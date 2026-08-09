@@ -1,0 +1,1 @@
+Read /tmp/zh-prompt.txt for the full build spec, then build the project end-to-end. Do NOT stop after writing a scaffold — keep iterating until cargo build --release succeeds and cargo test passes. Work entirely in /home/arctic/projects/zero-hermes/.

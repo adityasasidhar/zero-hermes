@@ -1,0 +1,236 @@
+=== BUILD SPEC ===
+# Brief: build zero-hermes
+
+You are OpenCode, given full autonomy to build the project end-to-end. Do not stop after a stub or scaffold — keep going until `cargo build --release` succeeds and at least the loop unit tests pass.
+
+## What this is
+
+A from-scratch Rust reimplementation of the Hermes Agent core (the agent loop, not OpenClaw's shape). Think of it as "ZeroClaw but for Hermes Agent" — same minimal-Rust-binary ethos (single binary, <15 MB, <10 MB RAM, <50 ms cold start), aimed at the Hermes Agent feature surface.
+
+Reference for "minimal agent loop in few lines of Python":
+`/home/arctic/projects/claude-code-in-100-lines/src/` — 210 LOC total (main.py:32, llm.py:60, tools.py:56, memory.py:30, loader.py:32).
+
+Reference for Hermes Agent target surface:
+`~/.hermes/` — read SOUL.md, CLAUDE.md, config.yaml to understand the agent behavior to port.
+
+## Scope (locked in advance by the user)
+
+- **Mid-weight**: Telegram gateway + agent loop + cron scheduler + skills loader (stubbed, no bundled skills yet) + SQLite memory. NO web UI, NO multi-provider router in v1.
+- **One LLM provider**: openai-compatible HTTP (works with minimax at `https://api.minimax.io/anthropic` — adapt the request shape; check the minimax config in `~/.openclaw/openclaw.json` for the exact request shape).
+- **Skills loader stubbed** — just SKILL.md parser + registry + a few hard-coded fake skills for the loader test. No real skills bundled yet.
+- **No git push** — local git init only. Do NOT push to GitHub.
+- **Tests required**: `cargo test` must pass. At minimum: agent loop dispatch, tool registry, memory round-trip, cron expression parsing, SKILL.md loader, Telegram message parse.
+
+## Target architecture
+
+```
+zero-hermes/
+├── Cargo.toml          # one binary crate, name = zero-hermes
+├── src/
+│   ├── main.rs         # CLI: zero-hermes gateway | run "msg" | cron list
+│   ├── config.rs       # zero_hermes.toml loading + defaults
+│   ├── error.rs        # anyhow-style Result alias
+│   ├── agent/
+│   │   ├── mod.rs      # the loop: prompt -> call LLM -> dispatch tools -> repeat
+│   │   ├── context.rs  # message list + compaction (drop oldest, keep system + last N)
+│   │   ├── provider.rs # LlmProvider trait + AnthropicMessages impl (minimax-compatible)
+│   │   └── tool.rs     # Tool trait + ToolCall parsing
+│   ├── tools/
+│   │   ├── mod.rs      # ToolRegistry: name -> Arc<dyn Tool>
+│   │   └── builtin.rs  # BashTool, ReadTool, WriteTool, FetchTool, MemoryTool
+│   ├── memory.rs       # sqlite (rusqlite) sessions + episodic notes
+│   ├── skills.rs       # SKILL.md loader (frontmatter + body), registry
+│   ├── cron.rs         # cron expr parser + tokio scheduler
+│   └── channels/
+│       ├── mod.rs      # Channel trait
+│       └── telegram.rs # long-poll getUpdates -> agent -> sendMessage
+├── skills/             # 2 stub SKILL.md files for the loader test
+│   ├── stub-1/SKILL.md
+│   └── stub-2/SKILL.md
+├── tests/
+│   ├── loop_test.rs
+│   ├── tools_test.rs
+│   ├── memory_test.rs
+│   ├── skills_test.rs
+│   └── cron_test.rs
+├── bench/              # empty for now, just a README
+├── README.md
+├── .gitignore          # target/, *.swp, .DS_Store
+└── BRIEF.md            # this file
+```
+
+## Dependencies (Cargo.toml)
+
+Keep it lean. Use:
+- `tokio` (rt-multi-thread, macros, net, time, sync) — async runtime
+- `reqwest` (json, rustls-tls, stream) — LLM HTTP
+- `serde` + `serde_json` — message/tool serialization
+- `rusqlite` (bundled) — SQLite, no system dep
+- `cron` — cron expression parser
+- `chrono` — timestamps
+- `clap` (derive) — CLI subcommands
+- `anyhow` + `thiserror` — errors
+- `tracing` + `tracing-subscriber` — logs
+- `dirs` — find config dir
+
+NO `async-tungstenite`, NO `actix`, NO `axum` — keep it stdlib+tokio. Use `std::process::Command` for bash tool (no async-shell crate).
+
+## The agent loop (the heart of this)
+
+Single function `agent::run(llm: &impl LlmProvider, tools: &ToolRegistry, system: &str, history: &mut Vec<Message>, user: &str) -> Result<String>`:
+
+1. Append user message to history.
+2. Loop:
+   a. Call `llm.complete(messages, tool_schemas)`. Get back either an assistant text or a list of tool_use blocks.
+   b. If text -> append to history, return text.
+   c. If tool_use blocks -> for each: dispatch via ToolRegistry, collect results, append as tool_result messages, continue loop.
+   d. Cap iterations at 10 (safety).
+3. Errors from tools -> append as tool_result with `is_error: true`, continue.
+
+The LlmProvider trait needs ONE impl: `AnthropicMessages` that POSTs to a configurable base_url (default `https://api.minimax.io/anthropic`) with an `x-api-key` header (matching the format in `~/.openclaw/openclaw.json`).
+
+## Verification checklist (must all be true before reporting done)
+
+- `cargo build --release` succeeds, emits `target/release/zero-hermes`
+- `cargo test` passes (all tests)
+- `cargo clippy -- -D warnings` clean (or document warnings)
+- `./target/release/zero-hermes --help` shows gateway | run | cron subcommands
+- `./target/release/zero-hermes run "say hi"` runs the agent loop against a mock provider in --mock mode (add a --mock flag for tests)
+- `./target/release/zero-hermes cron list` parses a sample cron expr
+- File counts: `find src -name '*.rs' | xargs wc -l` should be under 3000 LOC
+- `du -h target/release/zero-hermes` < 15 MB
+- Update README.md with: what it is, how to build, how to run gateway vs run, sample config, RAM/size benchmarks vs Hermes Agent baseline.
+
+## Style rules
+
+- Rust 2021 edition. `cargo fmt` clean.
+- No `unwrap()` outside tests. Use `?` + `anyhow`.
+- Public items get doc comments.
+- Tool implementations: each tool is `Arc<dyn Tool>` with `fn name(&self) -> &str`, `fn schema(&self) -> Value`, `async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput>`.
+- Use `#[tokio::main]` for the gateway.
+- Prefer `&str` over `String` in function args, owned `String` only where needed.
+
+## What NOT to do
+
+- Don't push to GitHub (user will handle).
+- Don't add a web UI / control UI.
+- Don't bundle real skills — stubs only.
+- Don't add multi-provider routing — single AnthropicMessages impl is enough.
+- Don't pull in heavy crates (bson, prost, sqlx, axum, etc.).
+- Don't leave TODOs in the code — implement or remove.
+- Don't write a single huge file — split per the layout above.
+
+## Working directory
+
+`/home/arctic/projects/zero-hermes/` — already initialized as a git repo.
+
+After everything works: `git add -A && git commit -m "feat: initial zero-hermes implementation"`. Do not push.
+
+Report back with:
+- Final file tree
+- LOC count
+- cargo test output
+- binary size
+- any caveats
+
+=== INLINE REFERENCE 1: minimal agent loop in 32 LOC (main.py) ===
+from src.llm import LLM
+from src.loader import load_skills, read_prompt
+from src.memory import ensure_memory
+from src.tools import TOOLS
+
+# Build the system prompt once at startup: inject the skills index and the
+# memory path so the agent knows what's available without loading everything.
+# Skills and memories are progressive disclosure: the agent reads them on
+# demand with bash, so they cost zero tokens until actually needed.
+SYSTEM_PROMPT = (
+    read_prompt("system_prompt")
+    .replace("{{SKILLS}}", load_skills())
+    .replace("{{MEMORY}}", ensure_memory())
+)
+
+
+def main():
+    # One LLM instance per session: it accumulates the full conversation
+    # history in self.messages, so context compounds across turns.
+    llm = LLM(system=SYSTEM_PROMPT, tools=TOOLS)
+    while True:
+        # Ctrl-D / Ctrl-C end the session cleanly instead of dumping a traceback.
+        try:
+            user_input = input("You> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye")
+            break
+        print(f"LLM> {llm.generate_response(user_input)} \n")
+
+
+if __name__ == "__main__":
+    main()
+
+=== INLINE REFERENCE 2: tool registry pattern (tools.py) ===
+from typing import Optional
+import subprocess
+import time
+
+from src.llm import LLM
+from src.loader import load_skills, read_prompt
+
+
+def bash(command: str, timeout: Optional[int] = 10) -> str:
+    """Run a shell command and return stdout + stderr.
+
+    Args:
+        command: Shell command to run
+        timeout: Timeout in seconds (default 10)
+    """
+    # shell=True lets the model use pipes, redirects, and builtins,
+    # the same things a human would type in a terminal.
+    timeout = int(timeout) if timeout is not None else None  # small models pass numbers as strings
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {timeout}s"
+    return r.stdout + r.stderr
+
+
+def timer(seconds: int, wake_up_message: Optional[str] = None) -> str:
+    """Wait for a given number of seconds, then return a completion message.
+
+    Args:
+        seconds: Seconds to wait
+        wake_up_message: Optional message to return when done
+    """
+    seconds = int(seconds)  # small models pass numbers as strings
+    time.sleep(seconds)
+    msg = f"Timer of {seconds} seconds completed."
+    return msg + (f" wake_up_message: {wake_up_message}" if wake_up_message else "")
+
+
+def subagent(name: str, task: str) -> str:
+    """Delegate a self-contained task to a fresh subagent (bash + timer, cannot nest).
+
+    Args:
+        name: Short label/role for the subagent, e.g. 'researcher'
+        task: Self-contained task description; the subagent sees no prior history
+    """
+    # Strip subagent from the child's tools so it can't spawn its own children.
+    # The child runs the exact same agent loop, just without the ability to recurse.
+    child_tools = {k: v for k, v in TOOLS.items() if k != "subagent"}
+    system = read_prompt("subagent_prompt").replace("{{NAME}}", name).replace("{{SKILLS}}", load_skills())
+    return LLM(system=system, tools=child_tools).generate_response(task)
+
+
+# TOOLS is a plain dict so llm.py can dispatch by name. Ollama derives each
+# tool's JSON schema from the function signature and docstring automatically.
+# No hand-written JSON to maintain; adding a tool means adding a function.
+TOOLS = {"bash": bash, "timer": timer, "subagent": subagent}
+
+=== INLINE REFERENCE 3: minimax API request shape (from openclaw config) ===
+baseUrl: https://api.minimax.io/anthropic
+api: anthropic-messages
+authHeader: True
+model id: MiniMax-M3
+input: ['text', 'image']
+contextWindow: 1000000
+maxTokens: 131072
+reasoning: True
