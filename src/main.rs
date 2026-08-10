@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long, global = true)]
     mock: bool,
 
+    /// Stream LLM tokens to stdout as they arrive (used by `run` and `repl`).
+    #[arg(long, global = true)]
+    stream: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -39,6 +43,8 @@ enum Command {
         /// The user message to send.
         message: String,
     },
+    /// Interactive multi-turn REPL on stdin. Lines are user turns; `/exit` quits.
+    Repl,
     /// Manage cron jobs.
     Cron {
         #[command(subcommand)]
@@ -75,13 +81,15 @@ async fn main() -> Result<()> {
     let cfg_path = cli
         .config
         .clone()
-        .or(zero_hermes::config::config_file())
+        .or_else(|| std::env::var("ZERO_HERMES_CONFIG").ok().map(PathBuf::from))
+        .or_else(zero_hermes::config::config_file)
         .unwrap_or_else(|| PathBuf::from("zero_hermes.toml"));
     let cfg = zero_hermes::config::load(&cfg_path).context("loading config")?;
 
     match cli.command {
         Command::Gateway => run_gateway(cfg, cli.mock).await,
-        Command::Run { message } => run_once(cfg, &message, cli.mock).await,
+        Command::Run { message } => run_once(cfg, &message, cli.mock, cli.stream).await,
+        Command::Repl => run_repl(cfg, cli.mock).await,
         Command::Cron { action } => match action {
             CronAction::List => cron_list(&cfg),
             CronAction::Check { expr } => cron_check(&expr),
@@ -89,7 +97,7 @@ async fn main() -> Result<()> {
         Command::Tools => tools_list(),
         Command::InitConfig { force } => init_config(force),
         Command::ShowConfig => {
-            let s = toml::to_string_pretty(&cfg).unwrap_or_else(|_| "<unparseable>".into());
+            let s = toml::to_string_pretty(&cfg).unwrap_or("<unparseable>".into());
             println!("{s}");
             Ok(())
         }
@@ -105,7 +113,10 @@ fn init_tracing() {
         .try_init();
 }
 
-fn build_tool_registry(cfg: &Config) -> ToolRegistry {
+fn build_tool_registry(
+    cfg: &Config,
+    provider: Arc<dyn zero_hermes::agent::LlmProvider>,
+) -> Arc<ToolRegistry> {
     use zero_hermes::tools::builtin::{BashTool, FetchTool, MemoryTool, ReadTool, WriteTool};
 
     let mut reg = ToolRegistry::new();
@@ -114,7 +125,19 @@ fn build_tool_registry(cfg: &Config) -> ToolRegistry {
     reg.insert(Arc::new(WriteTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(FetchTool::default()), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(MemoryTool), &cfg.agent.enabled_tools);
-    reg
+
+    // Snapshot the parent's tools into a sibling registry, then build
+    // SubAgentTool against that sibling. This avoids the Arc<DerefMut>
+    // borrow problem and means sub-agents see the parent's tools without
+    // being able to recurse (we strip `subagent` itself in the tool).
+    let sibling = Arc::new(reg.clone());
+    let mut reg = reg;
+    reg.insert_always(Arc::new(zero_hermes::tools::builtin::SubAgentTool::new(
+        provider,
+        sibling,
+        cfg.agent.max_iterations,
+    )));
+    Arc::new(reg)
 }
 
 fn build_system_prompt(cfg: &Config, skills: &SkillRegistry) -> String {
@@ -133,30 +156,139 @@ Memory: {{MEMORY}}\n\n\
 When you need to use a tool, emit a tool_use block. When you have a final answer, \
 respond with plain text only.";
 
-async fn run_once(cfg: Config, message: &str, mock: bool) -> Result<()> {
+async fn run_once(cfg: Config, message: &str, mock: bool, stream: bool) -> Result<()> {
     let skills = load_skills(&cfg);
-    let registry = build_tool_registry(&cfg);
     let memory = Arc::new(Memory::open(cfg.memory.path.as_deref())?);
     let provider: Arc<dyn LlmProvider> = if mock {
         Arc::new(MockProvider::text_only("hello from mock"))
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
+    let registry = build_tool_registry(&cfg, provider.clone());
     let system = build_system_prompt(&cfg, &skills);
     let ctx = zero_hermes::agent::make_context_with_memory(None, memory);
 
     let mut history: Vec<Message> = Vec::new();
-    let out = zero_hermes::agent::run(
-        provider.as_ref(),
-        &registry,
-        Some(&system),
-        &mut history,
-        message,
-        cfg.agent.max_iterations,
-        &ctx,
-    )
-    .await?;
-    println!("{out}");
+    let out = if stream {
+        zero_hermes::agent::run_stream(
+            provider.as_ref(),
+            registry.as_ref(),
+            Some(&system),
+            &mut history,
+            message,
+            cfg.agent.max_iterations,
+            &ctx,
+            |ev| match ev {
+                zero_hermes::agent::StreamTurn::TextDelta(s) => {
+                    print!("{s}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                zero_hermes::agent::StreamTurn::ToolUse(tc) => {
+                    println!("\n[tool: {}({})]", tc.name, tc.input);
+                }
+                zero_hermes::agent::StreamTurn::Done(_) => {
+                    println!();
+                }
+            },
+        )
+        .await
+    } else {
+        zero_hermes::agent::run(
+            provider.as_ref(),
+            registry.as_ref(),
+            Some(&system),
+            &mut history,
+            message,
+            cfg.agent.max_iterations,
+            &ctx,
+        )
+        .await
+    }?;
+    if !stream {
+        println!("{out}");
+    }
+    Ok(())
+}
+
+/// Interactive multi-turn REPL. Reads lines from stdin until EOF or `/exit`.
+/// History compounds across turns; the provider streams tokens to stdout.
+async fn run_repl(cfg: Config, mock: bool) -> Result<()> {
+    let skills = load_skills(&cfg);
+    let memory = Arc::new(Memory::open(cfg.memory.path.as_deref())?);
+    let provider: Arc<dyn LlmProvider> = if mock {
+        Arc::new(MockProvider::echo())
+    } else {
+        Arc::from(build_provider(&cfg.provider)?)
+    };
+    let registry = build_tool_registry(&cfg, provider.clone());
+    let system = build_system_prompt(&cfg, &skills);
+    let ctx = zero_hermes::agent::make_context_with_memory(None, memory);
+
+    let mut history: Vec<Message> = Vec::new();
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        buf.clear();
+        let n = stdin.read_line(&mut buf)?;
+        if n == 0 {
+            println!();
+            break;
+        }
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line {
+            "/exit" | "/quit" => break,
+            "/clear" => {
+                history.clear();
+                println!("(history cleared)");
+                continue;
+            }
+            "/tools" => {
+                for name in registry.names() {
+                    println!("  - {name}");
+                }
+                continue;
+            }
+            other if other.starts_with('/') => {
+                println!("(unknown command: {other})");
+                continue;
+            }
+            _ => {}
+        }
+        let result = zero_hermes::agent::run_stream(
+            provider.as_ref(),
+            registry.as_ref(),
+            Some(&system),
+            &mut history,
+            line,
+            cfg.agent.max_iterations,
+            &ctx,
+            |ev| match ev {
+                zero_hermes::agent::StreamTurn::TextDelta(s) => {
+                    print!("{s}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                zero_hermes::agent::StreamTurn::ToolUse(tc) => {
+                    println!("\n[tool: {}({})]", tc.name, tc.input);
+                }
+                zero_hermes::agent::StreamTurn::Done(_) => {
+                    println!();
+                }
+            },
+        )
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(e) => eprintln!("(error: {e})"),
+        }
+    }
     Ok(())
 }
 
@@ -166,13 +298,13 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     }
 
     let skills = load_skills(&cfg);
-    let registry = build_tool_registry(&cfg);
     let memory = Arc::new(Memory::open(cfg.memory.path.as_deref())?);
     let provider: Arc<dyn LlmProvider> = if mock {
         Arc::new(MockProvider::echo())
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
+    let registry = build_tool_registry(&cfg, provider.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(16);
     let system = build_system_prompt(&cfg, &skills);
@@ -274,6 +406,11 @@ fn load_skills(cfg: &Config) -> SkillRegistry {
     let dir = cfg
         .skills_dir
         .clone()
+        .or_else(|| {
+            std::env::var("ZERO_HERMES_SKILLS_DIR")
+                .ok()
+                .map(PathBuf::from)
+        })
         .or_else(|| zero_hermes::config::config_dir().map(|d| d.join("skills")))
         .unwrap_or_else(|| PathBuf::from("skills"));
     SkillRegistry::load_dir(&dir).unwrap_or_default()
@@ -300,7 +437,11 @@ fn cron_check(expr: &str) -> Result<()> {
 
 fn tools_list() -> Result<()> {
     let cfg = Config::default();
-    let reg = build_tool_registry(&cfg);
+    // tools_list doesn't make provider calls; we just need a placeholder to
+    // construct the registry so SubAgentTool's signature is satisfied.
+    let placeholder: Arc<dyn zero_hermes::agent::LlmProvider> =
+        Arc::new(zero_hermes::agent::mock::MockProvider::text_only(""));
+    let reg = build_tool_registry(&cfg, placeholder);
     println!("Tool registry:");
     for name in reg.names() {
         println!("  - {name}");

@@ -7,8 +7,12 @@
 //! Both implement [`LlmProvider`]; the agent loop is provider-agnostic.
 
 use async_trait::async_trait;
+use futures::Stream;
+use futures::StreamExt;
 use serde_json::{json, Value};
+use std::pin::Pin;
 
+use crate::agent::stream::{one_shot_stream, EventStream, StreamEvent};
 use crate::agent::tool::{ContentBlock, Message, ToolCall};
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::error::Result;
@@ -41,7 +45,27 @@ pub trait LlmProvider: Send + Sync {
         messages: &[Message],
         tools: &[Value],
     ) -> Result<Completion>;
+
+    /// Streaming variant. Returns a stream of [`StreamEvent`]s ending in a
+    /// single `Done(Completion)`. Default implementation just calls
+    /// `complete()` and emits a one-event stream — providers that support
+    /// real Server-Sent-Events should override this.
+    fn stream<'a>(
+        &'a self,
+        system: Option<&'a str>,
+        messages: &'a [Message],
+        tools: &'a [Value],
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        one_shot_stream(self, system, messages, tools)
+    }
 }
+
+// Convenience: shorthand for the boxed event stream.
+#[allow(dead_code)]
+type EventStreamAlias = EventStream;
 
 /// Anthropic-Messages provider (compatible with the minimax endpoint).
 pub struct AnthropicMessages {
@@ -203,6 +227,60 @@ impl LlmProvider for AnthropicMessages {
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("LLM body not JSON: {e}: {}", truncate(&text, 256)))?;
         Self::parse_response(&parsed)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        system: Option<&'a str>,
+        messages: &'a [Message],
+        tools: &'a [Value],
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        // Issue a `stream: true` request synchronously, then return the SSE
+        // parser over the resulting response. Any HTTP error here surfaces
+        // as the first stream event.
+        let mut body = Self::build_body(system, messages, tools);
+        body["model"] = json!(self.model);
+        body["max_tokens"] = json!(self.max_tokens);
+        body["stream"] = json!(true);
+
+        let url = format!("{}/v1/messages", self.base_url);
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+
+        Box::pin(
+            futures::stream::once(async move {
+                let resp = client
+                    .post(&url)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow::anyhow!(
+                        "LLM returned {}: {}",
+                        status,
+                        truncate(&text, 256)
+                    ));
+                }
+                Ok(resp)
+            })
+            .flat_map(|r: crate::error::Result<reqwest::Response>| match r {
+                Ok(resp) => crate::agent::stream::parse_anthropic_sse(resp),
+                Err(e) => Box::pin(futures::stream::once(async move { Err(e) }))
+                    as std::pin::Pin<
+                        Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>,
+                    >,
+            }),
+        )
     }
 }
 
@@ -451,9 +529,9 @@ impl OpenAiCompat {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("tool_call missing id"))?
                     .to_string();
-                let func = tc.get("function").ok_or_else(|| {
-                    anyhow::anyhow!("tool_call missing function object")
-                })?;
+                let func = tc
+                    .get("function")
+                    .ok_or_else(|| anyhow::anyhow!("tool_call missing function object"))?;
                 let name = func
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -461,8 +539,9 @@ impl OpenAiCompat {
                     .to_string();
                 // `arguments` may arrive as a JSON string (OpenAI spec) or already-parsed object.
                 let input = match func.get("arguments") {
-                    Some(Value::String(s)) => serde_json::from_str(s)
-                        .unwrap_or_else(|_| Value::String(s.clone())),
+                    Some(Value::String(s)) => {
+                        serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+                    }
                     Some(v) => v.clone(),
                     None => Value::Null,
                 };
@@ -516,6 +595,59 @@ impl LlmProvider for OpenAiCompat {
             .map_err(|e| anyhow::anyhow!("LLM body not JSON: {e}: {}", truncate(&text, 256)))?;
         Self::parse_response(&parsed)
     }
+
+    fn stream<'a>(
+        &'a self,
+        system: Option<&'a str>,
+        messages: &'a [Message],
+        tools: &'a [Value],
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        let mut body = Self::build_body(system, messages, tools);
+        body["model"] = json!(self.model);
+        body["max_tokens"] = json!(self.max_tokens);
+        if let Some(t) = self.temperature {
+            body["temperature"] = json!(t);
+        }
+        body["stream"] = json!(true);
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+
+        Box::pin(
+            futures::stream::once(async move {
+                let resp = client
+                    .post(&url)
+                    .bearer_auth(&api_key)
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
+
+                let status = resp.status();
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow::anyhow!(
+                        "LLM returned {}: {}",
+                        status,
+                        truncate(&text, 256)
+                    ));
+                }
+                Ok(resp)
+            })
+            .flat_map(|r: crate::error::Result<reqwest::Response>| match r {
+                Ok(resp) => crate::agent::stream::parse_openai_sse(resp),
+                Err(e) => Box::pin(futures::stream::once(async move { Err(e) }))
+                    as std::pin::Pin<
+                        Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>,
+                    >,
+            }),
+        )
+    }
 }
 
 /// Factory: build the right provider from a [`ProviderConfig`].
@@ -554,11 +686,7 @@ mod openai_tests {
 
     #[test]
     fn openai_body_wraps_tools() {
-        let body = OpenAiCompat::build_body(
-            None,
-            &[Message::user("hi")],
-            &[sample_tool_schema()],
-        );
+        let body = OpenAiCompat::build_body(None, &[Message::user("hi")], &[sample_tool_schema()]);
         let t = &body["tools"][0];
         assert_eq!(t["type"], "function");
         assert_eq!(t["function"]["name"], "bash");
@@ -591,7 +719,10 @@ mod openai_tests {
         // assistant message has tool_calls array
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "bash"
+        );
         // arguments is a JSON *string* (per OpenAI spec)
         let args_str = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
             .as_str()

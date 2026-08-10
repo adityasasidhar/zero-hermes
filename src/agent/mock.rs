@@ -1,8 +1,11 @@
 //! Mock provider for tests and `--mock` runs.
 
 use async_trait::async_trait;
+use futures::Stream;
 use serde_json::Value;
+use std::pin::Pin;
 
+use crate::agent::stream::StreamEvent;
 use crate::agent::{Completion, LlmProvider, Message};
 use crate::error::Result;
 
@@ -30,6 +33,19 @@ impl MockProvider {
             mode: MockMode::Echo,
         }
     }
+
+    fn make_completion(&self) -> Completion {
+        match &self.mode {
+            MockMode::Text(s) => Completion {
+                text: Some(s.clone()),
+                tool_calls: Vec::new(),
+            },
+            MockMode::Echo => Completion {
+                text: Some("(mock) ok".to_string()),
+                tool_calls: Vec::new(),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -40,15 +56,32 @@ impl LlmProvider for MockProvider {
         _messages: &[Message],
         _tools: &[Value],
     ) -> Result<Completion> {
-        match &self.mode {
-            MockMode::Text(s) => Ok(Completion {
-                text: Some(s.clone()),
-                tool_calls: Vec::new(),
-            }),
-            MockMode::Echo => Ok(Completion {
-                text: Some("(mock) ok".to_string()),
-                tool_calls: Vec::new(),
-            }),
+        Ok(self.make_completion())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _system: Option<&'a str>,
+        _messages: &'a [Message],
+        _tools: &'a [Value],
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        // Emit the full text in a single TextDelta followed by a Done.
+        // The brief asks for one chunk, which is the simplest correct
+        // behaviour for a mock and what real servers also produce when
+        // a model returns a tiny final answer.
+        let completion = self.make_completion();
+        let text = completion.text.clone().unwrap_or_default();
+        let mut events: Vec<Result<StreamEvent>> = Vec::new();
+        if !text.is_empty() {
+            events.push(Ok(StreamEvent::TextDelta(text.clone())));
         }
+        events.push(Ok(StreamEvent::Done(Completion {
+            text: Some(text),
+            tool_calls: Vec::new(),
+        })));
+        Box::pin(futures::stream::iter(events))
     }
 }

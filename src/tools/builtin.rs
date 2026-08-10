@@ -1,8 +1,9 @@
-//! Built-in tools: `bash`, `read`, `write`, `fetch`, `memory`.
+//! Built-in tools: `bash`, `read`, `write`, `fetch`, `memory`, `subagent`.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::tool::{Tool, ToolContext, ToolOutput};
@@ -355,6 +356,104 @@ impl Tool for MemoryTool {
                 Ok(ToolOutput::ok("ok".to_string()))
             }
             other => Ok(ToolOutput::err(format!("unknown action: {other}"))),
+        }
+    }
+}
+
+// SubAgentTool
+
+/// Spawn a fresh, isolated agent loop and return its final text answer.
+///
+/// This is the same pattern Hermes Agent uses for delegation: the sub-agent
+/// sees no prior history, gets a role-flavored system prompt, and runs with
+/// the parent's tool registry minus `subagent` (so it can't recurse).
+///
+/// Construct via [`SubAgentTool::new`] with the LLM provider and the parent
+/// `ToolRegistry`. The tool is then registered in the parent's registry;
+/// calling it spawns a child loop that uses a *clone* of the registry.
+pub struct SubAgentTool {
+    provider: Arc<dyn crate::agent::LlmProvider>,
+    parent_registry: Arc<crate::tools::ToolRegistry>,
+    max_iterations: usize,
+}
+
+impl SubAgentTool {
+    /// Build a sub-agent tool. Pass the parent's provider + tool registry;
+    /// the tool stores `Arc` clones of both.
+    pub fn new(
+        provider: Arc<dyn crate::agent::LlmProvider>,
+        parent_registry: Arc<crate::tools::ToolRegistry>,
+        max_iterations: usize,
+    ) -> Self {
+        Self {
+            provider,
+            parent_registry,
+            max_iterations,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SubAgentTool {
+    fn name(&self) -> &str {
+        "subagent"
+    }
+    fn description(&self) -> &str {
+        "Spawn a fresh isolated agent loop with a role and task. Returns the sub-agent's final answer as a string. Cannot nest."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Role label for the sub-agent (e.g. 'researcher', 'writer')."},
+                "task": {"type": "string", "description": "Self-contained task description; the sub-agent sees no prior history."}
+            },
+            "required": ["name", "task"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            name: String,
+            task: String,
+        }
+        let args: Args = serde_json::from_value(input)?;
+
+        // Build a child registry: same tools as the parent, minus `subagent`.
+        let mut child = crate::tools::ToolRegistry::new();
+        for tool_name in self.parent_registry.names() {
+            if tool_name == "subagent" {
+                continue;
+            }
+            if let Some(t) = self.parent_registry.get(&tool_name) {
+                child.insert_always(t);
+            }
+        }
+        let child = Arc::new(child);
+
+        let system = format!(
+            "You are a sub-agent spawned with the role: {role}. \
+             Complete the task below and return your final answer as plain text. \
+             You have no prior conversation history. Be concise. \
+             If you cannot complete the task, say so explicitly.",
+            role = args.name
+        );
+
+        let mut history: Vec<crate::agent::Message> = Vec::new();
+        let outcome = crate::agent::run(
+            self.provider.as_ref(),
+            child.as_ref(),
+            Some(&system),
+            &mut history,
+            &args.task,
+            self.max_iterations,
+            ctx,
+        )
+        .await;
+
+        match outcome {
+            Ok(text) => Ok(ToolOutput::ok(text)),
+            Err(e) => Ok(ToolOutput::err(format!("sub-agent failed: {e}"))),
         }
     }
 }

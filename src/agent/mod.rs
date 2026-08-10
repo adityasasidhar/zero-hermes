@@ -9,12 +9,16 @@
 pub mod context;
 pub mod mock;
 pub mod provider;
+pub mod stream;
 pub mod tool;
 
 use std::sync::Arc;
 
 pub use crate::agent::context::Context;
-pub use crate::agent::provider::{build_provider, AnthropicMessages, Completion, LlmProvider, OpenAiCompat};
+pub use crate::agent::provider::{
+    build_provider, AnthropicMessages, Completion, LlmProvider, OpenAiCompat,
+};
+pub use crate::agent::stream::{EventStream, StreamEvent};
 pub use crate::agent::tool::{
     ContentBlock, Message, Tool, ToolCall, ToolContext, ToolOutput, ToolResult,
 };
@@ -80,6 +84,111 @@ pub async fn run<P: LlmProvider + ?Sized>(
         "(agent loop hit max iterations without producing a final answer)".to_string()
     });
     history.push(Message::assistant_text(&fallback));
+    Ok(fallback)
+}
+
+/// A single event yielded by [`run_stream`] for each LLM round-trip.
+#[derive(Debug, Clone)]
+pub enum StreamTurn {
+    /// Text delta from the model (during the current iteration).
+    TextDelta(String),
+    /// The model just emitted a tool invocation request; the LLM-produced
+    /// `ToolCall` is included.
+    ToolUse(ToolCall),
+    /// The loop finished (either the model returned final text or it hit
+    /// the iteration cap). The string is the final text answer.
+    Done(String),
+}
+
+/// Streaming variant of [`run`]. Drives the same loop but calls
+/// `llm.stream(...)` and forwards each event through `on_event` as it
+/// arrives. Returns the same final string as `run`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_stream<P: LlmProvider + ?Sized, F>(
+    llm: &P,
+    tools: &ToolRegistry,
+    system: Option<&str>,
+    history: &mut Vec<Message>,
+    user: &str,
+    max_iterations: usize,
+    ctx: &ToolContext,
+    mut on_event: F,
+) -> Result<String>
+where
+    F: FnMut(StreamTurn) + Send,
+{
+    use futures::StreamExt;
+
+    history.push(Message::user(user));
+    let tool_schemas = tools.schemas();
+    let mut last_text: Option<String> = None;
+
+    for iteration in 0..max_iterations {
+        tracing::debug!(iteration, "agent loop iteration (stream)");
+
+        // Consume the stream fully inside this scope so the immutable
+        // borrow of `history` (and the other refs) ends before we
+        // push to it below.
+        let (completion, current_text) = {
+            let mut stream = llm.stream(system, history, &tool_schemas);
+
+            let mut current_text = String::new();
+            let mut event: Option<StreamEvent> = None;
+
+            while let Some(item) = stream.next().await {
+                let ev = item?;
+                match &ev {
+                    StreamEvent::TextDelta(s) => {
+                        on_event(StreamTurn::TextDelta(s.clone()));
+                        current_text.push_str(s);
+                    }
+                    StreamEvent::ToolUseBlock(tc) => {
+                        on_event(StreamTurn::ToolUse(tc.clone()));
+                    }
+                    StreamEvent::Done(_) => {
+                        event = Some(ev);
+                        break;
+                    }
+                }
+            }
+            let Some(StreamEvent::Done(completion)) = event else {
+                anyhow::bail!("LLM stream ended without a Done event");
+            };
+            (completion, current_text)
+        };
+
+        if completion.tool_calls.is_empty() {
+            let text = completion.text.unwrap_or_default();
+            history.push(Message::assistant_text(&text));
+            on_event(StreamTurn::Done(text.clone()));
+            return Ok(text);
+        }
+
+        // Build assistant message from the streamed tool calls.
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        if !current_text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: current_text.clone(),
+            });
+        }
+        for tc in &completion.tool_calls {
+            blocks.push(ContentBlock::ToolUse(tc.clone()));
+        }
+        history.push(Message::assistant(blocks));
+        last_text = completion.text;
+
+        let mut results = Vec::with_capacity(completion.tool_calls.len());
+        for tc in &completion.tool_calls {
+            results.push(dispatch_tool(tools, tc, ctx).await);
+        }
+        history.push(Message::tool_results(results));
+    }
+
+    let fallback = last_text.unwrap_or_else(|| {
+        "(agent loop hit max iterations without producing a final answer)".to_string()
+    });
+    history.push(Message::assistant_text(&fallback));
+    on_event(StreamTurn::Done(fallback.clone()));
     Ok(fallback)
 }
 
