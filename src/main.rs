@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use zero_hermes::agent::mock::MockProvider;
-use zero_hermes::agent::{AnthropicMessages, LlmProvider, Message};
+use zero_hermes::agent::{build_provider, LlmProvider, Message};
 use zero_hermes::channels::{telegram, Channel, InboundMessage};
 use zero_hermes::config::Config;
 use zero_hermes::error::Result;
@@ -140,9 +140,8 @@ async fn run_once(cfg: Config, message: &str, mock: bool) -> Result<()> {
     let provider: Arc<dyn LlmProvider> = if mock {
         Arc::new(MockProvider::text_only("hello from mock"))
     } else {
-        Arc::new(AnthropicMessages::new(&cfg.provider)?)
+        Arc::from(build_provider(&cfg.provider)?)
     };
-    let _ = provider;
     let system = build_system_prompt(&cfg, &skills);
     let ctx = zero_hermes::agent::make_context_with_memory(None, memory);
 
@@ -172,7 +171,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     let provider: Arc<dyn LlmProvider> = if mock {
         Arc::new(MockProvider::echo())
     } else {
-        Arc::new(AnthropicMessages::new(&cfg.provider)?)
+        Arc::from(build_provider(&cfg.provider)?)
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(16);
@@ -320,20 +319,37 @@ fn init_config(force: bool) -> Result<()> {
         );
     }
     let sample = r#"# zero-hermes configuration
+#
+# Two provider `kind`s are supported:
+#   - "anthropic"      -> /v1/messages, x-api-key header
+#                        (default; used by minimax at https://api.minimax.io/anthropic)
+#   - "openai_compat"  -> /v1/chat/completions, Bearer auth
+#                        (OpenAI, Together, Groq, OpenRouter, llama.cpp, ollama, ...)
+#
+# Swap by changing `kind` and `base_url`. All other fields stay the same.
+
 [provider]
-base_url = "https://api.minimax.io/anthropic"
-api_key  = ""
-model    = "MiniMax-M3"
+kind       = "anthropic"               # or "openai_compat"
+base_url   = "https://api.minimax.io/anthropic"
+api_key    = ""
+model      = "MiniMax-M3"
 max_tokens = 8192
+# OpenAI-compat-only (ignored when kind = "anthropic"):
+# temperature = 0.7
+# stream      = false
+
 [telegram]
 token = ""
 poll_timeout = 30
+
 [memory]
 path = "~/.local/share/zero-hermes/memory.sqlite"
+
 [agent]
 max_iterations = 10
 context_window = 50
 enabled_tools = []
+
 [[cron.jobs]]
 name = "status"
 schedule = "*/15 * * * *"

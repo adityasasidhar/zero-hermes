@@ -33,29 +33,57 @@ pub struct Config {
     pub skills_dir: Option<PathBuf>,
 }
 
-/// LLM provider configuration (Anthropic Messages flavour, minimax compatible).
+/// LLM provider configuration. The `kind` field selects the wire format:
+/// `anthropic` (the default — minimax-compatible `Messages` API) or
+/// `openai_compat` (any OpenAI-compatible `/v1/chat/completions` endpoint).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// Base URL for the Anthropic Messages endpoint.
+    /// Which provider implementation to use.
+    #[serde(default = "default_provider_kind")]
+    pub kind: ProviderKind,
+    /// Base URL for the chosen endpoint.
     pub base_url: String,
-    /// API key (sent as `x-api-key` header).
+    /// API key (sent as `Authorization: Bearer` for openai-compat, `x-api-key` for anthropic).
     pub api_key: String,
-    /// Model id, e.g. `MiniMax-M3`.
+    /// Model id, e.g. `MiniMax-M3` or `gpt-4o-mini`.
     pub model: String,
     /// Maximum tokens to generate.
     pub max_tokens: u32,
     /// Optional override for system prompt.
     pub system: Option<String>,
+    /// OpenAI-compat-only: optional `temperature` (0.0–2.0).
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// OpenAI-compat-only: request `stream: true` (not yet used by the loop; reserved).
+    #[serde(default)]
+    pub stream: bool,
+}
+
+fn default_provider_kind() -> ProviderKind {
+    ProviderKind::Anthropic
+}
+
+/// Which provider implementation the agent loop should build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// Anthropic Messages API (default; minimax uses this).
+    Anthropic,
+    /// Any OpenAI-compatible `/v1/chat/completions` endpoint.
+    OpenaiCompat,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
+            kind: ProviderKind::Anthropic,
             base_url: "https://api.minimax.io/anthropic".to_string(),
             api_key: String::new(),
             model: "MiniMax-M3".to_string(),
             max_tokens: 8192,
             system: None,
+            temperature: None,
+            stream: false,
         }
     }
 }

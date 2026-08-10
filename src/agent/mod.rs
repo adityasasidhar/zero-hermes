@@ -14,7 +14,7 @@ pub mod tool;
 use std::sync::Arc;
 
 pub use crate::agent::context::Context;
-pub use crate::agent::provider::{AnthropicMessages, Completion, LlmProvider};
+pub use crate::agent::provider::{build_provider, AnthropicMessages, Completion, LlmProvider, OpenAiCompat};
 pub use crate::agent::tool::{
     ContentBlock, Message, Tool, ToolCall, ToolContext, ToolOutput, ToolResult,
 };

@@ -11,12 +11,14 @@ loop, not OpenClaw's shape. Same minimal-Rust-binary ethos as
   &lt;15 MB executable. No system dependencies at runtime.
 * **Fast.** Cold start in &lt;50 ms. The agent loop adds at most one HTTP
   round-trip per LLM turn.
-* **Composable.** The agent loop is a 50-line function with a
+| **Composable.** The agent loop is a 50-line function with a
   `LlmProvider` trait and a `ToolRegistry`. New providers and tools are
   one file each.
-* **Hermes-compatible.** Speaks the Anthropic Messages API, which is the
-  wire format the `minimax` endpoint at `https://api.minimax.io/anthropic`
-  already accepts.
+* **Multi-provider.** Ships with two `LlmProvider` implementations:
+  the Anthropic Messages API (default, minimax-compatible) and any
+  OpenAI-compatible `/v1/chat/completions` endpoint (OpenAI, Together,
+  Groq, OpenRouter, llama.cpp, ollama, ...). Switch with
+  `[provider] kind = "openai_compat"`.
 
 ## Status
 
@@ -65,12 +67,25 @@ the agent loop, and sends the response back via `sendMessage`.
 
 ## Sample config (`~/.config/zero-hermes/zero_hermes.toml`)
 
+`kind` selects the wire format:
+
 ```toml
+# --- Anthropic Messages (default; minimax uses this) ---
 [provider]
-base_url = "https://api.minimax.io/anthropic"
-api_key  = "sk-..."
-model    = "MiniMax-M3"
+kind       = "anthropic"
+base_url   = "https://api.minimax.io/anthropic"
+api_key    = "sk-..."
+model      = "MiniMax-M3"
 max_tokens = 8192
+
+# --- OR: any OpenAI-compatible endpoint ---
+# [provider]
+# kind       = "openai_compat"
+# base_url   = "https://api.openai.com"            # or api.together.xyz, api.groq.com, ...
+# api_key    = "sk-..."
+# model      = "gpt-4o-mini"
+# max_tokens = 4096
+# temperature = 0.7                                # openai-compat-only
 
 [telegram]
 token          = "123:abc"
@@ -102,7 +117,7 @@ src/
 ├── agent/
 │   ├── mod.rs       # the loop: prompt -> call LLM -> dispatch tools -> repeat
 │   ├── context.rs   # message list + compaction (drop oldest, keep last N)
-│   ├── provider.rs  # LlmProvider trait + AnthropicMessages impl
+│   ├── provider.rs  # LlmProvider trait + AnthropicMessages + OpenAiCompat impls + build_provider()
 │   └── tool.rs      # Tool trait + Anthropic-flavoured ToolCall/Result
 ├── tools/
 │   ├── mod.rs       # ToolRegistry: name -> Arc<dyn Tool>
