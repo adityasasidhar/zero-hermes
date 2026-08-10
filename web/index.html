@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>zero-hermes</title>
+<style>
+  body { font: 14px/1.4 ui-monospace, monospace; margin: 1em; background: #0f0f0f; color: #eee; max-width: 800px; }
+  #msgs { list-style: none; padding: 0; }
+  #msgs li { margin: 4px 0; padding: 6px 10px; border-radius: 4px; }
+  li.user { background: #1e3a5f; }
+  li.text { background: #2a2a2a; white-space: pre-wrap; }
+  li.tool { background: #3a2a2a; color: #fa3; font-size: 12px; }
+  li.tool_result { background: #2a2a3a; color: #aaf; font-size: 12px; white-space: pre-wrap; }
+  li.done { background: #2a3a2a; color: #8f8; font-size: 12px; }
+  li.error { background: #5a1a1a; color: #f88; }
+  textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; background: #1a1a1a; color: #eee; border: 1px solid #444; }
+  button { padding: 8px 16px; background: #2a4a2a; color: #fff; border: 0; cursor: pointer; }
+  h1 { font-size: 16px; }
+  .meta { color: #888; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>zero-hermes</h1>
+<div class="meta">open <code>http://127.0.0.1:8088/</code> in your browser &mdash; SSE-driven, vanilla JS</div>
+<ul id="msgs"></ul>
+<form id="f" method="POST" action="/send">
+  <textarea id="m" name="message" rows="3" placeholder="ask the agent..." autofocus></textarea>
+  <button type="submit">send</button>
+</form>
+<script>
+const msgs = document.getElementById('msgs');
+const form = document.getElementById('f');
+const input = document.getElementById('m');
+
+function append(cls, text) {
+  const li = document.createElement('li');
+  li.className = cls;
+  li.textContent = text;
+  msgs.appendChild(li);
+  window.scrollTo(0, document.body.scrollHeight);
+  return li;
+}
+
+const es = new EventSource('/events');
+es.onmessage = (ev) => {
+  const e = JSON.parse(ev.data);
+  if (e.type === 'text_delta') {
+    const last = msgs.querySelector('li.text:last-child');
+    if (last) last.textContent += e.delta;
+    else append('text', e.delta);
+  } else if (e.type === 'user') append('user', '> ' + e.text);
+  else if (e.type === 'tool_use') append('tool', 'tool: ' + e.name + ' ' + JSON.stringify(e.input));
+  else if (e.type === 'tool_result') append('tool_result', 'tool[' + e.name + ']: ' + (e.is_error ? 'ERR ' : '') + e.output);
+  else if (e.type === 'done') { append('done', '\u2713 done'); input.value = ''; input.focus(); }
+  else if (e.type === 'error') append('error', 'error: ' + e.message);
+};
+es.onerror = () => append('error', 'sse connection lost \u2014 refresh to reconnect');
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.submit(); }
+});
+</script>
+</body>
+</html>

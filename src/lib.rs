@@ -9,3 +9,4 @@ pub mod error;
 pub mod memory;
 pub mod skills;
 pub mod tools;
+pub mod web;

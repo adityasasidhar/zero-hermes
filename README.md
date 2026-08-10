@@ -65,6 +65,16 @@ the agent loop, and sends the response back via `sendMessage`.
 ./target/release/zero-hermes cron check "*/5 * * * *"
 ```
 
+### Web UI
+
+```sh
+./target/release/zero-hermes web --bind 127.0.0.1:8088
+```
+
+Then open `http://127.0.0.1:8088/` in a browser. The page is a single HTML
+file with a tiny vanilla-JS `<script>` that uses `EventSource` to render
+streaming tokens. No JS framework, no build step.
+
 ## Sample config (`~/.config/zero-hermes/zero_hermes.toml`)
 
 `kind` selects the wire format:

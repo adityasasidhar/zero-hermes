@@ -32,10 +32,17 @@ futures = "0.3"
 toml = "0.8"
 libc = "0.2"
 bytes = "1"
+# Web UI: axum for the HTTP server + SSE; tokio-stream for Stream bodies.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "form"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-stream = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 opt-level = "z"

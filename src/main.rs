@@ -60,6 +60,12 @@ enum Command {
     },
     /// Print the resolved configuration to stdout.
     ShowConfig,
+    /// Run the minimal web UI (axum + SSE) on 127.0.0.1:8088.
+    Web {
+        /// Bind address as host:port (default 127.0.0.1:8088).
+        #[arg(long)]
+        bind: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -101,6 +107,7 @@ async fn main() -> Result<()> {
             println!("{s}");
             Ok(())
         }
+        Command::Web { bind } => run_web(cfg, cli.mock, bind).await,
     }
 }
 
@@ -290,6 +297,43 @@ async fn run_repl(cfg: Config, mock: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn run_web(cfg: Config, mock: bool, bind: Option<String>) -> Result<()> {
+    let skills = load_skills(&cfg);
+    let memory = Arc::new(Memory::open(cfg.memory.path.as_deref())?);
+    let provider: Arc<dyn LlmProvider> = if mock {
+        Arc::new(MockProvider::echo())
+    } else {
+        Arc::from(build_provider(&cfg.provider)?)
+    };
+    let registry = build_tool_registry(&cfg, provider.clone());
+    let system = build_system_prompt(&cfg, &skills);
+
+    let (tx, _rx) = tokio::sync::broadcast::channel(256);
+    let history = Arc::new(tokio::sync::RwLock::new(Vec::<Message>::new()));
+
+    let state = zero_hermes::web::AppState {
+        events: tx,
+        history,
+        system,
+        provider,
+        tools: registry,
+        memory,
+        max_iterations: cfg.agent.max_iterations,
+    };
+
+    let bind_addr = bind
+        .as_deref()
+        .map(zero_hermes::web::parse_bind)
+        .unwrap_or_default();
+
+    println!(
+        "zero-hermes web UI listening on http://{}:{}/",
+        bind_addr.host, bind_addr.port
+    );
+    println!("(Ctrl-C to stop)");
+    zero_hermes::web::serve(state, bind_addr).await
 }
 
 async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
