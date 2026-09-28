@@ -20,10 +20,11 @@
 //! `setMd`/`sanitize` in `web/index.html`). The `{{CSRF_TOKEN}}` placeholder is
 //! substituted by [`serve_index`].
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{
     sse::{Event, Sse},
@@ -79,12 +80,14 @@ pub enum UiEvent {
 pub struct AppState {
     /// Broadcast channel that every SSE connection subscribes to.
     pub events: broadcast::Sender<UiEvent>,
-    /// The conversation history (one in-memory session).
+    /// Per-session conversation histories, keyed by `web-*` session id.
     ///
-    /// `tokio::sync::Mutex` (not `RwLock`): we always write, and the lock
-    /// is held across the entire agent run. There's no concurrent reader
-    /// that would justify the read-side fast path.
-    pub history: Arc<Mutex<Vec<Message>>>,
+    /// `tokio::sync::Mutex` (not `RwLock`): turns clone a snapshot, run
+    /// without the lock, then store back (last-writer-wins per session).
+    /// Each session is also persisted to SQLite via [`Memory::save_history`]
+    /// so it survives restarts. The SSE broadcast stays global: every
+    /// browser tab sees every turn's events.
+    pub histories: Arc<Mutex<HashMap<String, Vec<Message>>>>,
     /// System prompt (built from skills + provider.system).
     pub system: String,
     /// Provider for the agent loop.
@@ -145,6 +148,43 @@ struct SendForm {
     /// Must match [`AppState::csrf_token`]. See the field docs for why.
     #[serde(default)]
     csrf: String,
+    /// Optional session key; defaults to `web-default`. Accepts a bare key
+    /// (`alice` -> `web-alice`) or a full `web-*` id.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SessionQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Normalize a user-supplied web session into a `web-*` session id.
+pub fn normalize_web_session(raw: Option<&str>) -> String {
+    let s = raw.unwrap_or("").trim();
+    if s.is_empty() {
+        return "web-default".to_string();
+    }
+    let mut clean: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    clean.truncate(64);
+    if clean.is_empty() || clean == "web-" {
+        return "web-default".to_string();
+    }
+    if clean.starts_with("web-") {
+        clean
+    } else {
+        format!("web-{clean}")
+    }
 }
 
 /// Constant-time-ish string comparison. Not a defence against a remote
@@ -162,7 +202,11 @@ fn tokens_match(a: &str, b: &str) -> bool {
 
 /// POST /send — kick off one agent turn for the submitted message.
 /// Streams events on the broadcast channel as the loop runs.
-async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>) -> Response {
+async fn send_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SessionQuery>,
+    Form(form): Form<SendForm>,
+) -> Response {
     // Reject anything that did not come from a page this process served.
     // A form POST is a "simple request": no CORS preflight, so without
     // this any site the user visits could drive the `bash` tool on their
@@ -175,13 +219,14 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
     if message.is_empty() {
         return Redirect::to("/").into_response();
     }
+    let session_id = normalize_web_session(form.session.as_deref().or(query.session.as_deref()));
     // Echo the user message immediately so the UI shows it before the agent
     // loop starts (which can take a few hundred ms for the LLM round-trip).
     state.emit(UiEvent::User {
         text: message.clone(),
     });
 
-    let history = state.history.clone();
+    let histories = state.histories.clone();
     let provider = state.provider.clone();
     let tools = state.tools.clone();
     let memory = state.memory.clone();
@@ -191,29 +236,46 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
 
     // Spawn the agent loop on its own task so the HTTP handler can return
     // immediately and the browser can keep the SSE stream open to receive
-    // events as they happen.
+    // events as they happen. The turn clones its session history, runs
+    // without holding the lock, then stores back (last-writer-wins) and
+    // persists to SQLite.
     tokio::spawn(async move {
+        let snapshot = {
+            let guard = histories.lock().await;
+            if let Some(h) = guard.get(&session_id) {
+                h.clone()
+            } else {
+                drop(guard);
+                let loaded = memory.load_history(&session_id).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "loading web session history failed");
+                    Vec::new()
+                });
+                let mut guard = histories.lock().await;
+                guard.entry(session_id.clone()).or_insert_with(Vec::new);
+                loaded
+            }
+        };
+        let mut history = snapshot;
         let ctx = ToolContext {
             cwd: None,
-            session_id: Some(WEB_SESSION_ID.to_string()),
+            session_id: Some(session_id.clone()),
             memory: Some(memory.clone()),
         };
-        // Hold the history mutex for the duration of the agent run. This
-        // serializes turns (the previous RwLock was misleading — we
-        // always wrote).
-        let mut history_guard = history.lock().await;
         // Recall is injected every turn so the agent sees past context
-        // without having to ask via the memory tool first.
-        let effective_system = match recall_section(&memory, &message, Some(WEB_SESSION_ID), 4) {
+        // without having to ask via the memory tool first. The current
+        // session is excluded so recall surfaces *other* conversations
+        // instead of echoing back what was just said.
+        let effective_system = match recall_section(&memory, &message, Some(session_id.as_str()), 4)
+        {
             Some(section) => format!("{system}\n\n{section}"),
             None => system,
         };
-        let len_before = history_guard.len();
+        let len_before = history.len();
         let result = run_stream(
             provider.as_ref(),
             tools.as_ref(),
             Some(&effective_system),
-            &mut history_guard,
+            &mut history,
             &message,
             limits,
             &ctx,
@@ -246,12 +308,16 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
         .await;
         match result {
             Ok(_) => {
+                {
+                    let mut guard = histories.lock().await;
+                    guard.insert(session_id.clone(), history.clone());
+                }
                 // Append only the delta: the agent loop compacts the
                 // in-memory history in place, so persisting the whole vector
                 // would delete the durable prefix.
-                let start = len_before.min(history_guard.len());
-                if let Err(e) = memory.append_messages(WEB_SESSION_ID, &history_guard[start..]) {
-                    tracing::warn!(error = %e, "saving web history failed");
+                let start = len_before.min(history.len());
+                if let Err(e) = memory.append_messages(&session_id, &history[start..]) {
+                    tracing::warn!(error = %e, "saving web session history failed");
                 }
             }
             Err(e) => {

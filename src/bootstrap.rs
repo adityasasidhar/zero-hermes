@@ -14,9 +14,9 @@ use crate::agent::{LlmProvider, RunLimits};
 use crate::config::Config;
 use crate::skills::SkillRegistry;
 use crate::tools::builtin::{
-    AskTool, BashTool, EditTool, ExecuteCodeTool, ExecuteCommandTool, FetchTool, MemoryTool,
-    MessageTool, ReadFileTool, ReadTool, SearchFilesTool, SkillTool, SkillViewTool, SubAgentTool,
-    TodoTool, WebExtractTool, WebSearchTool, WriteFileTool, WriteTool,
+    AskTool, BashTool, CronTool, EditTool, ExecuteCodeTool, ExecuteCommandTool, FetchTool,
+    MemoryTool, MessageTool, ReadFileTool, ReadTool, SearchFilesTool, SkillTool, SkillViewTool,
+    SubAgentTool, TodoTool, WebExtractTool, WebSearchTool, WriteFileTool, WriteTool,
 };
 use crate::tools::ToolRegistry;
 
@@ -138,11 +138,12 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     reg.insert(Arc::new(SearchFilesTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(FetchTool::default()), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WebSearchTool::default()), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(MemoryTool), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(CronTool), &cfg.agent.enabled_tools);
     reg.insert(
         Arc::new(WebExtractTool::default()),
         &cfg.agent.enabled_tools,
     );
-    reg.insert(Arc::new(MemoryTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(TodoTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(AskTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(MessageTool), &cfg.agent.enabled_tools);
@@ -200,8 +201,15 @@ pub fn build_system_prompt_with_notes(
         load_markdown_memory(cfg),
         render_notes_section(notes)
     );
-    base.replace("{{SKILLS}}", &skills.render_index())
-        .replace("{{MEMORY}}", &memory_section)
+    let rendered = base
+        .replace("{{SKILLS}}", &skills.render_index())
+        .replace("{{MEMORY}}", &memory_section);
+    let soul = load_soul_files();
+    if soul.is_empty() {
+        rendered
+    } else {
+        format!("{rendered}\n\n# Project instructions (SOUL/AGENTS)\n{soul}")
+    }
 }
 
 /// [`build_system_prompt_with_notes`], loading the notes from `memory`.
@@ -275,6 +283,46 @@ fn load_markdown_file(path: Option<&std::path::Path>, label: &str, cap_chars: us
     }
 }
 
+/// Load Hermes-style soul files for injection into the system prompt.
+///
+/// Searches the current directory and the user config directory for
+/// `SOUL.md`, `AGENTS.md`, `.hermes.md` and `.hermes/SOUL.md`. Each file
+/// present is capped at 4KB so a large `AGENTS.md` cannot blow the
+/// context window. Absent files are silently skipped.
+pub fn load_soul_files() -> String {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for name in ["SOUL.md", "AGENTS.md", ".hermes.md"] {
+        candidates.push(PathBuf::from(name));
+    }
+    candidates.push(PathBuf::from(".hermes/SOUL.md"));
+    if let Some(dir) = crate::config::config_dir() {
+        for name in ["SOUL.md", "AGENTS.md", ".hermes.md"] {
+            candidates.push(dir.join(name));
+        }
+        candidates.push(dir.join(".hermes/SOUL.md"));
+    }
+    load_soul_files_from(&candidates)
+}
+
+/// Load and concatenate soul files from explicit candidate paths.
+///
+/// Exported for tests; [`load_soul_files`] supplies the real candidates.
+pub fn load_soul_files_from(candidates: &[PathBuf]) -> String {
+    let mut sections = Vec::new();
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let capped = crate::util::truncate_bytes(trimmed, 4096);
+        sections.push(format!("## {}\n{capped}", path.display()));
+    }
+    sections.join("\n\n")
+}
+
 /// Resolve the skills directory and load it.
 ///
 /// Precedence: `[skills_dir]` in the config, then `ZERO_HERMES_SKILLS_DIR`,
@@ -327,6 +375,7 @@ mod tests {
             vec![
                 "ask",
                 "bash",
+                "cron",
                 "edit",
                 "execute_code",
                 "execute_command",
@@ -499,5 +548,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(skills_dir(&cfg), PathBuf::from("/explicit/skills"));
+    }
+
+    #[test]
+    fn soul_files_absent_yields_empty_string() {
+        let out = load_soul_files_from(&[PathBuf::from("/definitely/missing/SOUL.md")]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn soul_files_concatenate_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let soul = dir.path().join("SOUL.md");
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(&soul, "be kind").unwrap();
+        std::fs::write(&agents, "   ").unwrap();
+        let out = load_soul_files_from(&[soul, agents]);
+        assert!(out.contains("be kind"));
     }
 }

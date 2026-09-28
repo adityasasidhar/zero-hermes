@@ -37,6 +37,16 @@ fn system_with_recall(
     format!("{base}\n\n{section}")
 }
 
+/// Whether a telegram slash command resets the chat session locally.
+fn is_reset_command(cmd: &str) -> bool {
+    matches!(cmd, "new" | "clear" | "reset" | "start")
+}
+
+/// Help text sent for `/help` without calling the LLM.
+fn gateway_help_text() -> &'static str {
+    "Commands:\n/new or /clear — reset this chat's conversation history\n/help — show this help"
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zero-hermes", version, about = "Minimal Hermes Agent in Rust")]
 struct Cli {
@@ -419,17 +429,22 @@ async fn run_web(cfg: Config, mock: bool, bind: Option<String>) -> Result<()> {
     if let Err(e) = memory.upsert_session(zero_hermes::web::WEB_SESSION_ID, "web", "default") {
         tracing::warn!(error = %e, "upsert_session failed");
     }
-    let initial_history = memory
-        .load_history(zero_hermes::web::WEB_SESSION_ID)
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "loading durable web history failed");
-            Vec::new()
-        });
-    let history = Arc::new(tokio::sync::Mutex::new(initial_history));
+    let histories: Arc<tokio::sync::Mutex<HashMap<String, Vec<Message>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // Preload the default web session so a restart resumes the transcript
+    // instead of starting blank (persisted on every turn in `send_handler`).
+    if let Ok(loaded) = memory.load_history(zero_hermes::web::WEB_SESSION_ID) {
+        if !loaded.is_empty() {
+            histories
+                .lock()
+                .await
+                .insert(zero_hermes::web::WEB_SESSION_ID.to_string(), loaded);
+        }
+    }
 
     let state = zero_hermes::web::AppState {
         events: tx,
-        history,
+        histories,
         system,
         provider,
         tools: registry,
@@ -522,26 +537,57 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     let reply_channel = channel.clone();
     tracing::info!(channel = %channel_name, "gateway running (ctrl-c to stop)");
 
-    // Per-chat conversation history so the bot retains memory of previous
-    // turns. The select! loop processes messages serially, so a single
-    // HashMap guarded by no lock is correct (each entry is only mutated
-    // by this loop, not concurrently).
-    let mut histories: HashMap<String, Vec<Message>> = HashMap::new();
+    // Per-chat conversation histories. Each inbound turn is spawned as its
+    // own task so one slow LLM call never blocks other chats. Turns clone
+    // their session history, run without the lock, then store back
+    // (last-writer-wins if the same chat sends twice in quick succession).
+    let histories: Arc<tokio::sync::Mutex<HashMap<String, Vec<Message>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let notify_chats: Vec<i64> = cfg.telegram.allowed_chats.clone();
+    let agent_limits = RunLimits::from(&cfg.agent);
 
     loop {
         tokio::select! {
             Some(msg) = rx.recv() => {
                 let session_id = format!("{}-{}", msg.channel, msg.chat_id);
-                let history = histories.entry(session_id.clone()).or_insert_with(|| {
-                    memory.load_history(&session_id).unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "loading durable session history failed");
-                        Vec::new()
-                    })
-                });
-                let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory.clone());
-                ctx.session_id = Some(session_id.clone());
                 if let Err(e) = memory.upsert_session(&session_id, &msg.channel, &msg.chat_id) {
                     tracing::warn!(error = %e, "upsert_session failed");
+                }
+                // Slash commands that reset state are handled locally so
+                // `/new` and `/clear` actually reset instead of reaching
+                // the model as plain text.
+                if let Some(cmd) = msg.command.clone() {
+                    let lc = cmd.to_ascii_lowercase();
+                    if is_reset_command(&lc) {
+                        let histories = histories.clone();
+                        let memory = memory.clone();
+                        let reply = reply_channel.clone();
+                        let chat_id = msg.chat_id.clone();
+                        let session_id = session_id.clone();
+                        tokio::spawn(async move {
+                            {
+                                let mut guard = histories.lock().await;
+                                guard.remove(&session_id);
+                            }
+                            if let Err(e) = memory.save_history(&session_id, &[]) {
+                                tracing::warn!(error = %e, "clearing session history failed");
+                            }
+                            if let Err(e) = reply.send(&chat_id, "Conversation cleared. Starting fresh.").await {
+                                tracing::warn!(error = %e, "send reply failed");
+                            }
+                        });
+                        continue;
+                    }
+                    if lc == "help" {
+                        let reply = reply_channel.clone();
+                        let chat_id = msg.chat_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = reply.send(&chat_id, gateway_help_text()).await {
+                                tracing::warn!(error = %e, "send reply failed");
+                            }
+                        });
+                        continue;
+                    }
                 }
                 let user_text = match &msg.command {
                     Some(cmd) => match &msg.args {
@@ -550,74 +596,168 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                     },
                     None => msg.text.clone(),
                 };
-                let history_len_before = history.len();
-                let out = zero_hermes::agent::run(
-                    provider.as_ref(),
-                    &registry,
-                    Some(&system_with_recall(
+                // Snapshot history without holding the lock across the LLM call.
+                let snapshot = {
+                    let guard = histories.lock().await;
+                    if let Some(h) = guard.get(&session_id) {
+                        h.clone()
+                    } else {
+                        drop(guard);
+                        let loaded = memory.load_history(&session_id).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "loading durable session history failed");
+                            Vec::new()
+                        });
+                        let mut guard = histories.lock().await;
+                        guard.entry(session_id.clone()).or_insert_with(Vec::new);
+                        loaded
+                    }
+                };
+                let provider = provider.clone();
+                let registry = registry.clone();
+                let system = system.clone();
+                let memory_clone = memory.clone();
+                let reply = reply_channel.clone();
+                let histories_clone = histories.clone();
+                let chat_id = msg.chat_id.clone();
+                tokio::spawn(async move {
+                    let mut history = snapshot;
+                    let history_len_before = history.len();
+                    let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory_clone.clone());
+                    ctx.session_id = Some(session_id.clone());
+                    let recalled = system_with_recall(
                         &system,
-                        memory.as_ref(),
+                        memory_clone.as_ref(),
                         &user_text,
-                        Some(&session_id),
-                    )),
-                    history,
-                    &user_text,
-                    RunLimits::from(&cfg.agent),
-                    &ctx,
-                )
-                .await;
-                match out {
-                    Ok(text) => {
-                        // Append only the delta: `history` was compacted in
-                        // place by the agent loop, so saving the whole vector
-                        // would delete the durable prefix.
-                        let start = history_len_before.min(history.len());
-                        if let Err(e) =
-                            memory.append_messages(&session_id, &history[start..])
-                        {
-                            tracing::warn!(error = %e, "saving durable session history failed");
+                        Some(session_id.as_str()),
+                    );
+                    let out = zero_hermes::agent::run(
+                        provider.as_ref(),
+                        &registry,
+                        Some(&recalled),
+                        &mut history,
+                        &user_text,
+                        agent_limits,
+                        &ctx,
+                    )
+                    .await;
+                    match out {
+                        Ok(text) => {
+                            {
+                                let mut guard = histories_clone.lock().await;
+                                guard.insert(session_id.clone(), history.clone());
+                            }
+                            // Append only the delta: `history` was compacted in
+                            // place by the agent loop, so saving the whole vector
+                            // would delete the durable prefix.
+                            let start = history_len_before.min(history.len());
+                            if let Err(e) =
+                                memory_clone.append_messages(&session_id, &history[start..])
+                            {
+                                tracing::warn!(error = %e, "saving durable session history failed");
+                            }
+                            if let Err(e) = reply.send(&chat_id, &text).await {
+                                tracing::warn!(error = %e, "send reply failed");
+                            }
                         }
-                        if let Err(e) = reply_channel.send(&msg.chat_id, &text).await {
-                            tracing::warn!(error = %e, "send reply failed");
+                        Err(e) => {
+                            tracing::error!(error = %e, "agent run failed");
+                            // `run` pushes the user message before the first LLM
+                            // call, so a failure leaves an orphan trailing user
+                            // turn. Pop it so the next turn doesn't start with
+                            // `user,user`, then persist the repaired history.
+                            zero_hermes::agent::repair_history_after_failure(&mut history);
+                            {
+                                let mut guard = histories_clone.lock().await;
+                                guard.insert(session_id.clone(), history.clone());
+                            }
+                            let start = history_len_before.min(history.len());
+                            if let Err(e) = memory_clone.append_messages(&session_id, &history[start..]) {
+                                tracing::warn!(error = %e, "saving durable session history failed");
+                            }
+                            // Never leave the user with silence: send a short
+                            // error reply (truncated so a huge provider body
+                            // can't blow past Telegram's message cap).
+                            let reply_text = zero_hermes::util::truncate_bytes(
+                                &format!("Sorry, I hit an error: {e}"),
+                                400,
+                            );
+                            if let Err(e) = reply.send(&chat_id, &reply_text).await {
+                                tracing::warn!(error = %e, "send error reply failed");
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "agent run failed");
-                        // `run` pushes the user message before the first LLM
-                        // call, so a failure leaves an orphan trailing user
-                        // turn. Pop it so the next turn doesn't start with
-                        // `user,user`, then persist the repaired history.
-                        zero_hermes::agent::repair_history_after_failure(history);
-                        if let Err(e) = memory.save_history(&session_id, history) {
-                            tracing::warn!(error = %e, "saving durable session history failed");
-                        }
-                        // Never leave the user with silence: send a short
-                        // error reply (truncated so a huge provider body
-                        // can't blow past Telegram's message cap).
-                        let reply = zero_hermes::util::truncate_bytes(
-                            &format!("Sorry, I hit an error: {e}"),
-                            400,
-                        );
-                        if let Err(e) = reply_channel.send(&msg.chat_id, &reply).await {
-                            tracing::warn!(error = %e, "send error reply failed");
-                        }
-                    }
-                }
+                });
             }
             Some(evt) = cron_rx.recv() => {
                 // Cron ticks get a fresh history — each prompt stands alone,
                 // so compaction has nothing to do and is switched off.
-                let ctx = zero_hermes::agent::make_context_with_memory(None, memory.clone());
-                let mut history: Vec<Message> = Vec::new();
-                let _ = zero_hermes::agent::run(
-                    provider.as_ref(),
-                    &registry,
-                    Some(&system),
-                    &mut history,
-                    &evt.prompt,
-                    RunLimits::from(&cfg.agent).with_context_window(0),
-                    &ctx,
-                ).await;
+                // Late ticks (scheduler was down) are labelled so the model
+                // knows it is catching up rather than firing on time.
+                let lateness = chrono::Utc::now()
+                    .signed_duration_since(evt.at)
+                    .num_seconds();
+                let prompt = if lateness > 120 {
+                    format!(
+                        "[missed scheduled run for {:?} at {} ({}s late); catching up now]\n{}",
+                        evt.job,
+                        evt.at.to_rfc3339(),
+                        lateness,
+                        evt.prompt
+                    )
+                } else {
+                    evt.prompt.clone()
+                };
+                let session_id = format!("cron-{}", evt.job);
+                if let Err(e) = memory.upsert_session(&session_id, "cron", &evt.job) {
+                    tracing::warn!(error = %e, "upsert cron session failed");
+                }
+                let provider = provider.clone();
+                let registry = registry.clone();
+                let system = system.clone();
+                let memory_clone = memory.clone();
+                let reply = reply_channel.clone();
+                let notify = notify_chats.clone();
+                let job_name = evt.job.clone();
+                tokio::spawn(async move {
+                    let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory_clone.clone());
+                    ctx.session_id = Some(session_id.clone());
+                    let mut history: Vec<Message> = Vec::new();
+                    match zero_hermes::agent::run(
+                        provider.as_ref(),
+                        &registry,
+                        Some(&system),
+                        &mut history,
+                        &prompt,
+                        agent_limits.with_context_window(0),
+                        &ctx,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            tracing::info!(
+                                job = %job_name,
+                                result = %zero_hermes::util::truncate_bytes(&text, 500),
+                                "cron job completed"
+                            );
+                            if let Err(e) = memory_clone.save_history(&session_id, &history) {
+                                tracing::warn!(error = %e, "saving cron history failed");
+                            }
+                            // Best-effort delivery: with exactly one allowed
+                            // chat there is an unambiguous recipient.
+                            // Otherwise the result stays in memory under
+                            // `cron-<job>` plus the info log above.
+                            if notify.len() == 1 {
+                                let chat_id = notify[0].to_string();
+                                if let Err(e) = reply.send(&chat_id, &text).await {
+                                    tracing::warn!(error = %e, "cron notify send failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(job = %job_name, error = %e, "cron job failed");
+                        }
+                    }
+                });
             }
             // Surface channel failures instead of leaving the gateway
             // running against a channel that has silently given up (a
