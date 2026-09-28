@@ -166,7 +166,7 @@ path = "~/.local/share/zero-hermes/memory.sqlite"
 markdown_path = "memory/MEMORY.md"
 
 [agent]
-max_iterations = 10
+max_iterations = 50
 context_window = 50
 context_tokens = 24000
 # Empty means every built-in tool. Restrict this for a narrower agent.

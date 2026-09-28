@@ -58,6 +58,16 @@ pub trait Tool: Send + Sync {
 
     /// Run the tool with the given input.
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput>;
+
+    /// Whether the tool is free of observable side effects and safe to run
+    /// concurrently with other read-only tools.
+    ///
+    /// Defaults to `false` (serial execution) so a new tool is safe until
+    /// its implementation explicitly opts into parallelism. Read-only
+    /// tools (`read`, `fetch`) override this to `true`.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Anthropic-flavoured `tool_use` block parsed from an LLM response.

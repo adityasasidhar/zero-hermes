@@ -544,6 +544,24 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "agent run failed");
+                        // `run` pushes the user message before the first LLM
+                        // call, so a failure leaves an orphan trailing user
+                        // turn. Pop it so the next turn doesn't start with
+                        // `user,user`, then persist the repaired history.
+                        zero_hermes::agent::repair_history_after_failure(history);
+                        if let Err(e) = memory.save_history(&session_id, history) {
+                            tracing::warn!(error = %e, "saving durable session history failed");
+                        }
+                        // Never leave the user with silence: send a short
+                        // error reply (truncated so a huge provider body
+                        // can't blow past Telegram's message cap).
+                        let reply = zero_hermes::util::truncate_bytes(
+                            &format!("Sorry, I hit an error: {e}"),
+                            400,
+                        );
+                        if let Err(e) = reply_channel.send(&msg.chat_id, &reply).await {
+                            tracing::warn!(error = %e, "send error reply failed");
+                        }
                     }
                 }
             }
@@ -681,7 +699,7 @@ path = "~/.local/share/zero-hermes/memory.sqlite"
 markdown_path = "memory/MEMORY.md"
 
 [agent]
-max_iterations = 10
+max_iterations = 50
 # Messages retained before the oldest are dropped. Compaction only ever
 # cuts at a boundary that keeps tool calls paired with their results.
 # Set to 0 to disable.

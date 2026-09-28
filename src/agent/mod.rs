@@ -104,7 +104,142 @@ impl ThinkFilter {
 }
 
 /// Maximum iterations the outer loop will run before giving up.
-pub const DEFAULT_MAX_ITERATIONS: usize = 10;
+pub const DEFAULT_MAX_ITERATIONS: usize = 50;
+
+/// Whether a provider error looks transient and is worth retrying.
+///
+/// Matches on the error text for rate-limit / overload / 5xx / timeout
+/// signals. Tool errors never reach this path — only `llm.complete` /
+/// stream-establishment failures are retried.
+fn is_transient_provider_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    const MARKERS: &[&str] = &[
+        "rate limit",
+        "ratelimit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "overload",
+        "temporar",
+        "try again",
+        "service unavailable",
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "eof",
+        "broken pipe",
+        "reset by peer",
+    ];
+    MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// Backoff between provider retries (200ms, 800ms, 2s): up to 3 retries.
+const RETRY_BACKOFFS_MS: [u64; 3] = [200, 800, 2000];
+
+/// Call `llm.complete`, retrying transient provider errors up to 3 times
+/// with exponential backoff. Tool errors are never retried — they surface
+/// through [`dispatch_tool`], not this path.
+async fn complete_with_retry<P: LlmProvider + ?Sized>(
+    llm: &P,
+    system: Option<&str>,
+    history: &[Message],
+    tool_schemas: &[serde_json::Value],
+) -> Result<Completion> {
+    let mut attempt = 0usize;
+    loop {
+        match llm.complete(system, history, tool_schemas).await {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                if attempt >= RETRY_BACKOFFS_MS.len() || !is_transient_provider_error(&e) {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_BACKOFFS_MS[attempt]))
+                    .await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Dispatch one round of tool calls: read-only tools run concurrently,
+/// mutating tools run sequentially in input order. Results are returned
+/// in input order so the caller can zip them back with the requests.
+async fn dispatch_tool_calls(
+    tools: &ToolRegistry,
+    calls: &[ToolCall],
+    ctx: &ToolContext,
+) -> Vec<ToolResult> {
+    use std::collections::HashMap;
+    let readonly: HashMap<usize, bool> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, tc)| {
+            let ro = tools.get(&tc.name).is_some_and(|t| t.is_read_only());
+            (i, ro)
+        })
+        .collect();
+    let ro_indices: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| readonly[i])
+        .map(|(i, _)| i)
+        .collect();
+    // Concurrent batch for the side-effect-free calls.
+    let ro_results = futures::future::join_all(
+        ro_indices
+            .iter()
+            .map(|&i| dispatch_tool(tools, &calls[i], ctx)),
+    )
+    .await;
+    let mut out: Vec<Option<ToolResult>> = calls.iter().map(|_| None).collect();
+    for (&idx, res) in ro_indices.iter().zip(ro_results) {
+        out[idx] = Some(res);
+    }
+    // Mutating calls (and unknown tools) run one at a time, in order.
+    for (i, tc) in calls.iter().enumerate() {
+        if out[i].is_none() {
+            out[i] = Some(dispatch_tool(tools, tc, ctx).await);
+        }
+    }
+    // Every slot is filled above, but a missing slot must never panic the
+    // daemon (release sets `panic = "abort"`): degrade to an error result
+    // naming the unmatched call instead.
+    out.into_iter()
+        .zip(calls.iter())
+        .map(|(r, tc)| {
+            r.unwrap_or_else(|| ToolResult::err(&tc.id, "internal error: missing tool result"))
+        })
+        .collect()
+}
+
+/// Repair `history` after a failed [`run`] / [`run_stream`] turn.
+///
+/// `run` pushes the user message before the first LLM call, so a provider
+/// error leaves an orphan trailing user turn that would make the next turn
+/// start with `user,user`. Pop it — but only when it is a plain-text user
+/// message. A trailing `tool_result` message must be kept: popping it
+/// would orphan the preceding assistant `tool_use` and corrupt the
+/// transcript worse than the duplicate role would.
+pub fn repair_history_after_failure(history: &mut Vec<Message>) -> bool {
+    let Some(last) = history.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false;
+    }
+    let has_result = last
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+    if has_result {
+        return false;
+    }
+    history.pop();
+    true
+}
 
 /// Default number of messages retained before compaction kicks in.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 50;
@@ -190,7 +325,7 @@ pub async fn run<P: LlmProvider + ?Sized>(
         tracing::debug!(iteration, "agent loop iteration");
         compact_history(history, limits.context_window);
         context::compact_history_to_tokens(history, limits.context_tokens);
-        let mut completion = llm.complete(system, history, &tool_schemas).await?;
+        let mut completion = complete_with_retry(llm, system, history, &tool_schemas).await?;
         completion.text = completion.text.map(|text| strip_think_blocks(&text));
 
         if completion.tool_calls.is_empty() {
@@ -214,13 +349,7 @@ pub async fn run<P: LlmProvider + ?Sized>(
         }
         history.push(Message::assistant(blocks));
 
-        let results = futures::future::join_all(
-            completion
-                .tool_calls
-                .iter()
-                .map(|tc| dispatch_tool(tools, tc, ctx)),
-        )
-        .await;
+        let results = dispatch_tool_calls(tools, &completion.tool_calls, ctx).await;
         history.push(Message::tool_results(results));
     }
 
@@ -284,43 +413,74 @@ where
 
         // Consume the stream fully inside this scope so the immutable
         // borrow of `history` (and the other refs) ends before we
-        // push to it below.
+        // push to it below. Stream establishment is retried up to 3
+        // times on transient errors — but only while nothing has been
+        // emitted yet, so the UI never sees duplicated deltas.
         let (completion, current_text) = {
-            let mut stream = llm.stream(system, history, &tool_schemas);
+            let mut attempt = 0usize;
+            loop {
+                let mut stream = llm.stream(system, history, &tool_schemas);
 
-            let mut current_text = String::new();
-            let mut think_filter = ThinkFilter::default();
-            let mut event: Option<StreamEvent> = None;
+                let mut current_text = String::new();
+                let mut think_filter = ThinkFilter::default();
+                let mut event: Option<StreamEvent> = None;
+                let mut emitted_any = false;
+                let mut stream_err: Option<anyhow::Error> = None;
 
-            while let Some(item) = stream.next().await {
-                let ev = item?;
-                match ev {
-                    StreamEvent::TextDelta(s) => {
-                        let visible = think_filter.push(&s);
-                        if !visible.is_empty() {
-                            on_event(StreamTurn::TextDelta(visible.clone()));
-                            current_text.push_str(&visible);
+                while let Some(item) = stream.next().await {
+                    let ev = match item {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            stream_err = Some(e);
+                            break;
                         }
-                    }
-                    StreamEvent::ToolUseBlock(tc) => {
-                        on_event(StreamTurn::ToolUse(tc));
-                    }
-                    StreamEvent::Done(mut completion) => {
-                        let visible = think_filter.finish();
-                        if !visible.is_empty() {
-                            on_event(StreamTurn::TextDelta(visible.clone()));
-                            current_text.push_str(&visible);
+                    };
+                    match ev {
+                        StreamEvent::TextDelta(s) => {
+                            let visible = think_filter.push(&s);
+                            if !visible.is_empty() {
+                                on_event(StreamTurn::TextDelta(visible.clone()));
+                                emitted_any = true;
+                                current_text.push_str(&visible);
+                            }
                         }
-                        completion.text = (!current_text.is_empty()).then(|| current_text.clone());
-                        event = Some(StreamEvent::Done(completion));
-                        break;
+                        StreamEvent::ToolUseBlock(tc) => {
+                            on_event(StreamTurn::ToolUse(tc));
+                            emitted_any = true;
+                        }
+                        StreamEvent::Done(mut completion) => {
+                            let visible = think_filter.finish();
+                            if !visible.is_empty() {
+                                on_event(StreamTurn::TextDelta(visible.clone()));
+                                emitted_any = true;
+                                current_text.push_str(&visible);
+                            }
+                            completion.text =
+                                (!current_text.is_empty()).then(|| current_text.clone());
+                            event = Some(StreamEvent::Done(completion));
+                            break;
+                        }
                     }
                 }
+                if let Some(e) = stream_err {
+                    if !emitted_any
+                        && attempt < RETRY_BACKOFFS_MS.len()
+                        && is_transient_provider_error(&e)
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            RETRY_BACKOFFS_MS[attempt],
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                let Some(StreamEvent::Done(completion)) = event else {
+                    anyhow::bail!("LLM stream ended without a Done event");
+                };
+                break (completion, current_text);
             }
-            let Some(StreamEvent::Done(completion)) = event else {
-                anyhow::bail!("LLM stream ended without a Done event");
-            };
-            (completion, current_text)
         };
 
         if completion.tool_calls.is_empty() {
@@ -345,13 +505,7 @@ where
             }
         }
 
-        let results = futures::future::join_all(
-            completion
-                .tool_calls
-                .iter()
-                .map(|tc| dispatch_tool(tools, tc, ctx)),
-        )
-        .await;
+        let results = dispatch_tool_calls(tools, &completion.tool_calls, ctx).await;
         for (tc, result) in completion.tool_calls.iter().zip(results.iter()) {
             on_event(StreamTurn::ToolResult {
                 name: tc.name.clone(),
@@ -420,5 +574,294 @@ mod tests {
     #[test]
     fn unterminated_thinking_is_not_shown() {
         assert_eq!(strip_think_blocks("answer<think>private"), "answer");
+    }
+
+    #[test]
+    fn transient_markers_catch_rate_limits_and_5xx() {
+        for msg in [
+            "LLM returned 429: rate limit exceeded",
+            "LLM returned 503: overloaded",
+            "LLM request failed: timeout",
+            "service unavailable, try again later",
+        ] {
+            assert!(
+                is_transient_provider_error(&anyhow::anyhow!(msg)),
+                "{msg} should be transient"
+            );
+        }
+        assert!(!is_transient_provider_error(&anyhow::anyhow!(
+            "tool_use without id"
+        )));
+        assert!(!is_transient_provider_error(&anyhow::anyhow!(
+            "unknown tool: nope"
+        )));
+    }
+
+    #[test]
+    fn repair_pops_orphan_plain_user_message() {
+        let mut h = vec![Message::user("earlier"), Message::assistant_text("reply")];
+        assert!(!repair_history_after_failure(&mut h));
+        assert_eq!(h.len(), 2);
+
+        h.push(Message::user("failed turn"));
+        assert!(repair_history_after_failure(&mut h));
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.last().expect("history").role, "assistant");
+    }
+
+    #[test]
+    fn repair_keeps_tool_results_to_avoid_orphaning_tool_use() {
+        let mut h = vec![
+            Message::user("go"),
+            Message::assistant(vec![ContentBlock::ToolUse(ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            })]),
+            Message::tool_results(vec![ToolResult::ok("c1", "out")]),
+        ];
+        assert!(!repair_history_after_failure(&mut h));
+        assert_eq!(h.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Flaky {
+            failures_left: AtomicUsize,
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmProvider for Flaky {
+            async fn complete(
+                &self,
+                _system: Option<&str>,
+                _messages: &[Message],
+                _tools: &[serde_json::Value],
+            ) -> Result<Completion> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if self.failures_left.fetch_sub(1, Ordering::SeqCst) > 0 {
+                    return Err(anyhow::anyhow!("LLM returned 503: overloaded"));
+                }
+                Ok(Completion {
+                    text: Some("recovered".into()),
+                    tool_calls: Vec::new(),
+                })
+            }
+        }
+
+        let llm = Flaky {
+            failures_left: AtomicUsize::new(2),
+            attempts: AtomicUsize::new(0),
+        };
+        let reg = ToolRegistry::new();
+        let mut history = Vec::new();
+        let out = run(
+            &llm,
+            &reg,
+            None,
+            &mut history,
+            "hi",
+            RunLimits::iterations(3),
+            &ToolContext::default(),
+        )
+        .await
+        .expect("retry should recover");
+        assert_eq!(out, "recovered");
+        assert_eq!(llm.attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_on_permanent_errors() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Broken {
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LlmProvider for Broken {
+            async fn complete(
+                &self,
+                _system: Option<&str>,
+                _messages: &[Message],
+                _tools: &[serde_json::Value],
+            ) -> Result<Completion> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("tool_use without id"))
+            }
+        }
+
+        let llm = Broken {
+            attempts: AtomicUsize::new(0),
+        };
+        let reg = ToolRegistry::new();
+        let mut history = Vec::new();
+        let err = run(
+            &llm,
+            &reg,
+            None,
+            &mut history,
+            "hi",
+            RunLimits::iterations(3),
+            &ToolContext::default(),
+        )
+        .await
+        .expect_err("permanent errors must not be retried");
+        assert!(err.to_string().contains("tool_use without id"));
+        assert_eq!(llm.attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_dispatch_preserves_input_order() {
+        use async_trait::async_trait;
+
+        struct Ro;
+        #[async_trait]
+        impl Tool for Ro {
+            fn name(&self) -> &str {
+                "ro"
+            }
+            fn description(&self) -> &str {
+                "read-only"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                input: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::ok(
+                    input
+                        .get("v")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ))
+            }
+        }
+
+        struct Mutating;
+        #[async_trait]
+        impl Tool for Mutating {
+            fn name(&self) -> &str {
+                "mut_tool"
+            }
+            fn description(&self) -> &str {
+                "mutating"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                input: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput> {
+                Ok(ToolOutput::ok(
+                    input
+                        .get("v")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ))
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.insert_always(std::sync::Arc::new(Ro));
+        reg.insert_always(std::sync::Arc::new(Mutating));
+        let ctx = ToolContext::default();
+        let calls = vec![
+            ToolCall {
+                id: "1".into(),
+                name: "mut_tool".into(),
+                input: serde_json::json!({"v": "first"}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "ro".into(),
+                input: serde_json::json!({"v": "second"}),
+            },
+            ToolCall {
+                id: "3".into(),
+                name: "mut_tool".into(),
+                input: serde_json::json!({"v": "third"}),
+            },
+        ];
+        let results = dispatch_tool_calls(&reg, &calls, &ctx).await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tool_use_id, "1");
+        assert_eq!(results[0].content, "first");
+        assert_eq!(results[1].tool_use_id, "2");
+        assert_eq!(results[1].content, "second");
+        assert_eq!(results[2].tool_use_id, "3");
+        assert_eq!(results[2].content, "third");
+    }
+
+    #[tokio::test]
+    async fn mutating_tools_run_serially() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Serial {
+            live: std::sync::Arc<AtomicUsize>,
+            max_live: std::sync::Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Tool for Serial {
+            fn name(&self) -> &str {
+                "serial"
+            }
+            fn description(&self) -> &str {
+                "mutating"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput> {
+                let n = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_live.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolOutput::ok("ok"))
+            }
+        }
+
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_live = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.insert_always(std::sync::Arc::new(Serial {
+            live: live.clone(),
+            max_live: max_live.clone(),
+        }));
+        let ctx = ToolContext::default();
+        let calls: Vec<ToolCall> = (0..4)
+            .map(|i| ToolCall {
+                id: format!("c{i}"),
+                name: "serial".into(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let results = dispatch_tool_calls(&reg, &calls, &ctx).await;
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            max_live.load(Ordering::SeqCst),
+            1,
+            "mutating tools must not overlap"
+        );
     }
 }
