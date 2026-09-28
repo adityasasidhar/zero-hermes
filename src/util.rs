@@ -18,6 +18,18 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     out
 }
 
+/// Truncate `s` to at most `max_chars` characters, appending `…` when
+/// truncation occurred. Character-based counterpart to [`truncate_bytes`]
+/// for budgets expressed in characters (prompt-section caps).
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// Expand a leading `~` or `~/` in a path against the user's home directory.
 ///
 /// Config files are written by hand and by `init-config`, and `~` in a TOML
@@ -243,6 +255,16 @@ mod tests {
     #[test]
     fn empty_string() {
         assert_eq!(truncate_bytes("", 5), "");
+    }
+
+    #[test]
+    fn truncate_chars_counts_characters_not_bytes() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        assert_eq!(truncate_chars("hello world", 5), "hello\u{2026}");
+        // Six multi-byte chars capped at four: no split codepoint, no panic.
+        assert_eq!(truncate_chars("é".repeat(6).as_str(), 4), "éééé\u{2026}");
+        assert_eq!(truncate_chars("", 5), "");
     }
 
     #[test]

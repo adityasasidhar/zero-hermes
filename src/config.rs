@@ -169,9 +169,12 @@ pub struct MemoryConfig {
     /// Path to the SQLite database file. `None` -> in-memory.
     #[serde(default = "default_memory_path_opt")]
     pub path: Option<PathBuf>,
-    /// Optional Markdown memory injected into the system prompt on every turn.
+    /// Agent-owned durable facts (Hermes `MEMORY.md` side).
     #[serde(default = "default_memory_markdown_path")]
     pub markdown_path: Option<PathBuf>,
+    /// User-owned stable facts (Hermes `USER.md` side).
+    #[serde(default = "default_memory_user_path")]
+    pub user_path: Option<PathBuf>,
 }
 
 fn default_memory_path_opt() -> Option<PathBuf> {
@@ -182,11 +185,16 @@ fn default_memory_markdown_path() -> Option<PathBuf> {
     Some(PathBuf::from("memory/MEMORY.md"))
 }
 
+fn default_memory_user_path() -> Option<PathBuf> {
+    Some(PathBuf::from("memory/USER.md"))
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             path: Some(default_memory_path()),
             markdown_path: default_memory_markdown_path(),
+            user_path: default_memory_user_path(),
         }
     }
 }
@@ -310,6 +318,9 @@ impl Config {
         }
         if let Some(p) = &self.memory.markdown_path {
             self.memory.markdown_path = Some(crate::util::expand_tilde(p));
+        }
+        if let Some(p) = &self.memory.user_path {
+            self.memory.user_path = Some(crate::util::expand_tilde(p));
         }
         if let Some(p) = &self.skills_dir {
             self.skills_dir = Some(crate::util::expand_tilde(p));
@@ -486,5 +497,38 @@ prompt = "say pong"
         cfg.provider.api_key = "sk-literal".into();
         cfg.expand_env();
         assert_eq!(cfg.provider.api_key, "sk-literal");
+    }
+
+    #[test]
+    fn memory_split_defaults_to_user_and_agent_files() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.memory.user_path,
+            Some(PathBuf::from("memory/USER.md")),
+            "stable user facts live in USER.md"
+        );
+        assert_eq!(
+            cfg.memory.markdown_path,
+            Some(PathBuf::from("memory/MEMORY.md")),
+            "agent-owned facts live in MEMORY.md"
+        );
+    }
+
+    #[test]
+    fn tilde_in_user_path_is_expanded_on_load() {
+        let home = dirs::home_dir().expect("home dir");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("zero_hermes.toml");
+        std::fs::write(
+            &p,
+            "[memory]\nuser_path = \"~/memory/USER.md\"\nmarkdown_path = \"~/memory/MEMORY.md\"\n",
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert_eq!(cfg.memory.user_path.unwrap(), home.join("memory/USER.md"));
+        assert_eq!(
+            cfg.memory.markdown_path.unwrap(),
+            home.join("memory/MEMORY.md")
+        );
     }
 }
