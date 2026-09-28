@@ -82,7 +82,9 @@ choice would materially alter the outcome.
 You have a persistent memory tool. Use it for compact, durable facts that
 reduce future user steering: stable user preferences, environment details,
 tool quirks, and long-lived project conventions. Write declarative facts, not
-imperative instructions to yourself.
+imperative instructions to yourself. When the user states a durable fact
+about themselves, their environment, or the project, persist it with the
+memory tool without being asked.
 
 Do not save secrets, temporary task progress, session outcomes, completed-work
 logs, ephemeral TODOs, issue numbers, commit hashes, or information likely to
@@ -147,39 +149,102 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
 
 /// Render the system prompt, substituting the skill index and persistent memory.
 pub fn build_system_prompt(cfg: &Config, skills: &SkillRegistry) -> String {
+    build_system_prompt_with_notes(cfg, skills, &[])
+}
+
+/// Render the system prompt with durable SQLite notes injected alongside the
+/// Markdown sidecars.
+///
+/// The agent only sees notes when it asks via the `memory` tool, so a prompt
+/// built without this stays blind to everything stored from earlier sessions.
+/// Callers that hold a [`crate::memory::Memory`] handle should prefer
+/// [`build_system_prompt_with_memory`].
+pub fn build_system_prompt_with_notes(
+    cfg: &Config,
+    skills: &SkillRegistry,
+    notes: &[(String, String)],
+) -> String {
     let base = cfg
         .provider
         .system
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let memory_section = format!(
+        "{}\n\n## Durable notes (SQLite)\n{}",
+        load_markdown_memory(cfg),
+        render_notes_section(notes)
+    );
     base.replace("{{SKILLS}}", &skills.render_index())
-        .replace("{{MEMORY}}", &load_markdown_memory(cfg))
+        .replace("{{MEMORY}}", &memory_section)
 }
+
+/// [`build_system_prompt_with_notes`], loading the notes from `memory`.
+///
+/// An unreadable notes table degrades to "(no SQLite notes)" rather than a
+/// startup failure — same leniency as the Markdown sidecars.
+pub fn build_system_prompt_with_memory(
+    cfg: &Config,
+    skills: &SkillRegistry,
+    memory: Option<&crate::memory::Memory>,
+) -> String {
+    let notes = memory.and_then(|m| m.list_notes().ok()).unwrap_or_default();
+    build_system_prompt_with_notes(cfg, skills, &notes)
+}
+
+/// Render stored SQLite notes for prompt injection: the first 20 entries,
+/// each capped at 200 bytes.
+fn render_notes_section(notes: &[(String, String)]) -> String {
+    if notes.is_empty() {
+        return "(no SQLite notes)".to_string();
+    }
+    notes
+        .iter()
+        .take(20)
+        .map(|(key, value)| format!("- {key}: {}", crate::util::truncate_bytes(value, 200)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Prompt-injection budget for the user-owned sidecar, in characters.
+pub const USER_MD_CHARS: usize = 1375;
+/// Prompt-injection budget for the agent-owned sidecar, in characters.
+pub const MEMORY_MD_CHARS: usize = 2200;
 
 /// Load user-owned Markdown memory for injection into the system prompt.
 ///
+/// Hermes splits durable Markdown into user-owned `USER.md` (stable facts
+/// about the human) and agent-owned `MEMORY.md` (learned conventions); both
+/// are injected with Hermes-sized caps so one bloated sidecar cannot evict
+/// the other from the prompt.
+///
 /// An unreadable or absent file is not a startup failure: SQLite-backed notes
-/// still work, and installations that omit the optional sidecar remain usable.
+/// still work, and installations that omit the optional sidecars remain usable.
 fn load_markdown_memory(cfg: &Config) -> String {
-    let Some(path) = cfg.memory.markdown_path.as_deref() else {
-        return "(memory: in-process SQLite; no Markdown memory file configured)".to_string();
+    let user = load_markdown_file(cfg.memory.user_path.as_deref(), "USER.md", USER_MD_CHARS);
+    let memory = load_markdown_file(
+        cfg.memory.markdown_path.as_deref(),
+        "MEMORY.md",
+        MEMORY_MD_CHARS,
+    );
+    format!("## USER.md\n{user}\n\n## MEMORY.md\n{memory}")
+}
+
+/// Load one Markdown sidecar, truncating non-empty content to `cap_chars`.
+fn load_markdown_file(path: Option<&std::path::Path>, label: &str, cap_chars: usize) -> String {
+    let Some(path) = path else {
+        return format!("(no {label} configured)");
     };
     match std::fs::read_to_string(path) {
-        Ok(contents) if !contents.trim().is_empty() => format!(
-            "Persistent user memory from {}:\n{}",
-            path.display(),
-            contents.trim()
-        ),
-        Ok(_) => "(memory: in-process SQLite; Markdown memory file is empty)".to_string(),
+        Ok(contents) if !contents.trim().is_empty() => {
+            crate::util::truncate_chars(contents.trim(), cap_chars)
+        }
+        Ok(_) => format!("({label} is empty)"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!(
-                "(memory: in-process SQLite; no Markdown memory at {})",
-                path.display()
-            )
+            format!("(no {label} at {})", path.display())
         }
         Err(e) => {
             tracing::warn!(?path, error = %e, "failed to load Markdown memory");
-            "(memory: in-process SQLite; Markdown memory file could not be read)".to_string()
+            format!("({label} could not be read)")
         }
     }
 }
@@ -301,6 +366,84 @@ mod tests {
 
         let prompt = build_system_prompt(&cfg, &SkillRegistry::new());
         assert!(prompt.contains("User prefers concise answers."));
+    }
+
+    #[test]
+    fn system_prompt_injects_both_sidecars_with_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("USER.md");
+        let memory = dir.path().join("MEMORY.md");
+        std::fs::write(&user, "Lives in Berlin.").unwrap();
+        std::fs::write(&memory, "Repo uses conventional commits.").unwrap();
+        let mut cfg = Config::default();
+        cfg.memory.user_path = Some(user);
+        cfg.memory.markdown_path = Some(memory);
+
+        let prompt = build_system_prompt(&cfg, &SkillRegistry::new());
+        assert!(prompt.contains("## USER.md"));
+        assert!(prompt.contains("Lives in Berlin."));
+        assert!(prompt.contains("## MEMORY.md"));
+        assert!(prompt.contains("Repo uses conventional commits."));
+    }
+
+    #[test]
+    fn sidecars_are_truncated_to_hermes_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("USER.md");
+        let memory = dir.path().join("MEMORY.md");
+        std::fs::write(&user, "u".repeat(USER_MD_CHARS + 100)).unwrap();
+        std::fs::write(&memory, "m".repeat(MEMORY_MD_CHARS + 100)).unwrap();
+        let mut cfg = Config::default();
+        cfg.memory.user_path = Some(user);
+        cfg.memory.markdown_path = Some(memory);
+
+        let prompt = build_system_prompt(&cfg, &SkillRegistry::new());
+        // Isolate the USER block: the full prompt carries the whole system
+        // preamble, so measuring from the prompt start would count it too.
+        let user_block = prompt
+            .split("## USER.md")
+            .nth(1)
+            .unwrap_or_default()
+            .split("## MEMORY.md")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            user_block.chars().count() <= USER_MD_CHARS + 8,
+            "USER.md must not exceed its cap"
+        );
+        assert!(prompt.contains('\u{2026}'), "truncation marker expected");
+    }
+
+    #[test]
+    fn system_prompt_injects_sqlite_notes() {
+        let notes = vec![
+            ("preference".to_string(), "concise answers".to_string()),
+            ("project".to_string(), "uses cargo workspaces".to_string()),
+        ];
+        let prompt =
+            build_system_prompt_with_notes(&Config::default(), &SkillRegistry::new(), &notes);
+        assert!(prompt.contains("## Durable notes (SQLite)"));
+        assert!(prompt.contains("preference"));
+        assert!(prompt.contains("concise answers"));
+    }
+
+    #[test]
+    fn system_prompt_without_notes_marks_the_section_empty() {
+        let prompt = build_system_prompt(&Config::default(), &SkillRegistry::new());
+        assert!(prompt.contains("## Durable notes (SQLite)"));
+        assert!(prompt.contains("(no SQLite notes)"));
+    }
+
+    #[test]
+    fn system_prompt_with_memory_reads_notes_from_the_store() {
+        let memory = crate::memory::Memory::in_memory().unwrap();
+        memory.write_note("k", "v").unwrap();
+        let prompt = build_system_prompt_with_memory(
+            &Config::default(),
+            &SkillRegistry::new(),
+            Some(&memory),
+        );
+        assert!(prompt.contains("- k: v"));
     }
 
     #[test]

@@ -37,8 +37,13 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::agent::{run_stream, LlmProvider, Message, RunLimits, StreamTurn, ToolContext};
 use crate::error::Result;
-use crate::memory::Memory;
+use crate::memory::{recall_section, Memory};
 use crate::tools::ToolRegistry;
+
+/// Durable session id for the single shared web conversation. The web UI
+/// keeps one in-memory history like the CLI chat, so it gets one stable
+/// session row to append to.
+pub const WEB_SESSION_ID: &str = "web-default";
 
 /// Events the web UI cares about. Anything an agent does that's user-visible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,17 +195,24 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
     tokio::spawn(async move {
         let ctx = ToolContext {
             cwd: None,
-            session_id: None,
-            memory: Some(memory),
+            session_id: Some(WEB_SESSION_ID.to_string()),
+            memory: Some(memory.clone()),
         };
         // Hold the history mutex for the duration of the agent run. This
         // serializes turns (the previous RwLock was misleading — we
         // always wrote).
         let mut history_guard = history.lock().await;
+        // Recall is injected every turn so the agent sees past context
+        // without having to ask via the memory tool first.
+        let effective_system = match recall_section(&memory, &message, Some(WEB_SESSION_ID), 4) {
+            Some(section) => format!("{system}\n\n{section}"),
+            None => system,
+        };
+        let len_before = history_guard.len();
         let result = run_stream(
             provider.as_ref(),
             tools.as_ref(),
-            Some(&system),
+            Some(&effective_system),
             &mut history_guard,
             &message,
             limits,
@@ -232,10 +244,21 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
             },
         )
         .await;
-        if let Err(e) = result {
-            state_for_loop.emit(UiEvent::Error {
-                message: e.to_string(),
-            });
+        match result {
+            Ok(_) => {
+                // Append only the delta: the agent loop compacts the
+                // in-memory history in place, so persisting the whole vector
+                // would delete the durable prefix.
+                let start = len_before.min(history_guard.len());
+                if let Err(e) = memory.append_messages(WEB_SESSION_ID, &history_guard[start..]) {
+                    tracing::warn!(error = %e, "saving web history failed");
+                }
+            }
+            Err(e) => {
+                state_for_loop.emit(UiEvent::Error {
+                    message: e.to_string(),
+                });
+            }
         }
     });
 

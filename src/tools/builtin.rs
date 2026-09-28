@@ -375,7 +375,10 @@ impl Tool for MemoryTool {
         "memory"
     }
     fn description(&self) -> &str {
-        "Read or write a memory note. action='read'|'write'|'list'|'delete'."
+        "Durable memory: read, write, list, delete, or search notes and past conversation. \
+         Proactively write compact declarative facts the user states (stable preferences, \
+         environment details, project conventions) without being asked; never store secrets \
+         or ephemeral task state. action='read'|'write'|'list'|'delete'|'search'."
     }
     fn schema(&self) -> Value {
         json!({
@@ -437,7 +440,7 @@ impl Tool for MemoryTool {
             }
             "search" => {
                 let query = key()?;
-                let hits = memory.search_history(query, 8)?;
+                let hits = memory.search_history_excluding(query, 8, ctx.session_id.as_deref())?;
                 Ok(ToolOutput::ok(
                     hits.into_iter()
                         .map(|hit| {

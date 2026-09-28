@@ -131,29 +131,90 @@ pub fn compact_history_to_tokens(history: &mut Vec<Message>, max_tokens: usize) 
     false
 }
 
+/// Replace an old, complete prefix with a bounded extractive summary.
+///
+/// This is deliberately extractive, not abstractive: compaction runs inside
+/// a synchronous helper with no provider handle, so a model-written summary
+/// is not possible here. A full LLM summarizer (background call, transcript
+/// handoff) is deferred to Wave E; until then the durable SQLite transcript
+/// remains the source of truth and this prefix only keeps the tail coherent.
 fn summarize_prefix(messages: &[Message], cap: usize) -> String {
-    let cap = cap.clamp(32, 3_000);
-    let mut out = String::from("[Earlier conversation summary]\n");
-    for message in messages {
-        let text = message.text();
-        if text.trim().is_empty() || out.len() >= cap {
-            continue;
+    /// Maximum sentences in the extractive prefix.
+    const MAX_SENTENCES: usize = 12;
+    const HEADER: &str =
+        "[Earlier conversation summary — extractive; full transcript in durable memory]\n";
+    let cap = cap.clamp(HEADER.len() + 32, 3_000);
+    let mut out = String::from(HEADER);
+    // Gather deduplicated sentences, user turns first: when the budget only
+    // fits a few lines, what the human asked outranks assistant chatter.
+    let mut seen = std::collections::HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    for user_first in [true, false] {
+        for message in messages {
+            let is_user = message.role != "assistant";
+            if is_user != user_first {
+                continue;
+            }
+            let label = if message.role == "assistant" {
+                "Assistant"
+            } else {
+                "User"
+            };
+            for sentence in split_sentences(&message.text()) {
+                if seen.insert(sentence.to_lowercase()) {
+                    lines.push(format!("{label}: {sentence}"));
+                }
+            }
         }
-        let label = if message.role == "assistant" {
-            "Assistant"
-        } else {
-            "User"
-        };
-        let room = cap.saturating_sub(out.len() + label.len() + 3);
+    }
+    for line in lines.into_iter().take(MAX_SENTENCES) {
+        if out.len() >= cap {
+            break;
+        }
+        let room = cap.saturating_sub(out.len() + 1);
         if room == 0 {
             break;
         }
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(&crate::util::truncate_bytes(&text, room));
+        out.push_str(&crate::util::truncate_bytes(&line, room));
         out.push('\n');
     }
     out
+}
+
+/// Split text into sentence-ish chunks on `.`/`!`/`?` and newline boundaries.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            let s = current.trim().to_string();
+            if !s.is_empty() {
+                sentences.push(s);
+            }
+            current.clear();
+            continue;
+        }
+        current.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let boundary = match chars.peek() {
+                None => true,
+                Some(n) => n.is_whitespace(),
+            };
+            if boundary {
+                let s = current.trim().to_string();
+                if !s.is_empty() {
+                    sentences.push(s);
+                }
+                current.clear();
+            }
+        }
+    }
+    let tail = current.trim().to_string();
+    if !tail.is_empty() {
+        sentences.push(tail);
+    }
+    sentences
 }
 
 #[cfg(test)]
@@ -263,9 +324,14 @@ mod tests {
     #[test]
     fn token_compaction_keeps_a_summary_and_safe_tail() {
         let mut h: Vec<Message> = (1..=3).flat_map(exchange).collect();
-        assert!(compact_history_to_tokens(&mut h, 40));
+        // Budget must fit the summary header (~81 bytes) plus one exchange
+        // tail: 57-token history needs 51 < budget <= 57 to compact at all.
+        assert!(compact_history_to_tokens(&mut h, 56));
         assert!(h[0].text().contains("Earlier conversation summary"));
-        assert!(estimate_tokens(&h) <= 40);
+        assert!(h[0]
+            .text()
+            .contains("extractive; full transcript in durable memory"));
+        assert!(estimate_tokens(&h) <= 56);
         // Merged into the tail head: history still starts with a user
         // turn and never holds two same-role messages in a row.
         assert_eq!(h[0].role, "user");
@@ -326,5 +392,29 @@ mod tests {
         for pair in h.windows(2) {
             assert_ne!(pair[0].role, pair[1].role);
         }
+    }
+
+    #[test]
+    fn extractive_summary_dedupes_and_prefers_user_sentences() {
+        let h = vec![
+            Message::user("My editor is helix. My editor is helix."),
+            Message::assistant_text("Noted, helix it is. My editor is helix."),
+        ];
+        let summary = summarize_prefix(&h, 3_000);
+        assert!(
+            summary.contains("extractive; full transcript in durable memory"),
+            "marker: {summary}"
+        );
+        assert_eq!(
+            summary.matches("My editor is helix").count(),
+            1,
+            "repeated sentence kept once: {summary}"
+        );
+        let user_pos = summary.find("User:").unwrap_or(usize::MAX);
+        let assistant_pos = summary.find("Assistant:").unwrap_or(usize::MAX);
+        assert!(
+            user_pos < assistant_pos,
+            "user sentences come first: {summary}"
+        );
     }
 }
