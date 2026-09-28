@@ -210,7 +210,7 @@ pub struct AgentConfig {
 }
 
 fn default_max_iterations() -> usize {
-    10
+    50
 }
 
 fn default_context_window() -> usize {
@@ -343,14 +343,14 @@ mod tests {
     fn defaults_are_sane() {
         let cfg = Config::default();
         assert!(cfg.provider.base_url.starts_with("https://"));
-        assert_eq!(cfg.agent.max_iterations, 10);
+        assert_eq!(cfg.agent.max_iterations, 50);
         assert!(cfg.memory.path.is_some());
     }
 
     #[test]
     fn load_missing_returns_default() {
         let cfg = load(Path::new("/tmp/__definitely_missing__.toml")).unwrap();
-        assert_eq!(cfg.agent.max_iterations, 10);
+        assert_eq!(cfg.agent.max_iterations, 50);
     }
 
     #[test]
@@ -442,7 +442,7 @@ prompt = "say pong"
         )
         .expect("a partial config should parse");
         assert_eq!(cfg.agent.enabled_tools, vec!["read".to_string()]);
-        assert_eq!(cfg.agent.max_iterations, 10);
+        assert_eq!(cfg.agent.max_iterations, 50);
         assert_eq!(cfg.agent.context_window, 50);
         assert_eq!(cfg.provider.api_key, "sk-x");
         assert_eq!(cfg.provider.model, "MiniMax-M3");

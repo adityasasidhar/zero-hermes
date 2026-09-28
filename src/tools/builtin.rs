@@ -37,6 +37,9 @@ impl Tool for BashTool {
             "required": ["command"]
         })
     }
+    fn is_read_only(&self) -> bool {
+        false
+    }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
@@ -204,6 +207,9 @@ impl Tool for ReadTool {
             "required": ["path"]
         })
     }
+    fn is_read_only(&self) -> bool {
+        true
+    }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
@@ -244,6 +250,9 @@ impl Tool for WriteTool {
             },
             "required": ["path", "content"]
         })
+    }
+    fn is_read_only(&self) -> bool {
+        false
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
@@ -310,6 +319,9 @@ impl Tool for FetchTool {
             "required": ["url"]
         })
     }
+    fn is_read_only(&self) -> bool {
+        true
+    }
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
@@ -375,6 +387,12 @@ impl Tool for MemoryTool {
             },
             "required": ["action"]
         })
+    }
+    /// Conservative: `read`/`list`/`search` are side-effect free, but
+    /// `write`/`delete` mutate. The trait only offers a static flag, so
+    /// report `false` and run serially rather than risk concurrent writes.
+    fn is_read_only(&self) -> bool {
+        false
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
@@ -467,6 +485,12 @@ impl Tool for SkillTool {
                 "content": {"type": "string", "description": "full SKILL.md content for write"}
             }, "required": ["action"]
         })
+    }
+    /// Conservative: `list`/`read` are side-effect free, but `write`
+    /// creates files. The trait only offers a static flag, so report
+    /// `false` and run serially rather than risk concurrent writes.
+    fn is_read_only(&self) -> bool {
+        false
     }
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
@@ -568,6 +592,11 @@ impl Tool for SubAgentTool {
                 "timeout": {"type": "integer", "description": "Per-child timeout seconds (default 120, max 600)."}
             }
         })
+    }
+    /// Sub-agents inherit the parent's tools (including `bash`/`write`),
+    /// so they can mutate. Always run serially.
+    fn is_read_only(&self) -> bool {
+        false
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]

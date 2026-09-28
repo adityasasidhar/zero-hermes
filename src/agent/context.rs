@@ -95,12 +95,34 @@ pub fn compact_history_to_tokens(history: &mut Vec<Message>, max_tokens: usize) 
         let summary_cap = (max_tokens - tail_tokens)
             .saturating_mul(4)
             .saturating_sub(32);
-        let mut compacted = Vec::with_capacity(history.len() - cut + 1);
-        compacted.push(Message::user(summarize_prefix(
-            &history[..cut],
-            summary_cap,
-        )));
-        compacted.extend_from_slice(&history[cut..]);
+        let summary = summarize_prefix(&history[..cut], summary_cap);
+        // Merge the summary into the tail head instead of pushing a
+        // separate user message: the tail head is always a plain user
+        // turn (`is_safe_head`), so a separate message would produce
+        // `user,user` and break role alternation. Prepending keeps one
+        // user message at the head.
+        let mut compacted = Vec::with_capacity(history.len() - cut);
+        let mut tail = history[cut..].to_vec();
+        if let Some(head) = tail.first_mut() {
+            let merged = format!("{summary}\n\n---\n{}", head.text());
+            if let Some(block) = head.content.first_mut() {
+                match block {
+                    ContentBlock::Text { text } => {
+                        *text = merged;
+                    }
+                    _ => {
+                        head.content.insert(0, ContentBlock::Text { text: merged });
+                    }
+                }
+            } else {
+                head.content.push(ContentBlock::Text { text: merged });
+            }
+        } else {
+            // No tail (shouldn't happen — the cut range excludes an empty
+            // tail): keep a single user summary so history never empties.
+            tail.push(Message::user(summary));
+        }
+        compacted.extend_from_slice(&tail);
         if estimate_tokens(&compacted) <= max_tokens {
             *history = compacted;
             return true;
@@ -244,5 +266,65 @@ mod tests {
         assert!(compact_history_to_tokens(&mut h, 40));
         assert!(h[0].text().contains("Earlier conversation summary"));
         assert!(estimate_tokens(&h) <= 40);
+        // Merged into the tail head: history still starts with a user
+        // turn and never holds two same-role messages in a row.
+        assert_eq!(h[0].role, "user");
+        for pair in h.windows(2) {
+            // `tool_result` user messages legitimately follow an assistant
+            // `tool_use`; anything else must alternate.
+            let prev_has_tool_use = pair[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_)));
+            let next_has_result = pair[1]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+            if prev_has_tool_use && next_has_result {
+                continue;
+            }
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "compaction introduced {:?},{:?}",
+                pair[0].role, pair[1].role
+            );
+        }
+    }
+
+    #[test]
+    fn token_compaction_merges_summary_into_tail_head() {
+        // Two plain user/assistant pairs with no tool traffic: the cut
+        // lands on the second user turn, and the summary must be merged
+        // into it rather than pushed as its own message.
+        let mut h = vec![
+            Message::user(
+                "first question with a long backstory that runs on and on \
+                 with plenty of detail about the project history and goals \
+                 and constraints so it consumes a good share of the budget",
+            ),
+            Message::assistant_text(
+                "first answer with an equally long explanation covering the \
+                 approach taken and the alternatives considered in detail \
+                 so it also consumes a good share of the token budget",
+            ),
+            Message::user("second question with enough text to be kept"),
+            Message::assistant_text("second answer with enough text to be kept"),
+        ];
+        // Budget above the tail cost so a cut is feasible, with room for
+        // the merged summary head.
+        let tail_tokens = estimate_tokens(&h[2..]);
+        let budget = tail_tokens + 60;
+        assert!(estimate_tokens(&h) > budget);
+        assert!(compact_history_to_tokens(&mut h, budget));
+        assert_eq!(h[0].role, "user");
+        assert!(h[0].text().contains("Earlier conversation summary"));
+        assert!(
+            h[0].text().contains("second question"),
+            "tail head text survives under the summary: {}",
+            h[0].text()
+        );
+        for pair in h.windows(2) {
+            assert_ne!(pair[0].role, pair[1].role);
+        }
     }
 }
