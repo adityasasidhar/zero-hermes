@@ -1,5 +1,4 @@
-//! Minimal web UI: axum + SSE, single-page app with a textarea input and a
-//! streaming message list.
+//! Local web UI: axum + SSE, a single-page chat console.
 //!
 //! Architecture:
 //!
@@ -10,8 +9,16 @@
 //!   streams events to the browser.
 //! - `GET /` serves the static `index.html`.
 //!
-//! The UI is intentionally tiny — one HTML file, ~30 lines of vanilla JS
-//! using `EventSource` to render streaming events. No framework, no bundler.
+//! The UI is one HTML file — no framework, no bundler, no build step — but a
+//! complete console: it submits with `fetch` so a turn never navigates away,
+//! renders streaming markdown, shows tool calls as collapsible cards, and
+//! keeps session/connection state in a sidebar. `/send` still accepts a plain
+//! form POST, so the page degrades without JavaScript.
+//!
+//! The page's script escapes all model and tool output and then validates the
+//! parsed nodes against an allowlist before they reach the live DOM (see
+//! `setMd`/`sanitize` in `web/index.html`). The `{{CSRF_TOKEN}}` placeholder is
+//! substituted by [`serve_index`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -112,7 +119,8 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The page itself — vanilla DOM, one tiny script for EventSource.
+/// The page itself — vanilla DOM, no dependencies. See the `index.html`
+/// header/section comments for the structure of the client.
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
 /// Placeholder in `web/index.html` replaced with the live CSRF token.

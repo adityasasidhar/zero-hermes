@@ -1,68 +1,1249 @@
 <!DOCTYPE html>
-<html>
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
 <title>zero-hermes</title>
+<script>
+  // Resolve the theme before first paint so there is no flash of the wrong
+  // palette. `dark` is the default; an explicit choice wins, then the OS.
+  (function () {
+    try {
+      var saved = localStorage.getItem('zh-theme');
+      var os = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = saved === 'light' || saved === 'dark' ? saved : os;
+    } catch (e) { /* private mode: keep the default */ }
+  })();
+</script>
 <style>
-  body { font: 14px/1.4 ui-monospace, monospace; margin: 1em; background: #0f0f0f; color: #eee; max-width: 800px; }
-  #msgs { list-style: none; padding: 0; }
-  #msgs li { margin: 4px 0; padding: 6px 10px; border-radius: 4px; }
-  li.user { background: #1e3a5f; }
-  li.text { background: #2a2a2a; white-space: pre-wrap; }
-  li.tool { background: #3a2a2a; color: #fa3; font-size: 12px; }
-  li.tool_result { background: #2a2a3a; color: #aaf; font-size: 12px; white-space: pre-wrap; }
-  li.done { background: #2a3a2a; color: #8f8; font-size: 12px; }
-  li.error { background: #5a1a1a; color: #f88; }
-  textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; background: #1a1a1a; color: #eee; border: 1px solid #444; }
-  button { padding: 8px 16px; background: #2a4a2a; color: #fff; border: 0; cursor: pointer; }
-  h1 { font-size: 16px; }
-  .meta { color: #888; font-size: 11px; }
+  /* ---------------------------------------------------------------- tokens */
+  :root {
+    --bg: #0a0c11;
+    --surface: #10141c;
+    --surface-2: #161b26;
+    --surface-3: #1b2130;
+    --border: #232b3a;
+    --border-soft: #1a202c;
+    --text: #e8edf7;
+    --muted: #8c99ad;
+    --muted-2: #606c80;
+    --accent: #5b8cff;
+    --accent-2: #82a6ff;
+    --accent-soft: rgba(91, 140, 255, 0.13);
+    --user-bg: rgba(91, 140, 255, 0.10);
+    --user-border: rgba(91, 140, 255, 0.34);
+    --tool: #f0b45f;
+    --tool-soft: rgba(240, 180, 95, 0.10);
+    --ok: #3ddc97;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+    --err-soft: rgba(255, 107, 107, 0.12);
+    --code-bg: #0b0f16;
+    --shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f7fb;
+    --surface: #ffffff;
+    --surface-2: #f0f3f9;
+    --surface-3: #e8ecf5;
+    --border: #dde3ee;
+    --border-soft: #e9edf5;
+    --text: #131a26;
+    --muted: #5d6a7e;
+    --muted-2: #8792a5;
+    --accent: #2f6bff;
+    --accent-2: #1749d6;
+    --accent-soft: rgba(47, 107, 255, 0.10);
+    --user-bg: rgba(47, 107, 255, 0.07);
+    --user-border: rgba(47, 107, 255, 0.30);
+    --tool: #a26400;
+    --tool-soft: rgba(162, 100, 0, 0.08);
+    --ok: #0f9d63;
+    --warn: #b06f00;
+    --err: #d23b3b;
+    --err-soft: rgba(210, 59, 59, 0.09);
+    --code-bg: #f3f5fa;
+    --shadow: 0 8px 28px rgba(20, 30, 60, 0.12);
+  }
+
+  /* ----------------------------------------------------------------- base */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, textarea, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  svg { display: block; flex: none; }
+
+  /* ----------------------------------------------------------------- shell */
+  .app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
+
+  .sidebar {
+    width: 286px; flex: none; display: flex; flex-direction: column;
+    background: var(--surface); border-right: 1px solid var(--border);
+    z-index: 30;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 11px;
+    padding: 18px 18px 14px;
+  }
+  .brand-mark {
+    width: 34px; height: 34px; flex: none; border-radius: 10px;
+    display: grid; place-items: center;
+    background: linear-gradient(145deg, var(--accent-soft), transparent 70%), var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--accent-2);
+  }
+  .brand-name { font-weight: 650; letter-spacing: -0.01em; font-size: 15px; }
+  .brand-sub { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+
+  .side-scroll { flex: 1; overflow-y: auto; padding: 4px 12px 12px; }
+  .side-section { margin: 12px 6px 0; }
+  .side-label {
+    font-size: 10.5px; letter-spacing: 0.09em; text-transform: uppercase;
+    color: var(--muted-2); font-weight: 600; margin: 0 0 8px 4px;
+  }
+
+  .status-card {
+    background: var(--surface-2); border: 1px solid var(--border-soft);
+    border-radius: 12px; padding: 11px 12px;
+  }
+  .status-row { display: flex; align-items: center; gap: 9px; font-size: 13px; }
+  .status-row + .status-row { margin-top: 7px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted-2); }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(61, 220, 151, 0.5); animation: pulse 2.4s infinite; }
+  .dot.reconnecting { background: var(--warn); animation: pulse 1.2s infinite; }
+  .dot.offline { background: var(--err); }
+  .dot.busy { background: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(61, 220, 151, 0.45); }
+    70% { box-shadow: 0 0 0 6px rgba(61, 220, 151, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(61, 220, 151, 0); }
+  }
+  .status-k { color: var(--muted-2); min-width: 58px; }
+  .status-v { color: var(--text); }
+
+  .side-actions { display: grid; gap: 7px; }
+  .side-btn {
+    display: flex; align-items: center; gap: 9px;
+    background: var(--surface-2); border: 1px solid var(--border-soft);
+    color: var(--text); border-radius: 10px; padding: 9px 11px;
+    font-size: 13px; text-align: left; transition: background 0.14s, border-color 0.14s;
+  }
+  .side-btn:hover { background: var(--surface-3); border-color: var(--border); }
+  .side-btn svg { color: var(--muted); }
+  .side-btn:hover svg { color: var(--accent-2); }
+  .side-btn kbd { margin-left: auto; }
+
+  .shortcut { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); padding: 4px 4px; }
+  .shortcut span { color: var(--text); }
+  kbd {
+    font-family: var(--mono); font-size: 10.5px; line-height: 1;
+    padding: 4px 6px; border-radius: 6px; color: var(--muted);
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-bottom-width: 2px; white-space: nowrap;
+  }
+  .side-note {
+    display: flex; gap: 8px; align-items: flex-start;
+    font-size: 11.5px; line-height: 1.5; color: var(--muted);
+    padding: 11px 12px; margin: 0 0 4px;
+    background: var(--tool-soft); border: 1px solid var(--border-soft); border-radius: 12px;
+  }
+  .side-note svg { color: var(--warn); margin-top: 1px; }
+  .side-note b { color: var(--text); font-weight: 600; }
+
+  /* -------------------------------------------------------------- topbar */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .topbar-title { font-weight: 600; font-size: 14px; }
+  .topbar-sub { color: var(--muted-2); font-size: 12px; margin-left: 2px; }
+  .topbar-spacer { flex: 1; }
+  .icon-btn {
+    width: 34px; height: 34px; display: grid; place-items: center;
+    background: transparent; border: 1px solid transparent; border-radius: 10px;
+    color: var(--muted);
+  }
+  .icon-btn:hover { background: var(--surface-2); border-color: var(--border-soft); color: var(--text); }
+  .nav-toggle { display: none; }
+
+  /* --------------------------------------------------------------- stream */
+  .stream { flex: 1; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; }
+  .stream-inner { max-width: 860px; margin: 0 auto; padding: 26px 20px 36px; }
+
+  .welcome { padding: 8vh 0 24px; text-align: center; }
+  .welcome-mark {
+    width: 60px; height: 60px; margin: 0 auto 18px; border-radius: 18px;
+    display: grid; place-items: center; color: var(--accent-2);
+    background: radial-gradient(120% 120% at 30% 20%, var(--accent-soft), transparent 70%), var(--surface);
+    border: 1px solid var(--border);
+  }
+  .welcome h1 { font-size: 22px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  .welcome p { color: var(--muted); margin: 0 auto 26px; max-width: 46ch; }
+  .chips { display: flex; flex-wrap: wrap; gap: 9px; justify-content: center; }
+  .chip {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 999px; padding: 9px 15px; font-size: 13px;
+    transition: border-color 0.14s, background 0.14s, transform 0.14s;
+  }
+  .chip:hover { border-color: var(--accent); background: var(--accent-soft); transform: translateY(-1px); }
+
+  /* blocks appended to the stream are `.block` for consistent spacing */
+  .block { margin-bottom: 22px; animation: rise 0.22s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+  .msg { display: flex; gap: 12px; }
+  .avatar {
+    width: 30px; height: 30px; flex: none; border-radius: 9px; margin-top: 2px;
+    display: grid; place-items: center; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--muted);
+  }
+  .msg.user .avatar { color: var(--accent-2); border-color: var(--user-border); background: var(--user-bg); }
+  .msg.assistant .avatar { color: var(--ok); }
+  .msg.system .avatar, .msg.error .avatar { color: var(--warn); border-color: var(--border); }
+  .msg.error .avatar { color: var(--err); }
+  .msg-main { min-width: 0; flex: 1; }
+  .msg-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 5px; }
+  .msg-role { font-size: 11.5px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); }
+  .msg.user .msg-role { color: var(--accent-2); }
+  .msg-time { font-size: 11px; color: var(--muted-2); }
+  .msg-tools { margin-left: auto; display: flex; gap: 2px; opacity: 0; transition: opacity 0.14s; }
+  .msg:hover .msg-tools, .msg:focus-within .msg-tools { opacity: 1; }
+  .mini-btn {
+    background: transparent; border: 1px solid transparent; color: var(--muted-2);
+    border-radius: 7px; padding: 2px 7px; font-size: 11px; display: flex; align-items: center; gap: 4px;
+  }
+  .mini-btn:hover { background: var(--surface-2); border-color: var(--border-soft); color: var(--text); }
+
+  .bubble {
+    background: var(--surface); border: 1px solid var(--border-soft);
+    border-radius: 4px 12px 12px 12px; padding: 12px 15px;
+    overflow-wrap: anywhere;
+  }
+  .msg.user .bubble { background: var(--user-bg); border-color: var(--user-border); }
+  .msg.error .bubble { background: var(--err-soft); border-color: var(--err); }
+  .msg.system .bubble { background: var(--tool-soft); }
+
+  /* markdown rendered inside bubbles */
+  .bubble > :first-child { margin-top: 0; }
+  .bubble > :last-child { margin-bottom: 0; }
+  .bubble p { margin: 0 0 10px; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 { margin: 16px 0 8px; line-height: 1.3; letter-spacing: -0.01em; }
+  .bubble h1 { font-size: 18px; } .bubble h2 { font-size: 16px; } .bubble h3 { font-size: 14.5px; } .bubble h4 { font-size: 14px; }
+  .bubble ul, .bubble ol { margin: 0 0 10px; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble blockquote {
+    margin: 0 0 10px; padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border); color: var(--muted);
+  }
+  .bubble hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+  .bubble a { color: var(--accent-2); text-underline-offset: 2px; }
+  .bubble code {
+    font-family: var(--mono); font-size: 0.88em; background: var(--code-bg);
+    border: 1px solid var(--border-soft); border-radius: 5px; padding: 1px 5px;
+  }
+  .bubble pre {
+    background: var(--code-bg); border: 1px solid var(--border-soft);
+    border-radius: 10px; padding: 11px 13px; overflow-x: auto; margin: 0 0 10px;
+  }
+  .bubble pre code { background: none; border: 0; padding: 0; font-size: 12.5px; line-height: 1.5; }
+  .code-wrap { position: relative; }
+  .code-wrap .mini-btn { position: absolute; top: 7px; right: 7px; background: var(--surface); border-color: var(--border-soft); opacity: 0; }
+  .code-wrap:hover .mini-btn { opacity: 1; }
+
+  .caret {
+    display: inline-block; width: 7px; height: 1.02em; margin-left: 2px;
+    vertical-align: -2px; background: var(--accent); border-radius: 1px;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+
+  /* ---------------------------------------------------------------- tools */
+  .tool {
+    background: var(--surface); border: 1px solid var(--border-soft);
+    border-radius: 12px; overflow: hidden;
+  }
+  .tool + .tool { margin-top: 8px; }
+  .tool > summary {
+    display: flex; align-items: center; gap: 9px; padding: 9px 12px;
+    cursor: pointer; list-style: none; user-select: none;
+  }
+  .tool > summary::-webkit-details-marker { display: none; }
+  .tool > summary:hover { background: var(--surface-2); }
+  .tool-glyph {
+    width: 22px; height: 22px; flex: none; border-radius: 7px; display: grid; place-items: center;
+    background: var(--tool-soft); color: var(--tool);
+  }
+  .tool-name { font-weight: 620; font-size: 13px; color: var(--tool); }
+  .tool-arg {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0;
+  }
+  .tool-chev { color: var(--muted-2); transition: transform 0.16s; }
+  .tool[open] .tool-chev { transform: rotate(90deg); }
+  .tool-body { border-top: 1px solid var(--border-soft); padding: 10px 12px 12px; }
+  .tool-body pre {
+    margin: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+    background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 9px;
+    padding: 10px 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .tool-body .result-label {
+    font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted-2); font-weight: 600; margin: 0 0 6px 2px;
+  }
+  .tool-body .result { margin-top: 10px; }
+  .tool-body .result.err .result-label { color: var(--err); }
+  .tool-body .result.err pre { border-color: var(--err); background: var(--err-soft); }
+  .tool .badge {
+    font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border-soft); color: var(--muted);
+  }
+  .tool .badge.run { color: var(--warn); border-color: var(--warn); }
+
+  /* -------------------------------------------------------------- working */
+  .working { display: flex; align-items: center; gap: 11px; color: var(--muted); font-size: 13px; }
+  .working .avatar { color: var(--accent-2); }
+  .bounce { display: inline-flex; gap: 4px; }
+  .bounce i {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: bounce 1.2s infinite ease-in-out;
+  }
+  .bounce i:nth-child(2) { animation-delay: 0.15s; }
+  .bounce i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.5; } 30% { transform: translateY(-4px); opacity: 1; } }
+
+  /* ------------------------------------------------------------- composer */
+  .composer-wrap {
+    position: relative; border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+  }
+  .composer-inner { max-width: 860px; margin: 0 auto; }
+  .composer {
+    display: flex; align-items: flex-end; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 9px 9px 9px 14px;
+    transition: border-color 0.16s, box-shadow 0.16s;
+  }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  #composer-input {
+    flex: 1; min-width: 0; resize: none; border: 0; background: transparent;
+    padding: 6px 0; max-height: 220px; line-height: 1.5; outline: none;
+  }
+  #composer-input::placeholder { color: var(--muted-2); }
+  .send-btn {
+    width: 38px; height: 38px; flex: none; border-radius: 11px; border: 0;
+    display: grid; place-items: center; color: #fff;
+    background: linear-gradient(180deg, var(--accent-2), var(--accent));
+    transition: filter 0.14s, transform 0.14s, opacity 0.14s;
+  }
+  .send-btn:hover:not(:disabled) { filter: brightness(1.08); }
+  .send-btn:active:not(:disabled) { transform: translateY(1px); }
+  .send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .composer-hint {
+    display: flex; gap: 14px; align-items: center; justify-content: center;
+    margin-top: 8px; font-size: 11.5px; color: var(--muted-2); flex-wrap: wrap;
+  }
+  .composer-hint kbd { font-size: 9.5px; padding: 3px 5px; }
+
+  .jump {
+    position: absolute; right: 26px; top: -46px;
+    width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    box-shadow: var(--shadow); opacity: 0; pointer-events: none;
+    transition: opacity 0.16s, transform 0.16s;
+  }
+  .jump.show { opacity: 1; pointer-events: auto; }
+  .jump:hover { transform: translateY(-2px); }
+
+  .backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
+    z-index: 25; opacity: 0; transition: opacity 0.2s;
+  }
+
+  /* ------------------------------------------------------------ scrollbar */
+  .stream::-webkit-scrollbar, .side-scroll::-webkit-scrollbar { width: 10px; }
+  .stream::-webkit-scrollbar-thumb, .side-scroll::-webkit-scrollbar-thumb {
+    background: var(--surface-3); border-radius: 999px; border: 3px solid transparent; background-clip: content-box;
+  }
+  .stream::-webkit-scrollbar-thumb:hover, .side-scroll::-webkit-scrollbar-thumb:hover { background: var(--border); background-clip: content-box; }
+
+  /* --------------------------------------------------------------- mobile */
+  @media (max-width: 880px) {
+    .sidebar {
+      position: fixed; inset: 0 auto 0 0; transform: translateX(-100%);
+      transition: transform 0.22s ease; box-shadow: var(--shadow); width: 84vw; max-width: 320px;
+    }
+    body.nav-open .sidebar { transform: none; }
+    body.nav-open .backdrop { display: block; opacity: 1; }
+    .nav-toggle { display: grid; }
+    .stream-inner { padding: 20px 14px 30px; }
+    .composer-wrap { padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); }
+    .topbar { padding: 10px 12px; }
+    .welcome { padding-top: 5vh; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+    .stream { scroll-behavior: auto; }
+  }
 </style>
 </head>
 <body>
-<h1>zero-hermes</h1>
-<div class="meta">open <code>http://127.0.0.1:8088/</code> in your browser &mdash; SSE-driven, vanilla JS</div>
-<ul id="msgs"></ul>
-<form id="f" method="POST" action="/send">
-  <!-- Injected by the server per process. Without it /send is a simple
-       cross-origin form target, and the agent has a shell tool. -->
-  <input type="hidden" name="csrf" value="{{CSRF_TOKEN}}">
-  <textarea id="m" name="message" rows="3" placeholder="ask the agent..." autofocus></textarea>
-  <button type="submit">send</button>
-</form>
+<div class="app">
+
+  <!-- ---------------------------------------------------------- sidebar -->
+  <aside class="sidebar" id="sidebar" aria-label="Session panel">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6.5C4 5 5 4 6.5 4h11C19 4 20 5 20 6.5v8c0 1.5-1 2.5-2.5 2.5H9l-5 4v-4.5"/>
+          <path d="M8 9l2.2 2.2L8 13.4M12.5 13.4H16"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">zero-hermes</div>
+        <div class="brand-sub">local agent console</div>
+      </div>
+    </div>
+
+    <div class="side-scroll">
+      <div class="side-section">
+        <p class="side-label">Status</p>
+        <div class="status-card">
+          <div class="status-row">
+            <span class="dot" id="conn-dot" aria-hidden="true"></span>
+            <span class="status-k">stream</span>
+            <span class="status-v" id="conn-text">connecting…</span>
+          </div>
+          <div class="status-row">
+            <span class="dot" id="turn-dot" aria-hidden="true"></span>
+            <span class="status-k">agent</span>
+            <span class="status-v" id="turn-text">idle</span>
+          </div>
+          <div class="status-row">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M4 5h16v11H4zM8 20h8M12 16v4"/>
+            </svg>
+            <span class="status-k">turns</span>
+            <span class="status-v" id="turn-count">0</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <p class="side-label">Session</p>
+        <div class="side-actions">
+          <button class="side-btn" id="btn-new" type="button" title="Clears this page only — the agent still remembers the conversation">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+            Clear view
+          </button>
+          <button class="side-btn" id="btn-copy" type="button">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>
+            </svg>
+            <span id="btn-copy-label">Copy transcript</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <p class="side-label">Shortcuts</p>
+        <div class="shortcut"><kbd>Enter</kbd><span>send</span></div>
+        <div class="shortcut"><kbd>Shift</kbd><kbd>Enter</kbd><span>new line</span></div>
+        <div class="shortcut"><kbd>/</kbd><span>focus the input</span></div>
+        <div class="shortcut"><kbd id="mod-k">Ctrl</kbd><kbd>K</kbd><span>clear view</span></div>
+      </div>
+
+      <div class="side-section">
+        <p class="side-label">Notes</p>
+        <div class="side-note" id="security-note">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><path d="M12 9v4M12 16h.01"/>
+          </svg>
+          <span id="security-text">The agent can run shell commands on this machine. <b>Keep this bound to loopback</b> and treat every conversation as code execution. Clearing the view does not clear the agent's memory.</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <div class="backdrop" id="backdrop"></div>
+
+  <!-- ------------------------------------------------------------- main -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn nav-toggle" id="nav-toggle" type="button" aria-label="Open session panel" aria-controls="sidebar" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16"/>
+        </svg>
+      </button>
+      <div>
+        <div class="topbar-title">Conversation</div>
+      </div>
+      <span class="topbar-sub" id="endpoint"></span>
+      <div class="topbar-spacer"></div>
+      <button class="icon-btn" id="btn-theme" type="button" aria-label="Toggle light and dark theme" title="Toggle theme">
+        <svg id="theme-dark" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/>
+        </svg>
+        <svg id="theme-light" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" style="display:none">
+          <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="stream" id="stream" tabindex="-1">
+      <div class="stream-inner" id="stream-inner">
+        <section class="welcome" id="welcome">
+          <div class="welcome-mark" aria-hidden="true">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 6.5C4 5 5 4 6.5 4h11C19 4 20 5 20 6.5v8c0 1.5-1 2.5-2.5 2.5H9l-5 4v-4.5"/>
+              <path d="M8 9l2.2 2.2L8 13.4M12.5 13.4H16"/>
+            </svg>
+          </div>
+          <h1>What should the agent do?</h1>
+          <p>One Rust binary with shell, file, HTTP, memory, skill and subagent tools. Answers stream here as they are produced.</p>
+          <div class="chips" id="chips">
+            <button class="chip" type="button">What tools do you have, and how do I use them?</button>
+            <button class="chip" type="button">List the files in this project and explain the structure.</button>
+            <button class="chip" type="button">Search your memory for anything about this machine.</button>
+            <button class="chip" type="button">Write a one-line summary of the README.</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <button class="jump" id="jump" type="button" aria-label="Scroll to newest message" title="Jump to newest">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M6 13l6 6 6-6"/>
+        </svg>
+      </button>
+      <div class="composer-inner">
+        <form class="composer" id="composer" method="POST" action="/send" autocomplete="off">
+          <!-- Injected by the server per process. Without it /send is a simple
+               cross-origin form target, and the agent has a shell tool. -->
+          <input type="hidden" name="csrf" value="{{CSRF_TOKEN}}">
+          <textarea id="composer-input" name="message" rows="1"
+                    placeholder="Ask the agent…" aria-label="Message" autofocus></textarea>
+          <button class="send-btn" id="send" type="submit" aria-label="Send message" title="Send (Enter)">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 12l16-8-6 8 6 8z"/>
+            </svg>
+          </button>
+        </form>
+        <div class="composer-hint">
+          <span><kbd>Enter</kbd> send</span>
+          <span><kbd>Shift</kbd>+<kbd>Enter</kbd> new line</span>
+          <span id="hint-note">The agent can run commands — review tool output before trusting it.</span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<noscript>
+  <p style="padding:16px;font-family:sans-serif">zero-hermes needs JavaScript for the streaming UI. Enable it, or use <code>zero-hermes chat</code> in a terminal.</p>
+</noscript>
+
+<div class="sr-only" id="live" aria-live="polite" aria-atomic="true"></div>
+
 <script>
-const msgs = document.getElementById('msgs');
-const form = document.getElementById('f');
-const input = document.getElementById('m');
+(function () {
+  'use strict';
 
-function append(cls, text) {
-  const li = document.createElement('li');
-  li.className = cls;
-  li.textContent = text;
-  msgs.appendChild(li);
-  window.scrollTo(0, document.body.scrollHeight);
-  return li;
-}
+  // ------------------------------------------------------------- element refs
+  var $ = function (id) { return document.getElementById(id); };
+  var stream = $('stream');
+  var streamInner = $('stream-inner');
+  var welcome = $('welcome');
+  var form = $('composer');
+  var input = $('composer-input');
+  var sendBtn = $('send');
+  var jump = $('jump');
+  var live = $('live');
+  var connDot = $('conn-dot'), connText = $('conn-text');
+  var turnDot = $('turn-dot'), turnText = $('turn-text'), turnCountEl = $('turn-count');
+  var securityText = $('security-text');
+  var csrf = form.querySelector('input[name="csrf"]');
 
-const es = new EventSource('/events');
-es.onmessage = (ev) => {
-  const e = JSON.parse(ev.data);
-  if (e.type === 'text_delta') {
-    const last = msgs.querySelector('li.text:last-child');
-    if (last) last.textContent += e.delta;
-    else append('text', e.delta);
-  } else if (e.type === 'user') append('user', '> ' + e.text);
-  else if (e.type === 'tool_use') append('tool', 'tool: ' + e.name + ' ' + JSON.stringify(e.input));
-  else if (e.type === 'tool_result') append('tool_result', 'tool[' + e.name + ']: ' + (e.is_error ? 'ERR ' : '') + e.output);
-  else if (e.type === 'done') { append('done', '\u2713 done'); input.value = ''; input.focus(); }
-  else if (e.type === 'error') append('error', 'error: ' + e.message);
-  else if (e.type === 'lagged') append('error', '\u26a0 missed ' + e.missed + ' events \u2014 some output was dropped');
-};
-es.onerror = () => append('error', 'sse connection lost \u2014 refresh to reconnect');
+  // ------------------------------------------------------------------ state
+  var state = {
+    busy: false,
+    streaming: null,     // element receiving text deltas for the current turn
+    streamText: '',      // raw markdown accumulated for that element
+    pendingEcho: null,   // user text we rendered optimistically
+    waiting: [],         // tool cards awaiting a result (FIFO per name)
+    working: null,       // the animated "working" row
+    atBottom: true,
+    turns: 0,
+    transcript: [],      // { role, text } for "copy transcript"
+    started: false       // welcome screen removed once the first message lands
+  };
 
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.submit(); }
-});
+  if (navigator.platform && /mac/i.test(navigator.platform)) $('mod-k').textContent = '⌘';
+
+  var IS_LOOPBACK = location.protocol === 'file:' || /^(127\.0\.0\.1|localhost|\[::1\]|::1)$/.test(location.hostname);
+  $('endpoint').textContent = location.host;
+  if (!IS_LOOPBACK) {
+    securityText.textContent = 'This console is reachable beyond loopback. Anyone who can open it can drive the shell tool. Bind to 127.0.0.1 or put it behind your own auth.';
+    document.querySelector('.side-note svg').style.color = 'var(--err)';
+  }
+
+  // ---------------------------------------------------------------- helpers
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function timeNow() {
+    var d = new Date();
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function announce(msg) { live.textContent = msg; }
+
+  // The markdown renderer escapes everything before it emits markup. These
+  // helpers then parse that markup in an inert document and run every node
+  // through an allowlist before it reaches the live DOM — so the escaping is
+  // the primary defence and this filter is a second one that survives future
+  // renderer changes.
+  var MD_TAGS = { A: 1, P: 1, BR: 1, STRONG: 1, EM: 1, CODE: 1, PRE: 1, H1: 1, H2: 1, H3: 1, H4: 1, UL: 1, OL: 1, LI: 1, BLOCKQUOTE: 1, HR: 1, DIV: 1, SPAN: 1, BUTTON: 1 };
+  var MD_ATTRS = { href: 1, target: 1, rel: 1, class: 1, type: 1, 'data-copy': 1 };
+
+  function parseHtml(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    return Array.prototype.slice.call(doc.body.childNodes);
+  }
+  function sanitize(nodes) {
+    nodes.forEach(function walk(node) {
+      if (node.nodeType !== 1) return;
+      if (!MD_TAGS[node.tagName]) { node.remove(); return; }
+      Array.prototype.slice.call(node.attributes).forEach(function (attr) {
+        if (!MD_ATTRS[attr.name]) node.removeAttribute(attr.name);
+      });
+      if (node.tagName === 'A' && !/^https?:\/\//i.test(node.getAttribute('href') || '')) {
+        node.removeAttribute('href');
+      }
+      Array.prototype.slice.call(node.childNodes).forEach(walk);
+    });
+    return nodes;
+  }
+  function setMd(node, src) {
+    node.replaceChildren.apply(node, sanitize(parseHtml(renderMd(src))));
+  }
+  function iconNode(name) { return parseHtml(ICONS[name])[0]; }
+
+  // ------------------------------------------------------------------ icons
+  var ICONS = {
+    user: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.4"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/></svg>',
+    bot: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 13h.01M15 13h.01M9 16.5h6"/></svg>',
+    tool: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0 5 5L21 21l-3 .5L8.5 12A4 4 0 0 1 3 6.5L6 9l3-3z"/></svg>',
+    chevron: '<svg class="tool-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+    warn: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>',
+    err: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5h.01"/></svg>',
+    copy: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+    check: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 7"/></svg>'
+  };
+
+  // ------------------------------------------------------- tiny md renderer
+  // Escapes first, then applies a deliberately small markdown subset. Nothing
+  // is ever injected unescaped, so model output cannot become markup.
+  function inlineMd(s) {
+    var codes = [];
+    // inline code first, so its contents are not touched by other passes
+    s = s.replace(/`([^`\n]+)`/g, function (m, c) {
+      codes.push(c);
+      return '\u0000c' + (codes.length - 1) + '\u0000';
+    });
+    // [text](url) before bare-URL autolinking
+    var links = [];
+    s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function (m, t, u) {
+      links.push([t, u]);
+      return '\u0001' + (links.length - 1) + '\u0001';
+    });
+    // bold / italic (operate on escaped text; no HTML tags exist yet)
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[\s(])_([^_\n]+)_/g, '$1<em>$2</em>');
+    // bare URLs, with trailing punctuation pulled back out of the link
+    s = s.replace(/https?:\/\/[^\s<]+/g, function (m) {
+      var url = m, tail = '';
+      while (/[.,;:!?)\]]$/.test(url)) { tail = url.slice(-1) + tail; url = url.slice(0, -1); }
+      return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>' + tail;
+    });
+    // restore markdown links
+    s = s.replace(/\u0001(\d+)\u0001/g, function (m, i) {
+      var l = links[+i];
+      return '<a href="' + l[1] + '" target="_blank" rel="noopener noreferrer">' + l[0] + '</a>';
+    });
+    // restore inline code
+    s = s.replace(/\u0000c(\d+)\u0000/g, function (m, i) { return '<code>' + codes[+i] + '</code>'; });
+    return s;
+  }
+
+  function codeBlock(lang, body) {
+    var cls = lang ? ' class="language-' + esc(lang) + '"' : '';
+    return '<div class="code-wrap"><pre><code' + cls + '>' + body + '</code></pre>' +
+      '<button class="mini-btn" type="button" data-copy="block">' + ICONS.copy + 'Copy</button></div>';
+  }
+
+  function renderMd(src) {
+    if (!src) return '';
+    var fences = [];
+    var s = esc(src).replace(/```([^\n`]*)\n?([\s\S]*?)```/g, function (m, lang, body) {
+      fences.push({ lang: lang.trim(), body: body.replace(/\n$/, '') });
+      return '\u0002F' + (fences.length - 1) + '\u0002';
+    });
+
+    var out = [], para = [], list = null;
+    function flushPara() {
+      if (para.length) { out.push('<p>' + inlineMd(para.join('<br>')) + '</p>'); para = []; }
+    }
+    function flushList() {
+      if (list) {
+        out.push('<' + list.tag + '>' + list.items.map(function (i) { return '<li>' + inlineMd(i) + '</li>'; }).join('') + '</' + list.tag + '>');
+        list = null;
+      }
+    }
+
+    s.split('\n').forEach(function (raw) {
+      var line = raw.replace(/\s+$/, '');
+      var m;
+      if ((m = line.match(/^\u0002F(\d+)\u0002$/))) {
+        flushPara(); flushList();
+        out.push(codeBlock(fences[+m[1]].lang, fences[+m[1]].body));
+        return;
+      }
+      if (!line.trim()) { flushPara(); flushList(); return; }
+      if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+        flushPara(); flushList();
+        var lvl = Math.min(4, m[1].length);
+        out.push('<h' + lvl + '>' + inlineMd(m[2]) + '</h' + lvl + '>');
+        return;
+      }
+      if (/^\s*([-*_])\s*\1\s*\1[\s\S]*$/.test(line)) { flushPara(); flushList(); out.push('<hr>'); return; }
+      if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+        flushPara();
+        if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; }
+        list.items.push(m[1]); return;
+      }
+      if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+        flushPara();
+        if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; }
+        list.items.push(m[1]); return;
+      }
+      if ((m = line.match(/^>\s?(.*)$/))) {
+        flushPara(); flushList();
+        out.push('<blockquote>' + inlineMd(m[1]) + '</blockquote>'); return;
+      }
+      flushList();
+      para.push(line);
+    });
+    flushPara(); flushList();
+    return out.join('');
+  }
+
+  // --------------------------------------------------------------- stream UI
+  function nearBottom() {
+    return stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
+  }
+  function scrollToBottom(force) {
+    if (force || state.atBottom) stream.scrollTop = stream.scrollHeight;
+    updateJump();
+  }
+  function showWelcome(show) {
+    welcome.style.display = show ? '' : 'none';
+  }
+  function pushBlock(node) {
+    showWelcome(false);
+    streamInner.appendChild(node);
+    if (state.working && state.working.parentNode) streamInner.appendChild(state.working);
+    scrollToBottom(false);
+    return node;
+  }
+  function clearWorking() {
+    if (state.working && state.working.parentNode) state.working.parentNode.removeChild(state.working);
+    state.working = null;
+  }
+  function setWorking(label) {
+    if (!state.working) {
+      state.working = el('div', 'block working');
+      var avatar = el('div', 'avatar');
+      avatar.appendChild(iconNode('bot'));
+      var bounce = el('div', 'bounce');
+      bounce.setAttribute('aria-hidden', 'true');
+      bounce.appendChild(el('i'));
+      bounce.appendChild(el('i'));
+      bounce.appendChild(el('i'));
+      state.working.appendChild(avatar);
+      state.working.appendChild(bounce);
+      state.working.appendChild(el('span', 'working-label'));
+    }
+    state.working.querySelector('.working-label').textContent = label;
+    streamInner.appendChild(state.working);
+    scrollToBottom(false);
+  }
+
+  function addMsg(role, text, opts) {
+    opts = opts || {};
+    var label = opts.label || ({ user: 'You', assistant: 'zero-hermes', error: 'Error', system: 'System' }[role] || role);
+    var wrap = el('div', 'block msg ' + role);
+
+    var avatar = el('div', 'avatar');
+    avatar.appendChild(iconNode({ user: 'user', assistant: 'bot', error: 'err', system: 'warn' }[role] || 'bot'));
+
+    var head = el('div', 'msg-head');
+    head.appendChild(el('span', 'msg-role', label));
+    head.appendChild(el('span', 'msg-time', timeNow()));
+    var tools = el('span', 'msg-tools');
+    var copyBtn = el('button', 'mini-btn');
+    copyBtn.type = 'button';
+    copyBtn.setAttribute('data-copy', 'msg');
+    copyBtn.appendChild(iconNode('copy'));
+    copyBtn.appendChild(document.createTextNode('Copy'));
+    tools.appendChild(copyBtn);
+    head.appendChild(tools);
+
+    var bubble = el('div', 'bubble');
+    if (opts.raw) bubble.textContent = text; else setMd(bubble, text);
+
+    var main = el('div', 'msg-main');
+    main.appendChild(head);
+    main.appendChild(bubble);
+    wrap.appendChild(avatar);
+    wrap.appendChild(main);
+    pushBlock(wrap);
+    if (role === 'user') { state.turns += 1; turnCountEl.textContent = state.turns; }
+    return { wrap: wrap, bubble: bubble };
+  }
+
+  function summarizeInput(name, input) {
+    if (input == null) return '';
+    if (typeof input === 'string') return input;
+    var keys = Object.keys(input);
+    if (!keys.length) return '';
+    var one = function (v) {
+      var s = typeof v === 'string' ? v : JSON.stringify(v);
+      return String(s).replace(/\s+/g, ' ').trim();
+    };
+    for (var i = 0; i < ['command', 'cmd', 'path', 'file', 'query', 'url', 'name', 'text', 'prompt', 'message'].length; i++) {
+      var k = ['command', 'cmd', 'path', 'file', 'query', 'url', 'name', 'text', 'prompt', 'message'][i];
+      if (input[k] !== undefined) {
+        var val = one(input[k]);
+        return val.length > 120 ? val.slice(0, 119) + '…' : val;
+      }
+    }
+    var j = one(JSON.stringify(input));
+    return j.length > 120 ? j.slice(0, 119) + '…' : j;
+  }
+
+  function addTool(name, input) {
+    var d = document.createElement('details');
+    d.className = 'tool block';
+
+    var summary = el('summary');
+    var glyph = el('span', 'tool-glyph');
+    glyph.appendChild(iconNode('tool'));
+    summary.appendChild(glyph);
+    summary.appendChild(el('span', 'tool-name', name));
+    summary.appendChild(el('span', 'tool-arg', summarizeInput(name, input)));
+    summary.appendChild(iconNode('chevron'));
+
+    var body = el('div', 'tool-body');
+    // Only show the raw arguments when the summary does not already say it all.
+    if (input && typeof input === 'object' && Object.keys(input).length > 1) {
+      body.appendChild(el('pre', null, JSON.stringify(input, null, 2)));
+    }
+    var result = el('div', 'result');
+    var label = el('p', 'result-label');
+    label.appendChild(el('span', 'badge run', 'running'));
+    result.appendChild(label);
+    body.appendChild(result);
+
+    d.appendChild(summary);
+    d.appendChild(body);
+    d._result = result;
+    d._name = name;
+    pushBlock(d);
+    state.waiting.push(d);
+    return d;
+  }
+
+  function completeTool(name, output, isError) {
+    var card = null;
+    for (var i = 0; i < state.waiting.length; i++) {
+      if (state.waiting[i]._name === name) { card = state.waiting.splice(i, 1)[0]; break; }
+    }
+    if (!card) { card = addTool(name, null); state.waiting.pop(); }
+    var result = card._result;
+    result.className = 'result' + (isError ? ' err' : '');
+    result.replaceChildren();
+    result.appendChild(el('p', 'result-label', isError ? 'error' : 'output'));
+    var text = output == null ? '' : String(output);
+    var LIMIT = 20000;
+    var pre = el('pre', null, text.length > LIMIT ? text.slice(0, LIMIT) : text);
+    result.appendChild(pre);
+    if (text.length > LIMIT) {
+      var btn = el('button', 'mini-btn', 'Show all (' + Math.round(text.length / 1024) + ' KB)');
+      btn.type = 'button';
+      btn.style.marginTop = '8px';
+      btn.addEventListener('click', function () {
+        pre.textContent = text;
+        btn.remove();
+      });
+      result.appendChild(btn);
+    }
+    if (isError) card.open = true; // errors are worth seeing without a click
+    // An open card means the user wants the detail; keep it open as results land.
+    if (state.atBottom) scrollToBottom(false);
+  }
+
+  // --------------------------------------------------- streaming transcript
+  var raf = null;
+  function scheduleRender() {
+    if (raf) return;
+    raf = requestAnimationFrame(function () {
+      raf = null;
+      if (!state.streaming) return;
+      // Read the pinned-to-bottom flag *before* the update. Re-measuring here
+      // would see the taller content from the previous chunk and wrongly
+      // decide the user had scrolled away, so the view would stop following.
+      var stick = state.atBottom;
+      setMd(state.streaming.bubble, state.streamText);
+      state.streaming.bubble.appendChild(el('span', 'caret'));
+      if (stick) scrollToBottom(true);
+    });
+  }
+
+  function beginAssistant() {
+    var m = addMsg('assistant', '');
+    state.streaming = m;
+    state.streamText = '';
+    return m;
+  }
+
+  function onTextDelta(delta) {
+    if (!state.streaming) beginAssistant();
+    clearWorking();
+    state.streamText += delta;
+    setTurn('busy', 'responding');
+    scheduleRender();
+  }
+
+  function finishAssistant() {
+    if (state.streaming) {
+      setMd(state.streaming.bubble, state.streamText);
+      if (state.streamText) state.transcript.push({ role: 'assistant', text: state.streamText });
+      state.streaming = null;
+      state.streamText = '';
+      // The final render can arrive after the last streaming frame (a `done`
+      // in the same tick as the last delta), and it can be taller than what
+      // was on screen. Re-pin so a following view is never left short.
+      scrollToBottom(false);
+    }
+  }
+
+  // ---------------------------------------------------------------- status
+  function setConn(kind, text) {
+    connDot.className = 'dot ' + (kind === 'live' ? 'live' : kind === 'reconnecting' ? 'reconnecting' : 'offline');
+    connText.textContent = text;
+  }
+  function setTurn(kind, text) {
+    turnDot.className = 'dot ' + (kind === 'busy' ? 'busy' : '');
+    turnText.textContent = text;
+  }
+  function setBusy(busy) {
+    state.busy = busy;
+    sendBtn.disabled = busy;
+    if (!busy) clearWorking();
+  }
+
+  function resetView() {
+    streamInner.querySelectorAll('.block').forEach(function (n) { n.remove(); });
+    state.streaming = null;
+    state.streamText = '';
+    state.waiting = [];
+    state.working = null;
+    state.transcript = [];
+    state.turns = 0;
+    state.atBottom = true;
+    turnCountEl.textContent = '0';
+    showWelcome(true);
+    updateJump();
+    input.focus();
+  }
+
+  // ------------------------------------------------------------- submit flow
+  async function submit() {
+    var text = input.value.trim();
+    if (!text || state.busy) return;
+
+    if (!state.started) state.started = true;
+    addMsg('user', text);
+    state.transcript.push({ role: 'user', text: text });
+    state.pendingEcho = text;
+    input.value = '';
+    autosize();
+    setBusy(true);
+    setTurn('busy', 'thinking');
+    setWorking('thinking…');
+    announce('Message sent. The agent is working.');
+
+    var body = new URLSearchParams();
+    body.set('csrf', csrf.value);
+    body.set('message', text);
+    try {
+      var res = await fetch('/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+        redirect: 'manual'
+      });
+      // 303 (a redirect) is the success path; with redirect:'manual' browsers
+      // surface it as an opaque-redirect response with status 0.
+      if (res.status === 403) {
+        finishAssistant();
+        setBusy(false);
+        setTurn('', 'idle');
+        addMsg('error', 'The session token was rejected. Reload the page to get a fresh one.');
+        announce('Send rejected.');
+      }
+    } catch (e) {
+      finishAssistant();
+      setBusy(false);
+      setTurn('', 'idle');
+      addMsg('error', 'Could not reach the server: ' + e.message);
+      announce('Send failed.');
+    }
+    // A response that was a plain 200 with HTML (a browser that followed the
+    // redirect) carries nothing to read — the SSE stream has the turn.
+  }
+
+  // ------------------------------------------------------------- event wiring
+  function handleEvent(e) {
+    switch (e.type) {
+      case 'user':
+        // Skip the echo of a message we already rendered optimistically.
+        if (state.pendingEcho !== null && e.text === state.pendingEcho) {
+          state.pendingEcho = null;
+          break;
+        }
+        addMsg('user', e.text);
+        state.transcript.push({ role: 'user', text: e.text });
+        break;
+      case 'text_delta':
+        onTextDelta(e.delta);
+        break;
+      case 'tool_use':
+        finishAssistant();
+        addTool(e.name, e.input);
+        setTurn('busy', 'running ' + e.name);
+        setWorking(e.name + '…');
+        break;
+      case 'tool_result':
+        completeTool(e.name, e.output, e.is_error);
+        setTurn('busy', 'thinking');
+        setWorking('thinking…');
+        break;
+      case 'done':
+        finishAssistant();
+        state.pendingEcho = null;
+        setBusy(false);
+        setTurn('', 'idle');
+        input.focus();
+        announce('Agent finished.');
+        break;
+      case 'error':
+        finishAssistant();
+        state.pendingEcho = null;
+        setBusy(false);
+        setTurn('', 'idle');
+        addMsg('error', e.message);
+        announce('The agent reported an error.');
+        break;
+      case 'lagged':
+        addMsg('system', 'The event stream lagged and ' + e.missed + ' event(s) were dropped. Some output is missing from this view.', { label: 'Stream warning' });
+        break;
+    }
+  }
+
+  var es = new EventSource('/events');
+  es.onopen = function () { setConn('live', 'connected'); };
+  es.onmessage = function (ev) {
+    var e;
+    try { e = JSON.parse(ev.data); } catch (err) { return; }
+    handleEvent(e);
+  };
+  es.onerror = function () {
+    if (es.readyState === EventSource.CLOSED) setConn('offline', 'disconnected');
+    else setConn('reconnecting', 'reconnecting…');
+  };
+
+  // ---------------------------------------------------------------- composer
+  function autosize() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 220) + 'px';
+  }
+  input.addEventListener('input', autosize);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+      e.preventDefault();
+      submit();
+    }
+  });
+  form.addEventListener('submit', function (e) {
+    e.preventDefault(); // never let the browser navigate away from the stream
+    submit();
+  });
+
+  // -------------------------------------------------------------- shortcuts
+  document.addEventListener('keydown', function (e) {
+    var mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); resetView(); return; }
+    if (e.key === '/' && document.activeElement !== input && !mod) {
+      e.preventDefault();
+      input.focus();
+    }
+  });
+
+  // ----------------------------------------------------------- scroll + nav
+  // `state.atBottom` is the user's *intent* to follow the newest output. It
+  // only changes when the user scrolls; programmatic pinning never rewrites
+  // it. Deriving it from geometry alone let a burst of appended output flip
+  // the flag and break following mid-turn.
+  function updateJump() {
+    jump.classList.toggle('show', !nearBottom() && !!streamInner.querySelector('.block'));
+  }
+  function syncFromUserScroll() {
+    state.atBottom = nearBottom();
+    updateJump();
+  }
+  var gestureTimer = null;
+  function markGesture() {
+    clearTimeout(gestureTimer);
+    gestureTimer = setTimeout(function () { gestureTimer = null; }, 220);
+    syncFromUserScroll();
+  }
+  stream.addEventListener('wheel', markGesture, { passive: true });
+  stream.addEventListener('touchmove', markGesture, { passive: true });
+  stream.addEventListener('pointerdown', markGesture, { passive: true });
+  stream.addEventListener('keydown', function (e) {
+    if (/^(ArrowUp|ArrowDown|PageUp|PageDown|Home|End| )$/.test(e.key)) markGesture();
+  });
+  stream.addEventListener('scroll', function () {
+    // While a user gesture is in flight these scroll events are theirs; once
+    // it settles any scroll is ours and must not change the intent flag.
+    if (gestureTimer) syncFromUserScroll();
+    else updateJump();
+  });
+  jump.addEventListener('click', function () {
+    state.atBottom = true;
+    stream.scrollTop = stream.scrollHeight;
+    updateJump();
+  });
+
+  $('nav-toggle').addEventListener('click', function () {
+    var open = document.body.classList.toggle('nav-open');
+    this.setAttribute('aria-expanded', String(open));
+  });
+  $('backdrop').addEventListener('click', function () {
+    document.body.classList.remove('nav-open');
+    $('nav-toggle').setAttribute('aria-expanded', 'false');
+  });
+
+  // --------------------------------------------------------------- sidebar
+  $('btn-new').addEventListener('click', function () {
+    resetView();
+    document.body.classList.remove('nav-open');
+  });
+  $('btn-copy').addEventListener('click', async function () {
+    var label = $('btn-copy-label');
+    var text = state.transcript.map(function (m) {
+      return (m.role === 'user' ? 'You: ' : 'zero-hermes: ') + m.text;
+    }).join('\n\n');
+    if (!text) { label.textContent = 'Nothing to copy'; }
+    else {
+      try { await navigator.clipboard.writeText(text); label.textContent = 'Copied'; }
+      catch (err) { label.textContent = 'Copy failed'; }
+    }
+    setTimeout(function () { label.textContent = 'Copy transcript'; }, 1600);
+  });
+
+  // Copy buttons rendered inside message/tool content.
+  document.addEventListener('click', async function (e) {
+    var btn = e.target.closest && e.target.closest('[data-copy]');
+    if (!btn) return;
+    var scope = btn.getAttribute('data-copy') === 'block'
+      ? btn.closest('.code-wrap')
+      : btn.closest('.msg');
+    if (!scope) return;
+    var text = scope.innerText;
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.replaceChildren(iconNode('check'), document.createTextNode('Copied'));
+      setTimeout(function () {
+        btn.replaceChildren(iconNode('copy'), document.createTextNode('Copy'));
+      }, 1400);
+    } catch (err) { /* clipboard unavailable — leave the button alone */ }
+  });
+
+  // ---------------------------------------------------------------- theme
+  $('btn-theme').addEventListener('click', function () {
+    var next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('zh-theme', next); } catch (err) { /* ignore */ }
+    syncThemeIcon();
+  });
+  function syncThemeIcon() {
+    var light = document.documentElement.dataset.theme === 'light';
+    $('theme-dark').style.display = light ? '' : 'none';
+    $('theme-light').style.display = light ? 'none' : '';
+  }
+  syncThemeIcon();
+
+  // -------------------------------------------------------------- launcher
+  document.querySelectorAll('.chip').forEach(function (c) {
+    c.addEventListener('click', function () {
+      input.value = c.textContent;
+      autosize();
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+  });
+
+  autosize();
+  setConn('reconnecting', 'connecting…');
+  setTurn('', 'idle');
+})();
 </script>
 </body>
 </html>
