@@ -11,6 +11,7 @@ use futures::Stream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::agent::stream::{one_shot_stream, EventStream, StreamEvent};
 use crate::agent::tool::{ContentBlock, Message, ToolCall};
@@ -83,10 +84,40 @@ pub trait LlmProvider: Send + Sync {
 #[allow(dead_code)]
 type EventStreamAlias = EventStream;
 
+/// Split a `;`-separated credential pool into individual keys.
+///
+/// `api_key = "sk-a; sk-b; sk-c"` rotates per call (round-robin) so one
+/// leaked or rate-limited key does not take the gateway down. A single key
+/// (no `;`) behaves exactly as before. Empty segments are dropped.
+fn split_key_pool(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pick the next key from a pool, advancing `counter` round-robin.
+///
+/// Empty pool yields an empty string (the request then fails server-side
+/// with 401 rather than panicking here; the release profile sets
+/// `panic = "abort"` so panicking would kill the whole daemon).
+fn pick_key(pool: &[String], counter: &AtomicUsize) -> String {
+    if pool.is_empty() {
+        return String::new();
+    }
+    if pool.len() == 1 {
+        return pool[0].clone();
+    }
+    let i = counter.fetch_add(1, Ordering::Relaxed) % pool.len();
+    pool[i].clone()
+}
+
 /// Anthropic-Messages provider (compatible with the minimax endpoint).
 pub struct AnthropicMessages {
     base_url: String,
-    api_key: String,
+    api_keys: Vec<String>,
+    key_idx: AtomicUsize,
     model: String,
     max_tokens: u32,
     client: reqwest::Client,
@@ -97,14 +128,28 @@ impl AnthropicMessages {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
-            api_key: cfg.api_key.clone(),
+            api_keys: split_key_pool(&cfg.api_key),
+            key_idx: AtomicUsize::new(0),
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             client: build_client(cfg)?,
         })
     }
 
+    /// Currently selected API key (round-robin over the `;`-separated pool).
+    fn api_key(&self) -> String {
+        pick_key(&self.api_keys, &self.key_idx)
+    }
+
     /// Build the request body for /v1/messages.
+    ///
+    /// The `system` prompt is emitted as a block array with
+    /// `cache_control: {type: "ephemeral"}` so Anthropic prompt caching can
+    /// reuse the prefix across turns. Callers must keep the base system
+    /// stable for this to pay off: `main::system_with_recall` only *appends*
+    /// a recall section after a fixed delimiter, so the cached prefix still
+    /// hits (see E23). We only *build* the body here, so parsing is
+    /// unaffected.
     pub fn build_body(system: Option<&str>, messages: &[Message], tools: &[Value]) -> Value {
         let rendered: Vec<Value> = messages
             .iter()
@@ -142,7 +187,11 @@ impl AnthropicMessages {
             "messages": rendered,
         });
         if let Some(sys) = system {
-            body["system"] = json!(sys);
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -217,10 +266,11 @@ impl LlmProvider for AnthropicMessages {
         body["max_tokens"] = json!(self.max_tokens);
 
         let url = format!("{}/v1/messages", self.base_url);
+        let api_key = self.api_key();
         let resp = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
@@ -265,7 +315,7 @@ impl LlmProvider for AnthropicMessages {
 
         let url = format!("{}/v1/messages", self.base_url);
         let client = self.client.clone();
-        let api_key = self.api_key.clone();
+        let api_key = self.api_key();
 
         Box::pin(
             futures::stream::once(async move {
@@ -309,8 +359,38 @@ mod tests {
     #[test]
     fn build_body_minimal() {
         let body = AnthropicMessages::build_body(Some("sys"), &[Message::user("hi")], &[]);
-        assert_eq!(body["system"], "sys");
+        // E22: system is a cached block array, not a plain string.
+        assert!(body["system"].is_array(), "system must carry cache_control");
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn build_body_no_system_has_no_system_key() {
+        let body = AnthropicMessages::build_body(None, &[Message::user("hi")], &[]);
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn key_pool_splits_and_rotates() {
+        let pool = split_key_pool("sk-a; sk-b ; ;sk-c");
+        assert_eq!(pool, vec!["sk-a", "sk-b", "sk-c"]);
+        let counter = AtomicUsize::new(0);
+        assert_eq!(pick_key(&pool, &counter), "sk-a");
+        assert_eq!(pick_key(&pool, &counter), "sk-b");
+        assert_eq!(pick_key(&pool, &counter), "sk-c");
+        assert_eq!(pick_key(&pool, &counter), "sk-a");
+    }
+
+    #[test]
+    fn key_pool_single_and_empty() {
+        let single = split_key_pool("sk-only");
+        let counter = AtomicUsize::new(0);
+        assert_eq!(pick_key(&single, &counter), "sk-only");
+        assert_eq!(pick_key(&single, &counter), "sk-only");
+        let empty: Vec<String> = split_key_pool("");
+        assert_eq!(pick_key(&empty, &counter), "");
     }
 
     #[test]
@@ -343,7 +423,8 @@ mod tests {
 /// and tool results are returned as separate `{role:"tool", tool_call_id, content}` messages.
 pub struct OpenAiCompat {
     base_url: String,
-    api_key: String,
+    api_keys: Vec<String>,
+    key_idx: AtomicUsize,
     model: String,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -405,12 +486,18 @@ impl OpenAiCompat {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
-            api_key: cfg.api_key.clone(),
+            api_keys: split_key_pool(&cfg.api_key),
+            key_idx: AtomicUsize::new(0),
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
             client: build_client(cfg)?,
         })
+    }
+
+    /// Currently selected API key (round-robin over the `;`-separated pool).
+    fn api_key(&self) -> String {
+        pick_key(&self.api_keys, &self.key_idx)
     }
 
     /// Provider name (the configured model id).
@@ -588,10 +675,11 @@ impl LlmProvider for OpenAiCompat {
         }
 
         let url = format!("{}/v1/chat/completions", self.base_url);
+        let api_key = self.api_key();
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&api_key)
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -635,7 +723,7 @@ impl LlmProvider for OpenAiCompat {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let client = self.client.clone();
-        let api_key = self.api_key.clone();
+        let api_key = self.api_key();
 
         Box::pin(
             futures::stream::once(async move {
@@ -671,10 +759,78 @@ impl LlmProvider for OpenAiCompat {
 }
 
 /// Factory: build the right provider from a [`ProviderConfig`].
+///
+/// When `cfg.fallbacks` is non-empty the primary provider is tried first
+/// and each fallback is tried once in order on `Err`. Nested `fallbacks`
+/// inside a fallback entry are ignored so the retry graph stays a flat
+/// list. Streaming uses the default one-shot fallback (which calls
+/// `complete`, so it inherits the same failover).
 pub fn build_provider(cfg: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
-    match cfg.kind {
-        ProviderKind::Anthropic => Ok(Box::new(AnthropicMessages::new(cfg)?)),
-        ProviderKind::OpenaiCompat => Ok(Box::new(OpenAiCompat::new(cfg)?)),
+    fn build_one(cfg: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
+        match cfg.kind {
+            ProviderKind::Anthropic => Ok(Box::new(AnthropicMessages::new(cfg)?)),
+            ProviderKind::OpenaiCompat => Ok(Box::new(OpenAiCompat::new(cfg)?)),
+        }
+    }
+    let primary = build_one(cfg)?;
+    if cfg.fallbacks.is_empty() {
+        return Ok(primary);
+    }
+    let mut providers: Vec<Box<dyn LlmProvider>> = Vec::with_capacity(cfg.fallbacks.len() + 1);
+    providers.push(primary);
+    for fb in &cfg.fallbacks {
+        providers.push(build_one(fb)?);
+    }
+    Ok(Box::new(FallbackProvider::new(providers)))
+}
+
+/// Ordered failover over two or more [`LlmProvider`]s.
+///
+/// Tries each provider once in order, returning the first `Ok`. Failures
+/// are logged at warn level with their position so operators can see which
+/// endpoint is down. `stream` is intentionally not overridden: the default
+/// `LlmProvider::stream` calls `complete`, which already fans out.
+pub struct FallbackProvider {
+    providers: Vec<Box<dyn LlmProvider>>,
+}
+
+impl FallbackProvider {
+    /// Build a failover chain. Empty input completes with an error rather
+    /// than panicking (release sets `panic = "abort"`).
+    pub fn new(providers: Vec<Box<dyn LlmProvider>>) -> Self {
+        Self { providers }
+    }
+
+    /// Number of providers in the chain (primary + fallbacks).
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Is the chain empty?
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FallbackProvider {
+    async fn complete(
+        &self,
+        system: Option<&str>,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Result<Completion> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, p) in self.providers.iter().enumerate() {
+            match p.complete(system, messages, tools).await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    tracing::warn!(provider_index = i, error = %e, "provider failed, trying fallback");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no providers configured")))
     }
 }
 
@@ -856,5 +1012,86 @@ mod openai_tests {
     fn openai_parse_missing_choices_errors() {
         let v = json!({"error": "bad request"});
         assert!(OpenAiCompat::parse_response(&v).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use crate::agent::tool::Message;
+
+    struct FailProvider;
+    struct OkProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailProvider {
+        async fn complete(
+            &self,
+            _system: Option<&str>,
+            _messages: &[Message],
+            _tools: &[Value],
+        ) -> Result<Completion> {
+            Err(anyhow::anyhow!("primary down"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OkProvider {
+        async fn complete(
+            &self,
+            _system: Option<&str>,
+            _messages: &[Message],
+            _tools: &[Value],
+        ) -> Result<Completion> {
+            Ok(Completion {
+                text: Some(self.0.to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_tries_next_on_error() {
+        let chain = FallbackProvider::new(vec![
+            Box::new(FailProvider),
+            Box::new(OkProvider("from-fallback")),
+        ]);
+        assert_eq!(chain.len(), 2);
+        let c = chain
+            .complete(None, &[Message::user("hi")], &[])
+            .await
+            .unwrap();
+        assert_eq!(c.text.as_deref(), Some("from-fallback"));
+    }
+
+    #[tokio::test]
+    async fn fallback_errors_when_all_fail() {
+        let chain = FallbackProvider::new(vec![Box::new(FailProvider), Box::new(FailProvider)]);
+        assert!(chain
+            .complete(None, &[Message::user("hi")], &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_empty_chain_errors_without_panic() {
+        let chain = FallbackProvider::new(vec![]);
+        assert!(chain.is_empty());
+        assert!(chain
+            .complete(None, &[Message::user("hi")], &[])
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn build_provider_wraps_fallbacks() {
+        let mut cfg = crate::config::ProviderConfig::default();
+        assert!(build_provider(&cfg).is_ok());
+        let mut fb = crate::config::ProviderConfig::default();
+        fb.kind = crate::config::ProviderKind::OpenaiCompat;
+        fb.base_url = "https://example.test".into();
+        cfg.fallbacks.push(fb);
+        // Wrapping succeeds without network; failover happens per-call.
+        assert!(build_provider(&cfg).is_ok());
     }
 }
