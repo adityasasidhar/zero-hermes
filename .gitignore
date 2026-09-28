@@ -12,3 +12,4 @@ zero_hermes.toml
 .env
 .pi/
 .hermes/
+.remember/
