@@ -1087,9 +1087,11 @@ mod fallback_tests {
     fn build_provider_wraps_fallbacks() {
         let mut cfg = crate::config::ProviderConfig::default();
         assert!(build_provider(&cfg).is_ok());
-        let mut fb = crate::config::ProviderConfig::default();
-        fb.kind = crate::config::ProviderKind::OpenaiCompat;
-        fb.base_url = "https://example.test".into();
+        let fb = crate::config::ProviderConfig {
+            kind: crate::config::ProviderKind::OpenaiCompat,
+            base_url: "https://example.test".into(),
+            ..Default::default()
+        };
         cfg.fallbacks.push(fb);
         // Wrapping succeeds without network; failover happens per-call.
         assert!(build_provider(&cfg).is_ok());
