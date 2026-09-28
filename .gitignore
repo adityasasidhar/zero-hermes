@@ -10,3 +10,5 @@ target/
 *.sqlite-wal
 zero_hermes.toml
 .env
+.pi/
+.hermes/
