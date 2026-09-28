@@ -1,0 +1,41 @@
+{
+  "beat": "<beat>",
+  "stories": [
+    {
+      "rank": 1,
+      "headline": "<6-12 word headline>",
+      "dek": "<one-sentence dek, 15-25 words>",
+      "body": "<paragraph 1>\n\n<paragraph 2>\n\n<paragraph 3>",
+      "source_url": "<canonical article URL>",
+      "source_name": "<outlet name>",
+      "published_at": "<ISO-8601 UTC, e.g. 2026-07-26T01:30:00Z>",
+      "primary": true,
+      "image": {
+        "kind": "downloaded",
+        "local_path": "<absolute local path, e.g. /home/arctic/.hermes/data/hermes-times-v4/assets/messi_<slug>.jpg>",
+        "source_url": "<page URL the image was downloaded from>",
+        "credit": "<photographer string as on the page, e.g. 'Minas Panagiotakis / Getty Images'>"
+      }
+    },
+    {
+      "rank": 2,
+      "headline": "<6-12 word headline>",
+      "dek": "<one-sentence dek, 15-25 words>",
+      "body": "<paragraph 1>\n\n<paragraph 2>\n\n<paragraph 3>",
+      "source_url": "<canonical article URL>",
+      "source_name": "<outlet name>",
+      "published_at": "<ISO-8601 UTC>",
+      "primary": true
+    },
+    {
+      "rank": 3,
+      "headline": "<6-12 word headline>",
+      "dek": "<one-sentence dek, 15-25 words>",
+      "body": "<paragraph 1>\n\n<paragraph 2>\n\n<paragraph 3>",
+      "source_url": "<canonical article URL>",
+      "source_name": "<outlet name>",
+      "published_at": "<ISO-8601 UTC>",
+      "primary": true
+    }
+  ]
+}

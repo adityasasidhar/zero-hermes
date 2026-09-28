@@ -36,6 +36,13 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Remove a tool by name, returning the previous `Arc` if present.
+    /// Used by [`SubAgentTool`] to strip itself out of the child registry
+    /// without iterating all tools.
+    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.remove(name)
+    }
+
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
@@ -171,5 +178,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown tool"));
+    }
+
+    #[test]
+    fn registry_remove_returns_arc() {
+        let mut reg = ToolRegistry::new();
+        reg.insert_always(Arc::new(HelloTool));
+        assert!(reg.remove("hello").is_some());
+        assert!(reg.remove("hello").is_none());
+        assert!(reg.names().is_empty());
     }
 }

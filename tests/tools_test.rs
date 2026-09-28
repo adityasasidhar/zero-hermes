@@ -138,3 +138,56 @@ async fn memory_tool_round_trip() {
         .unwrap();
     assert_eq!(out.content, "ok");
 }
+
+#[tokio::test]
+async fn subagent_tool_runs_child_loop_and_strips_itself() {
+    use zero_hermes::tools::builtin::SubAgentTool;
+
+    // Mock provider echoes canned text; the sub-agent will return that.
+    let provider: Arc<dyn zero_hermes::agent::LlmProvider> = Arc::new(
+        zero_hermes::agent::mock::MockProvider::text_only("from-subagent"),
+    );
+    let mut reg = ToolRegistry::new();
+    reg.insert_always(Arc::new(BashTool));
+    let reg = Arc::new(reg);
+    let subagent = SubAgentTool::new(
+        provider.clone(),
+        reg.clone(),
+        zero_hermes::agent::RunLimits::iterations(3),
+    );
+
+    let out = subagent
+        .execute(
+            json!({"name": "helper", "task": "echo back"}),
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "from-subagent");
+    assert!(!out.is_error);
+}
+
+#[tokio::test]
+async fn subagent_child_registry_excludes_subagent_itself() {
+    use zero_hermes::tools::builtin::SubAgentTool;
+
+    // Sanity: the SubAgentTool is never in the child registry. We can't
+    // observe the child directly from outside the spawned loop, but the
+    // construction path uses `remove("subagent")` which we exercise here.
+    let provider: Arc<dyn zero_hermes::agent::LlmProvider> =
+        Arc::new(zero_hermes::agent::mock::MockProvider::echo());
+    let mut reg = ToolRegistry::new();
+    reg.insert_always(Arc::new(BashTool));
+    reg.insert_always(Arc::new(SubAgentTool::new(
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+        zero_hermes::agent::RunLimits::iterations(1),
+    )));
+    assert!(reg.names().contains(&"subagent".to_string()));
+
+    // Simulate the strip that SubAgentTool::execute does internally.
+    let mut child = reg.clone();
+    child.remove("subagent");
+    assert!(!child.names().contains(&"subagent".to_string()));
+    assert!(child.names().contains(&"bash".to_string()));
+}

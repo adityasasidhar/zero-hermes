@@ -30,13 +30,17 @@ fn describe_minimal() {
     assert!(s.contains('T'));
 }
 
-#[tokio::test]
+// `start_paused` auto-advances tokio's clock while every task is idle, so
+// the wait to the next minute boundary resolves immediately instead of
+// burning up to 60s of real time.
+#[tokio::test(start_paused = true)]
 async fn scheduler_emits_event_within_window() {
     let job = CronJob::new("hello", "* * * * *", "prompt").unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let handle = Scheduler::start(vec![job], tx).unwrap();
     let evt = tokio::time::timeout(Duration::from_secs(65), rx.recv()).await;
-    handle.stop().await;
     let evt = evt.expect("scheduler fires within 65s").unwrap();
+    handle.stop().await;
     assert_eq!(evt.job, "hello");
+    assert_eq!(evt.prompt, "prompt");
 }

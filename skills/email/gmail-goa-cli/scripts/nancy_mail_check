@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Alert on new Gmail search results mentioning a specific contact.
+
+A focused, lightweight variant of `mail_check` for when the user wants to
+track one person's email/reply activity (e.g. "regularly check for her
+mails"). Rather than the full IMPORTANT/DIGEST classifier it just runs
+`mail search <name>`, diffs against a seen-set keyed by IMAP UID, and
+sends a Telegram alert only when new UIDs appear.
+
+Install:
+    install -m 0755 scripts/nancy_mail_check ~/.local/bin/nancy_mail_check
+    ~/.local/bin/nancy_mail_check --init   # baseline: see current state
+
+Schedule (cron needs scripts under ~/.hermes/scripts/):
+    cp scripts/nancy_mail_check.sh ~/.hermes/scripts/nancy_mail_check.sh
+    chmod +x ~/.hermes/scripts/nancy_mail_check.sh
+    # then hermes cron create every 30m --name nancy-mail-check \
+    #   --script nancy_mail_check.sh --no-agent --deliver telegram
+"""
+from __future__ import annotations
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Edit these for a different contact:
+SEARCH_QUERY = "Nancy"
+MAIL_BIN = "/home/arctic/.local/bin/mail"
+HERMES_BIN = "/home/arctic/.local/bin/hermes"
+STATE = Path.home() / ".local/state/nancy-mail-check/seen.json"
+STATE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def search() -> list[tuple[str, str]]:
+    p = subprocess.run(
+        [MAIL_BIN, "search", SEARCH_QUERY, "20"],
+        text=True, capture_output=True, timeout=90,
+    )
+    if p.returncode != 0:
+        print(p.stderr, file=sys.stderr)
+        raise SystemExit(p.returncode)
+    out = []
+    # mail search output line shape:  [UID]  DATE  FROM  SUBJECT
+    for line in p.stdout.splitlines():
+        m = re.match(r"\s*\[(\d+)\]\s+(.+?)\s{2,}(.+)$", line)
+        if m:
+            uid, rest, subject = m.groups()
+            # rest = "<date>  <from>"; we keep both fields
+            out.append((uid, f"{rest.strip()} — {subject.strip()}"))
+    return out
+
+
+def send(text: str) -> None:
+    subprocess.run(
+        [HERMES_BIN, "send", "-q", "-t", "telegram", text],
+        check=True, timeout=30,
+    )
+
+
+def main() -> None:
+    items = search()
+    current = {uid: desc for uid, desc in items}
+
+    if "--init" in sys.argv:
+        STATE.write_text(json.dumps(sorted(current)))
+        print(f"baseline: marked {len(current)} {SEARCH_QUERY}-related messages as seen")
+        return
+
+    try:
+        seen = set(json.loads(STATE.read_text()))
+    except (FileNotFoundError, json.JSONDecodeError):
+        # SAFE FIRST RUN: if state is missing or unreadable, treat the
+        # current inbox snapshot as already-seen. This prevents a flood
+        # alert on first deploy. To reset, run with --init.
+        seen = set(current)
+
+    new = [(uid, desc) for uid, desc in items if uid not in seen]
+
+    # Persist union of historical seen + current snapshot. We store UIDs
+    # (small ints) and intersect by string match — duplicate UIDs are
+    # impossible in IMAP, so equality is fine.
+    STATE.write_text(json.dumps(sorted(set(seen) | set(current))))
+
+    if not new:
+        return
+
+    lines = [f"📬 {len(new)} new {SEARCH_QUERY}-related email(s):"]
+    for _, desc in new[:5]:
+        lines.append(f"  • {desc[:180]}")
+    if len(new) > 5:
+        lines.append(f"  • …and {len(new) - 5} more")
+    send("\n".join(lines))
+    print(f"sent: {len(new)} new {SEARCH_QUERY}-related messages")
+
+
+if __name__ == "__main__":
+    main()

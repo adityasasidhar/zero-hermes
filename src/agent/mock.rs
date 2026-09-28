@@ -72,14 +72,14 @@ impl LlmProvider for MockProvider {
         // The brief asks for one chunk, which is the simplest correct
         // behaviour for a mock and what real servers also produce when
         // a model returns a tiny final answer.
-        let completion = self.make_completion();
-        let text = completion.text.clone().unwrap_or_default();
-        let mut events: Vec<Result<StreamEvent>> = Vec::new();
+        let mut completion = self.make_completion();
+        let text = completion.text.take().unwrap_or_default();
+        let mut events: Vec<Result<StreamEvent>> = Vec::with_capacity(2);
         if !text.is_empty() {
             events.push(Ok(StreamEvent::TextDelta(text.clone())));
         }
         events.push(Ok(StreamEvent::Done(Completion {
-            text: Some(text),
+            text: if text.is_empty() { None } else { Some(text) },
             tool_calls: Vec::new(),
         })));
         Box::pin(futures::stream::iter(events))

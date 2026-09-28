@@ -24,6 +24,9 @@
 <div class="meta">open <code>http://127.0.0.1:8088/</code> in your browser &mdash; SSE-driven, vanilla JS</div>
 <ul id="msgs"></ul>
 <form id="f" method="POST" action="/send">
+  <!-- Injected by the server per process. Without it /send is a simple
+       cross-origin form target, and the agent has a shell tool. -->
+  <input type="hidden" name="csrf" value="{{CSRF_TOKEN}}">
   <textarea id="m" name="message" rows="3" placeholder="ask the agent..." autofocus></textarea>
   <button type="submit">send</button>
 </form>
@@ -53,6 +56,7 @@ es.onmessage = (ev) => {
   else if (e.type === 'tool_result') append('tool_result', 'tool[' + e.name + ']: ' + (e.is_error ? 'ERR ' : '') + e.output);
   else if (e.type === 'done') { append('done', '\u2713 done'); input.value = ''; input.focus(); }
   else if (e.type === 'error') append('error', 'error: ' + e.message);
+  else if (e.type === 'lagged') append('error', '\u26a0 missed ' + e.missed + ' events \u2014 some output was dropped');
 };
 es.onerror = () => append('error', 'sse connection lost \u2014 refresh to reconnect');
 

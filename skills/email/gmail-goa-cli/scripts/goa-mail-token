@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Fetch a fresh Gmail OAuth2 token from GNOME Online Accounts via D-Bus.
+
+Emits the XOAUTH2 SASL initial-response payload (raw, unencoded):
+    user=<email>\x01auth=Bearer <token>\x01\x01
+
+Himalaya base64-encodes this on its own for IMAP; smtplib does not — this
+helper works for both because the bytes form is what smtplib wants and
+himalaya's IMAP path will re-encode anyway.
+
+Env:
+    GOA_EMAIL  - which account to use (default: primary from accounts.conf)
+"""
+from __future__ import annotations
+
+import configparser
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+CONF = Path.home() / ".config/goa-1.0/accounts.conf"
+
+
+def parse_accounts() -> list[dict]:
+    """Parse GOA accounts.conf into [{path, identity, provider}]."""
+    cp = configparser.RawConfigParser()
+    # GOA uses Capitalized keys; preserve case.
+    cp.optionxform = str  # type: ignore[assignment]
+    cp.read(str(CONF))
+    accounts = []
+    for section in cp.sections():
+        sec = dict(cp.items(section))
+        accounts.append({
+            "section": section,
+            "path": section[len("Account "):],
+            "identity": sec.get("Identity", ""),
+            "provider": sec.get("Provider", ""),
+            "mail_enabled": sec.get("MailEnabled", "") == "true",
+        })
+    return accounts
+
+
+def pick_account() -> dict:
+    target = os.environ.get("GOA_EMAIL", "").strip()
+    accounts = [a for a in parse_accounts() if a["mail_enabled"]]
+    if not accounts:
+        print("No GOA accounts with MailEnabled=true", file=sys.stderr)
+        sys.exit(1)
+    if target:
+        for a in accounts:
+            if a["identity"] == target:
+                return a
+        print(f"GOA account for {target} not found", file=sys.stderr)
+        sys.exit(1)
+    # Prefer Google provider
+    for a in accounts:
+        if a["provider"] == "google":
+            return a
+    return accounts[0]
+
+
+def fetch_token(account_path: str) -> str:
+    out = subprocess.check_output([
+        "gdbus", "call", "--session",
+        "--dest", "org.gnome.OnlineAccounts",
+        "--object-path", f"/org/gnome/OnlineAccounts/Accounts/{account_path}",
+        "--method", "org.gnome.OnlineAccounts.OAuth2Based.GetAccessToken",
+    ], text=True, env=_gdbus_env())
+    m = re.search(r"^\('([^']+)',", out)
+    if not m:
+        print(f"Could not parse token from gdbus output: {out[:200]!r}", file=sys.stderr)
+        sys.exit(1)
+    return m.group(1)
+
+
+def _gdbus_env() -> dict:
+    """Minimal env for gdbus. Cron sessions have no DBUS_SESSION_BUS_ADDRESS
+    but the GOA daemon listens on the user bus socket; we can point gdbus
+    at it explicitly."""
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        bus = f"unix:path=/run/user/{os.getuid()}/bus"
+        env["DBUS_SESSION_BUS_ADDRESS"] = bus
+    return env
+
+
+def main() -> None:
+    account = pick_account()
+    token = fetch_token(account["path"])
+    if not token:
+        print("Empty token from GOA", file=sys.stderr)
+        sys.exit(1)
+    # XOAUTH2 initial-response (raw bytes; himalaya base64-encodes for IMAP, smtplib uses as-is)
+    sys.stdout.write(f"user={account['identity']}\x01auth=Bearer {token}\x01\x01")
+
+
+if __name__ == "__main__":
+    main()

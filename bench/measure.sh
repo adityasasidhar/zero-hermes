@@ -47,29 +47,6 @@ MAX_MS=$(sort -n "$MS_FILE" | tail -1)
 
 rm -f "$TIMES_FILE" "$MS_FILE"
 
-# Idle RSS: run `--version` under `/usr/bin/time -v` to capture peak RSS.
-# `--version` doesn't allocate much, so we run a no-op mock-mode REPL
-# instead: it builds the registry, opens memory, then exits. That's the
-# closest thing we can measure to "idle gateway".
-TMP_CFG=$(mktemp)
-TMP_DB=$(mktemp)
-cat > "$TMP_CFG" <<EOF
-[provider]
-kind = "anthropic"
-base_url = "https://example.invalid"
-api_key = "bench"
-model = "bench"
-max_tokens = 1
-
-[memory]
-path = "$TMP_DB"
-
-[agent]
-max_iterations = 1
-context_window = 1
-enabled_tools = []
-EOF
-
 # Build a one-shot "open the world and exit" via `--mock tools`. That
 # opens Memory + SkillRegistry + ToolRegistry — the same warm path the
 # gateway takes before listening.

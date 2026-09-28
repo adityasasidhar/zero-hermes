@@ -5,15 +5,47 @@ use std::path::PathBuf;
 
 use zero_hermes::skills::{split_frontmatter, Skill, SkillRegistry};
 
+/// Recursively count `SKILL.md` / `skill.md` files under `dir`.
+fn count_skill_files(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            n += count_skill_files(&path);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("skill.md"))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
 #[test]
-fn loads_bundled_stubs() {
-    // The repo ships two stub skills. They should both parse.
-    let reg = SkillRegistry::load_dir(&PathBuf::from("skills")).unwrap();
-    assert!(reg.get("stub-1").is_some());
-    assert!(reg.get("stub-2").is_some());
-    let s1 = reg.get("stub-1").unwrap();
-    assert!(!s1.description.is_empty());
-    assert!(s1.body.contains("Stub Skill 1"));
+fn loads_bundled_hermes_skills() {
+    // The repo vendors the nested Hermes skill pack. The registry keeps
+    // duplicate frontmatter names under directory aliases, so a complete
+    // recursive scan must yield exactly one entry per SKILL.md on disk; this
+    // catches a wiped category or a loader that stops descending.
+    let dir = PathBuf::from("skills");
+    let reg = SkillRegistry::load_dir(&dir).unwrap();
+    let files = count_skill_files(&dir);
+    assert!(files > 100, "vendored skill pack looks truncated: {files}");
+    assert_eq!(
+        reg.names().len(),
+        files,
+        "recursive loader did not register every SKILL.md"
+    );
+    // Representative skills across categories prove recursive discovery and
+    // declared-name parsing (frontmatter `name:` overrides the directory).
+    assert!(reg.get("systematic-debugging").is_some());
+    assert!(reg.get("github-code-review").is_some());
+    let obsidian = reg.get("obsidian").unwrap();
+    assert!(!obsidian.description.is_empty());
+    assert!(obsidian.body.contains("Obsidian"));
 }
 
 #[test]

@@ -20,15 +20,15 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{
     sse::{Event, Sse},
-    Html, IntoResponse, Redirect,
+    Html, IntoResponse, Redirect, Response,
 };
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex};
 
-use crate::agent::{run_stream, LlmProvider, Message, StreamTurn, ToolContext};
+use crate::agent::{run_stream, LlmProvider, Message, RunLimits, StreamTurn, ToolContext};
 use crate::error::Result;
 use crate::memory::Memory;
 use crate::tools::ToolRegistry;
@@ -57,6 +57,9 @@ pub enum UiEvent {
     Done,
     /// The agent loop failed.
     Error { message: String },
+    /// The broadcast channel lagged: a slow client missed `missed` events.
+    /// Surfaced once per lag so the UI can warn the user.
+    Lagged { missed: u64 },
 }
 
 /// Shared state for the web server.
@@ -65,7 +68,11 @@ pub struct AppState {
     /// Broadcast channel that every SSE connection subscribes to.
     pub events: broadcast::Sender<UiEvent>,
     /// The conversation history (one in-memory session).
-    pub history: Arc<RwLock<Vec<Message>>>,
+    ///
+    /// `tokio::sync::Mutex` (not `RwLock`): we always write, and the lock
+    /// is held across the entire agent run. There's no concurrent reader
+    /// that would justify the read-side fast path.
+    pub history: Arc<Mutex<Vec<Message>>>,
     /// System prompt (built from skills + provider.system).
     pub system: String,
     /// Provider for the agent loop.
@@ -74,8 +81,17 @@ pub struct AppState {
     pub tools: Arc<ToolRegistry>,
     /// Memory handle (for tools that read/write notes).
     pub memory: Arc<Memory>,
-    /// Max iterations per turn.
-    pub max_iterations: usize,
+    /// Per-turn iteration and context-window limits.
+    pub limits: RunLimits,
+    /// Per-process CSRF token.
+    ///
+    /// `POST /send` is a form submission, which browsers treat as a simple
+    /// request: no preflight, and any page on the internet can send one to
+    /// `localhost`. Since the agent has a `bash` tool, an unprotected
+    /// endpoint is drive-by code execution. The token is minted at startup
+    /// and injected into the page, so only a document served by this
+    /// process can submit.
+    pub csrf_token: String,
 }
 
 impl AppState {
@@ -99,8 +115,11 @@ pub fn router(state: AppState) -> Router {
 /// The page itself — vanilla DOM, one tiny script for EventSource.
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-async fn serve_index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+/// Placeholder in `web/index.html` replaced with the live CSRF token.
+const CSRF_PLACEHOLDER: &str = "{{CSRF_TOKEN}}";
+
+async fn serve_index(State(state): State<AppState>) -> Html<String> {
+    Html(INDEX_HTML.replace(CSRF_PLACEHOLDER, &state.csrf_token))
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -110,14 +129,38 @@ async fn health_handler() -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct SendForm {
     message: String,
+    /// Must match [`AppState::csrf_token`]. See the field docs for why.
+    #[serde(default)]
+    csrf: String,
+}
+
+/// Constant-time-ish string comparison. Not a defence against a remote
+/// timing attack over a network this coarse, but it costs nothing and
+/// keeps the check from short-circuiting on the first byte.
+fn tokens_match(a: &str, b: &str) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// POST /send — kick off one agent turn for the submitted message.
 /// Streams events on the broadcast channel as the loop runs.
-async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>) -> Redirect {
+async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>) -> Response {
+    // Reject anything that did not come from a page this process served.
+    // A form POST is a "simple request": no CORS preflight, so without
+    // this any site the user visits could drive the `bash` tool on their
+    // machine just by targeting localhost.
+    if !tokens_match(&form.csrf, &state.csrf_token) {
+        tracing::warn!("rejected /send with a missing or invalid CSRF token");
+        return (StatusCode::FORBIDDEN, "invalid or missing CSRF token").into_response();
+    }
     let message = form.message.trim().to_string();
     if message.is_empty() {
-        return Redirect::to("/");
+        return Redirect::to("/").into_response();
     }
     // Echo the user message immediately so the UI shows it before the agent
     // loop starts (which can take a few hundred ms for the LLM round-trip).
@@ -130,7 +173,7 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
     let tools = state.tools.clone();
     let memory = state.memory.clone();
     let system = state.system.clone();
-    let max_iterations = state.max_iterations;
+    let limits = state.limits;
     let state_for_loop = state.clone();
 
     // Spawn the agent loop on its own task so the HTTP handler can return
@@ -142,14 +185,17 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
             session_id: None,
             memory: Some(memory),
         };
-        let mut history_guard = history.write().await;
+        // Hold the history mutex for the duration of the agent run. This
+        // serializes turns (the previous RwLock was misleading — we
+        // always wrote).
+        let mut history_guard = history.lock().await;
         let result = run_stream(
             provider.as_ref(),
             tools.as_ref(),
             Some(&system),
             &mut history_guard,
             &message,
-            max_iterations,
+            limits,
             &ctx,
             |ev| match ev {
                 StreamTurn::TextDelta(s) => {
@@ -159,6 +205,17 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
                     state_for_loop.emit(UiEvent::ToolUse {
                         name: tc.name,
                         input: tc.input,
+                    });
+                }
+                StreamTurn::ToolResult {
+                    name,
+                    output,
+                    is_error,
+                } => {
+                    state_for_loop.emit(UiEvent::ToolResult {
+                        name,
+                        output,
+                        is_error,
                     });
                 }
                 StreamTurn::Done(_) => {
@@ -174,7 +231,7 @@ async fn send_handler(State(state): State<AppState>, Form(form): Form<SendForm>)
         }
     });
 
-    Redirect::to("/")
+    Redirect::to("/").into_response()
 }
 
 /// SSE handler — subscribes to the broadcast channel and yields events
@@ -187,13 +244,18 @@ async fn sse_handler(
     let mut inner = tokio_stream::wrappers::BroadcastStream::new(rx);
     let stream = async_stream::stream! {
         while let Some(item) = inner.next().await {
-            // `BroadcastStream` only yields `Ok` or `Lagged`; the `Lagged`
-            // variant means a slow client missed events — drop them silently
-            // and keep streaming.
-            if let Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) = item {
-                continue;
-            }
-            let ev = item.expect("BroadcastStream only yields Ok | Lagged");
+            let ev = match item {
+                Ok(ev) => ev,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    // A slow client missed events. Surface a one-off
+                    // `Lagged` UI event so the browser can warn the user
+                    // that some output is gone.
+                    let json = serde_json::to_string(&UiEvent::Lagged { missed: n })
+                        .unwrap_or_else(|_| "{}".into());
+                    yield Ok(Event::default().data(json));
+                    continue;
+                }
+            };
             let json = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
             yield Ok(Event::default().data(json));
         }
@@ -237,13 +299,29 @@ pub async fn serve(state: AppState, bind: BindAddr) -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", bind.host, bind.port)
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "binding outside loopback: the agent can run shell commands, so              anyone who can reach this port can run them on this host"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "zero-hermes web UI listening");
     let app = router(state);
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| anyhow::anyhow!("axum serve: {e}"))?;
     Ok(())
+}
+
+/// Resolve on Ctrl-C so in-flight responses can finish instead of being
+/// cut off mid-stream.
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("shutdown signal received"),
+        Err(e) => tracing::warn!(error = %e, "failed to listen for ctrl-c"),
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 //! deliberately minimal — we only implement the parts of SSE that real
 //! providers (Anthropic, OpenAI-compatible) actually emit.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -79,6 +80,7 @@ pub fn parse_anthropic_sse(response: reqwest::Response) -> EventStream {
         cur_tool_id: String::new(),
         cur_tool_name: String::new(),
         cur_tool_input: String::new(),
+        pending: VecDeque::new(),
         finished: false,
     })
 }
@@ -92,23 +94,32 @@ struct AnthropicSse {
     cur_tool_id: String,
     cur_tool_name: String,
     cur_tool_input: String,
+    /// Events buffered for the consumer (one event per poll). The parser
+    /// pushes here instead of returning inline so multiple events from a
+    /// single SSE line (rare but possible) are preserved.
+    pending: VecDeque<StreamEvent>,
     finished: bool,
 }
 
 impl AnthropicSse {
-    fn feed_line(&mut self, line: &str) -> Result<Option<StreamEvent>> {
+    /// Parse one SSE `data:` line and push any resulting events into
+    /// `self.pending`.
+    fn feed_line(&mut self, line: &str) -> Result<()> {
         let Some(data) = line.strip_prefix("data:") else {
-            return Ok(None);
+            return Ok(());
         };
         let payload = data.trim();
         if payload.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let v: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             // Some providers ping heartbeat JSON we don't care about; skip
             // anything that doesn't parse rather than failing the stream.
-            Err(_) => return Ok(None),
+            Err(e) => {
+                tracing::debug!(error = %e, payload, "anthropic SSE: ignoring non-JSON line");
+                return Ok(());
+            }
         };
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
@@ -136,7 +147,6 @@ impl AnthropicSse {
                         self.in_block = 0;
                     }
                 }
-                Ok(None)
             }
             "content_block_delta" => {
                 let delta = v.get("delta").cloned().unwrap_or(Value::Null);
@@ -145,7 +155,8 @@ impl AnthropicSse {
                     "text_delta" => {
                         if let Some(t) = delta.get("text").and_then(|x| x.as_str()) {
                             self.text.push_str(t);
-                            return Ok(Some(StreamEvent::TextDelta(t.to_string())));
+                            self.pending
+                                .push_back(StreamEvent::TextDelta(t.to_string()));
                         }
                     }
                     "input_json_delta" => {
@@ -155,55 +166,55 @@ impl AnthropicSse {
                     }
                     _ => {}
                 }
-                Ok(None)
             }
             "content_block_stop" => {
                 if self.in_block == 2 {
-                    let input: Value = serde_json::from_str(&self.cur_tool_input)
-                        .unwrap_or_else(|_| Value::String(self.cur_tool_input.clone()));
+                    let input = match serde_json::from_str(&self.cur_tool_input) {
+                        Ok(v) => v,
+                        Err(_) => Value::String(self.cur_tool_input.clone()),
+                    };
                     let tc = ToolCall {
                         id: std::mem::take(&mut self.cur_tool_id),
                         name: std::mem::take(&mut self.cur_tool_name),
                         input,
                     };
                     self.tool_calls.push(tc.clone());
-                    self.in_block = 0;
-                    return Ok(Some(StreamEvent::ToolUseBlock(tc)));
+                    self.pending.push_back(StreamEvent::ToolUseBlock(tc));
                 }
                 self.in_block = 0;
-                Ok(None)
             }
             "message_stop" => {
                 self.finished = true;
-                Ok(Some(StreamEvent::Done(Completion {
+                self.pending.push_back(StreamEvent::Done(Completion {
                     text: if self.text.is_empty() {
                         None
                     } else {
                         Some(std::mem::take(&mut self.text))
                     },
                     tool_calls: std::mem::take(&mut self.tool_calls),
-                })))
+                }));
             }
             // message_start / message_delta / ping etc — ignore.
-            _ => Ok(None),
+            _ => {}
         }
+        Ok(())
     }
 
-    fn flush_done_if_needed(&mut self) -> Option<StreamEvent> {
+    fn flush_done_if_needed(&mut self) {
         if self.finished {
-            return None;
+            return;
         }
         // Stream ended without an explicit message_stop (rare but possible
         // for cancelled or truncated responses); still emit a Done.
         self.finished = true;
-        Some(StreamEvent::Done(Completion {
+        self.pending.push_back(StreamEvent::Done(Completion {
             text: if self.text.is_empty() {
                 None
             } else {
                 Some(std::mem::take(&mut self.text))
             },
             tool_calls: std::mem::take(&mut self.tool_calls),
-        }))
+        }));
     }
 }
 
@@ -212,32 +223,43 @@ impl Stream for AnthropicSse {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Drain any events already parsed before going back to the wire.
+            if let Some(ev) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(ev)));
+            }
+
             // Try to drain any complete lines already in the buffer.
             if let Some(idx) = self.buffer.find('\n') {
-                let line = self.buffer[..idx].to_string();
-                self.buffer.drain(..=idx);
-                let line = line.trim_end_matches('\r');
+                // Vec::split_off takes ownership of the tail [at, len) and
+                // leaves [0, at) in self.buffer with no allocation. We then
+                // swap so self.buffer holds the remainder and `line_buf`
+                // holds the line (still ending in '\n', which we pop).
+                let line_buf = self.buffer.split_off(idx + 1);
+                let mut line_buf = line_buf;
+                std::mem::swap(&mut self.buffer, &mut line_buf);
+                line_buf.pop(); // drop the trailing '\n'
+                let line = line_buf.trim_end_matches('\r');
                 if line.is_empty() {
                     continue;
                 }
-                match self.feed_line(line) {
-                    Ok(Some(ev)) => return Poll::Ready(Some(Ok(ev))),
-                    Ok(None) => continue,
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                }
+                self.feed_line(line)?;
+                continue;
             }
 
             // Need more bytes from the underlying byte stream.
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    // String::from_utf8_lossy is zero-copy when the bytes are
+                    // valid UTF-8 (the normal case); the only allocation is
+                    // when copying into self.buffer below.
                     self.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("SSE read error: {e}"))));
                 }
                 Poll::Ready(None) => {
-                    if let Some(ev) = self.flush_done_if_needed() {
+                    self.flush_done_if_needed();
+                    if let Some(ev) = self.pending.pop_front() {
                         return Poll::Ready(Some(Ok(ev)));
                     }
                     return Poll::Ready(None);
@@ -263,8 +285,11 @@ pub fn parse_openai_sse(response: reqwest::Response) -> EventStream {
         // Per-index tool call accumulators keyed by `index` field.
         // We don't always receive the full tool call on first delta; the
         // first delta usually has the id+name and subsequent ones have
-        // argument fragments.
+        // argument fragments. The parser flushes builders into `tool_calls`
+        // (and emits `ToolUseBlock` events) when a `finish_reason:"tool_calls"`
+        // marker arrives, or defensively at `[DONE]`.
         builders: std::collections::HashMap::new(),
+        pending: VecDeque::new(),
         finished: false,
     })
 }
@@ -281,43 +306,74 @@ struct OpenAiSse {
     text: String,
     tool_calls: Vec<ToolCall>,
     builders: std::collections::HashMap<usize, OpenAiToolBuilder>,
+    pending: VecDeque<StreamEvent>,
     finished: bool,
 }
 
 impl OpenAiSse {
-    fn feed_line(&mut self, line: &str) -> Result<Option<StreamEvent>> {
+    /// Build the final `ToolCall` from an in-flight builder, falling back to
+    /// `Value::String(args)` when the partial JSON doesn't parse.
+    fn builder_to_call(b: OpenAiToolBuilder) -> ToolCall {
+        let input = match serde_json::from_str(&b.args) {
+            Ok(v) => v,
+            Err(_) => Value::String(b.args),
+        };
+        ToolCall {
+            id: b.id,
+            name: b.name,
+            input,
+        }
+    }
+
+    /// Flush all in-flight builders, push the resulting `ToolCall`s to
+    /// `self.tool_calls` (so `Done` carries them) and queue a
+    /// `ToolUseBlock` event per tool call (sorted by index for stable
+    /// ordering). Idempotent: callers ensure builders are non-empty.
+    fn flush_builders(&mut self) {
+        if self.builders.is_empty() {
+            return;
+        }
+        let mut keys: Vec<usize> = self.builders.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            if let Some(b) = self.builders.remove(&k) {
+                let tc = Self::builder_to_call(b);
+                self.tool_calls.push(tc.clone());
+                self.pending.push_back(StreamEvent::ToolUseBlock(tc));
+            }
+        }
+    }
+
+    /// Parse one SSE `data:` line and queue any resulting events.
+    fn feed_line(&mut self, line: &str) -> Result<()> {
         let Some(data) = line.strip_prefix("data:") else {
-            return Ok(None);
+            return Ok(());
         };
         let payload = data.trim();
         if payload.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         if payload == "[DONE]" {
             self.finished = true;
-            // Flush any in-flight tool calls.
-            let mut out: Vec<ToolCall> = std::mem::take(&mut self.tool_calls);
-            for (_, b) in self.builders.drain() {
-                let input: Value =
-                    serde_json::from_str(&b.args).unwrap_or_else(|_| Value::String(b.args.clone()));
-                out.push(ToolCall {
-                    id: b.id,
-                    name: b.name,
-                    input,
-                });
-            }
-            return Ok(Some(StreamEvent::Done(Completion {
+            // Defensive: flush any builders that never received a
+            // finish_reason. Some servers omit it.
+            self.flush_builders();
+            self.pending.push_back(StreamEvent::Done(Completion {
                 text: if self.text.is_empty() {
                     None
                 } else {
                     Some(std::mem::take(&mut self.text))
                 },
-                tool_calls: out,
-            })));
+                tool_calls: std::mem::take(&mut self.tool_calls),
+            }));
+            return Ok(());
         }
         let v: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                tracing::debug!(error = %e, payload, "openai SSE: ignoring non-JSON line");
+                return Ok(());
+            }
         };
         let choice = v
             .get("choices")
@@ -326,11 +382,11 @@ impl OpenAiSse {
             .cloned()
             .unwrap_or(Value::Null);
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
-        let mut emitted: Option<StreamEvent> = None;
         if let Some(content) = delta.get("content").and_then(|x| x.as_str()) {
             if !content.is_empty() {
                 self.text.push_str(content);
-                emitted = Some(StreamEvent::TextDelta(content.to_string()));
+                self.pending
+                    .push_back(StreamEvent::TextDelta(content.to_string()));
             }
         }
         if let Some(arr) = delta.get("tool_calls").and_then(|x| x.as_array()) {
@@ -361,36 +417,30 @@ impl OpenAiSse {
                 }
             }
         }
-        // Tool calls sometimes also come fully formed in a single delta with
-        // a `finish_reason` of `tool_calls`. When that happens the server
-        // may not emit any further deltas, so we have nothing else to do
-        // here — the [DONE] marker will arrive shortly and we'll flush.
-        Ok(emitted)
+        // finish_reason arrives in the *same* choice object that contains
+        // the delta. The OpenAI spec uses "tool_calls" to mark completion.
+        if let Some(fr) = choice.get("finish_reason").and_then(|x| x.as_str()) {
+            if fr == "tool_calls" {
+                self.flush_builders();
+            }
+        }
+        Ok(())
     }
 
-    fn flush_done_if_needed(&mut self) -> Option<StreamEvent> {
+    fn flush_done_if_needed(&mut self) {
         if self.finished {
-            return None;
+            return;
         }
         self.finished = true;
-        let mut out: Vec<ToolCall> = std::mem::take(&mut self.tool_calls);
-        for (_, b) in self.builders.drain() {
-            let input: Value =
-                serde_json::from_str(&b.args).unwrap_or_else(|_| Value::String(b.args.clone()));
-            out.push(ToolCall {
-                id: b.id,
-                name: b.name,
-                input,
-            });
-        }
-        Some(StreamEvent::Done(Completion {
+        self.flush_builders();
+        self.pending.push_back(StreamEvent::Done(Completion {
             text: if self.text.is_empty() {
                 None
             } else {
                 Some(std::mem::take(&mut self.text))
             },
-            tool_calls: out,
-        }))
+            tool_calls: std::mem::take(&mut self.tool_calls),
+        }));
     }
 }
 
@@ -399,29 +449,31 @@ impl Stream for OpenAiSse {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if let Some(ev) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(ev)));
+            }
             if let Some(idx) = self.buffer.find('\n') {
-                let line = self.buffer[..idx].to_string();
-                self.buffer.drain(..=idx);
-                let line = line.trim_end_matches('\r');
+                let line_buf = self.buffer.split_off(idx + 1);
+                let mut line_buf = line_buf;
+                std::mem::swap(&mut self.buffer, &mut line_buf);
+                line_buf.pop();
+                let line = line_buf.trim_end_matches('\r');
                 if line.is_empty() {
                     continue;
                 }
-                match self.feed_line(line) {
-                    Ok(Some(ev)) => return Poll::Ready(Some(Ok(ev))),
-                    Ok(None) => continue,
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                }
+                self.feed_line(line)?;
+                continue;
             }
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("SSE read error: {e}"))));
                 }
                 Poll::Ready(None) => {
-                    if let Some(ev) = self.flush_done_if_needed() {
+                    self.flush_done_if_needed();
+                    if let Some(ev) = self.pending.pop_front() {
                         return Poll::Ready(Some(Ok(ev)));
                     }
                     return Poll::Ready(None);
@@ -470,7 +522,6 @@ mod tests {
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".into(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into(),
         ];
-        // Build a minimal AnthropicSse directly (bypassing reqwest Response).
         let mut s = AnthropicSse {
             inner: byte_stream_from_strings(events),
             buffer: String::new(),
@@ -480,6 +531,7 @@ mod tests {
             cur_tool_id: String::new(),
             cur_tool_name: String::new(),
             cur_tool_input: String::new(),
+            pending: VecDeque::new(),
             finished: false,
         };
         let events = sse_events(&mut s);
@@ -513,6 +565,7 @@ mod tests {
             cur_tool_id: String::new(),
             cur_tool_name: String::new(),
             cur_tool_input: String::new(),
+            pending: VecDeque::new(),
             finished: false,
         };
         let events = sse_events(&mut s);
@@ -549,6 +602,7 @@ mod tests {
             text: String::new(),
             tool_calls: Vec::new(),
             builders: std::collections::HashMap::new(),
+            pending: VecDeque::new(),
             finished: false,
         };
         let events = sse_events(&mut s);
@@ -561,7 +615,46 @@ mod tests {
     }
 
     #[test]
-    fn openai_tool_call_stream() {
+    fn openai_tool_call_stream_with_finish_reason() {
+        // The "real" OpenAI flow: tool-call deltas followed by a
+        // finish_reason:"tool_calls" marker.
+        let events: Vec<String> = vec![
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n".into(),
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n".into(),
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n".into(),
+            "data: [DONE]\n\n".into(),
+        ];
+        let mut s = OpenAiSse {
+            inner: byte_stream_from_strings(events),
+            buffer: String::new(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+            builders: std::collections::HashMap::new(),
+            pending: VecDeque::new(),
+            finished: false,
+        };
+        let events = sse_events(&mut s);
+        // ToolUseBlock should fire before Done.
+        match &events[0] {
+            StreamEvent::ToolUseBlock(tc) => {
+                assert_eq!(tc.name, "bash");
+                assert_eq!(tc.input["command"], "ls");
+            }
+            other => panic!("expected ToolUseBlock, got {other:?}"),
+        }
+        match events.last().unwrap() {
+            StreamEvent::Done(c) => {
+                assert_eq!(c.tool_calls.len(), 1);
+                assert_eq!(c.tool_calls[0].name, "bash");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_tool_call_stream_flushes_on_done() {
+        // Some servers don't emit finish_reason. The parser should still
+        // surface tool calls at [DONE].
         let events: Vec<String> = vec![
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n".into(),
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n".into(),
@@ -573,15 +666,53 @@ mod tests {
             text: String::new(),
             tool_calls: Vec::new(),
             builders: std::collections::HashMap::new(),
+            pending: VecDeque::new(),
             finished: false,
         };
         let events = sse_events(&mut s);
-        match &events.last().unwrap() {
+        match events.last().unwrap() {
             StreamEvent::Done(c) => {
                 assert_eq!(c.tool_calls.len(), 1);
                 assert_eq!(c.tool_calls[0].name, "bash");
-                assert_eq!(c.tool_calls[0].input["command"], "ls");
             }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_multiple_tool_calls() {
+        // Two tool calls flushed together when finish_reason arrives.
+        let events: Vec<String> = vec![
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n".into(),
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n".into(),
+            "data: [DONE]\n\n".into(),
+        ];
+        let mut s = OpenAiSse {
+            inner: byte_stream_from_strings(events),
+            buffer: String::new(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+            builders: std::collections::HashMap::new(),
+            pending: VecDeque::new(),
+            finished: false,
+        };
+        let events = sse_events(&mut s);
+        let blocks: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseBlock(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected two ToolUseBlocks, got {events:?}"
+        );
+        assert_eq!(blocks[0].name, "bash");
+        assert_eq!(blocks[1].name, "read");
+        match events.last().unwrap() {
+            StreamEvent::Done(c) => assert_eq!(c.tool_calls.len(), 2),
             other => panic!("expected Done, got {other:?}"),
         }
     }

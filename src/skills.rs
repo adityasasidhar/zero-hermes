@@ -38,7 +38,12 @@ pub struct Skill {
 impl Skill {
     /// Render a short index entry for the system prompt.
     pub fn index_line(&self) -> String {
-        format!("- {}: {}", self.name, self.description)
+        format!(
+            "- {}: {} ({})",
+            self.name,
+            self.description,
+            self.path.display()
+        )
     }
 }
 
@@ -87,30 +92,69 @@ impl SkillRegistry {
         out
     }
 
-    /// Build the registry by scanning `dir` for `*/SKILL.md` and
-    /// `*/skill.md` (case-insensitive).
+    /// Build the registry by recursively scanning `dir` for `SKILL.md` and
+    /// `skill.md` files. This accepts the nested category layout shipped by
+    /// Hermes Agent as well as zero-hermes' original one-directory-per-skill
+    /// layout.
     pub fn load_dir(dir: &Path) -> Result<Self> {
         let mut reg = Self::new();
         if !dir.exists() {
             tracing::info!(?dir, "skills dir does not exist");
             return Ok(reg);
         }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
+        Self::load_dir_recursive(dir, &mut reg)?;
+        Ok(reg)
+    }
+
+    fn load_dir_recursive(dir: &Path, reg: &mut Self) -> Result<()> {
+        let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
             let path = entry.path();
-            for name in ["SKILL.md", "skill.md"] {
-                let candidate = path.join(name);
-                if candidate.exists() {
-                    let skill = Skill::from_file(&candidate)?;
-                    reg.insert(skill);
-                    break;
+            if entry.file_type()?.is_dir() {
+                Self::load_dir_recursive(&path, reg)?;
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("skill.md"))
+            {
+                let mut skill = Skill::from_file(&path)?;
+                if let Some(previous) = reg.get(&skill.name) {
+                    let duplicate_name = path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("skill")
+                        .to_string();
+                    tracing::warn!(
+                        name = %skill.name,
+                        previous = ?previous.path,
+                        replacement = ?skill.path,
+                        alias = %duplicate_name,
+                        "duplicate skill name; loading the later path under its directory alias"
+                    );
+                    skill.name = Self::unique_name(duplicate_name, reg);
                 }
+                reg.insert(skill);
             }
         }
-        Ok(reg)
+        Ok(())
+    }
+
+    /// Produce a collision-free skill name, preserving the source directory
+    /// name as the readable base for a skill with duplicate frontmatter.
+    fn unique_name(base: String, reg: &Self) -> String {
+        if reg.get(&base).is_none() {
+            return base;
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if reg.get(&candidate).is_none() {
+                return candidate;
+            }
+            suffix += 1;
+        }
     }
 }
 
@@ -137,16 +181,24 @@ impl Skill {
         })
     }
 
-    /// Load a skill from a file. The `name` is inferred from the parent
-    /// directory if the frontmatter does not provide one.
+    /// Load a skill from a file. The `name` is read from frontmatter when
+    /// present, otherwise inferred from the parent directory.
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
-        let name = path
+        let fallback_name = path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("skill")
             .to_string();
+        let (front, _) = split_frontmatter(&raw);
+        let name = front
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("name:"))
+            .map(|name| name.trim().trim_matches(['"', '\'']).to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(fallback_name);
         Self::parse(name, path.to_path_buf(), &raw)
     }
 }
@@ -230,6 +282,42 @@ mod tests {
         let a = reg.get("alpha").unwrap();
         assert_eq!(a.description, "alpha skill");
         assert!(a.body.contains("alpha body"));
+    }
+
+    #[test]
+    fn loads_nested_hermes_layout_and_frontmatter_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("development").join("debugging");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: systematic-debugging\ndescription: debug carefully\n---\nbody\n",
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::load_dir(tmp.path()).unwrap();
+        assert_eq!(reg.names(), vec!["systematic-debugging"]);
+        assert_eq!(
+            reg.get("systematic-debugging").unwrap().description,
+            "debug carefully"
+        );
+    }
+
+    #[test]
+    fn keeps_duplicate_frontmatter_names_under_directory_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["first", "patch"] {
+            let skill_dir = tmp.path().join(dir);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: shared\ndescription: duplicate\n---\nbody\n",
+            )
+            .unwrap();
+        }
+
+        let reg = SkillRegistry::load_dir(tmp.path()).unwrap();
+        assert_eq!(reg.names(), vec!["patch", "shared"]);
     }
 
     #[test]

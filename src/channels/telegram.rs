@@ -9,6 +9,15 @@ use std::time::Duration;
 
 use crate::channels::{parse_command, strip_bot_mention, Channel, InboundMessage};
 use crate::error::Result;
+use crate::util::{chunk_text, truncate_bytes};
+
+/// Telegram rejects `sendMessage` bodies over 4096 characters outright.
+/// Split below that with a little headroom, since the API counts UTF-16
+/// code units and we count `char`s.
+pub const TELEGRAM_MAX_MESSAGE_CHARS: usize = 4000;
+
+/// Longest backoff between failed `getUpdates` polls.
+const MAX_POLL_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Telegram channel configuration.
 #[derive(Debug, Clone)]
@@ -34,10 +43,15 @@ pub struct TelegramChannel {
 impl TelegramChannel {
     /// Build a channel from a config.
     pub fn new(cfg: TelegramConfig) -> Self {
+        // `panic = "abort"` in the release profile means an `expect` here
+        // would take the process down rather than degrade one channel.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(cfg.poll_timeout as u64 + 30))
             .build()
-            .expect("reqwest client");
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "telegram client build failed; using default client");
+                reqwest::Client::new()
+            });
         Self { cfg, client }
     }
 }
@@ -50,6 +64,9 @@ impl Channel for TelegramChannel {
 
     async fn run(&self, tx: tokio::sync::mpsc::Sender<InboundMessage>) -> Result<()> {
         let mut offset: Option<i64> = None;
+        // Transient failures back off exponentially instead of hammering
+        // the API every 2s forever.
+        let mut backoff = Duration::from_secs(2);
         loop {
             let mut url = format!(
                 "{}/getUpdates?timeout={}",
@@ -62,19 +79,48 @@ impl Channel for TelegramChannel {
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(error = %e, "telegram getUpdates failed");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tracing::warn!(error = %e, backoff = ?backoff, "telegram getUpdates failed");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
                     continue;
                 }
             };
+
+            // A rejected token never becomes valid by retrying. Surfacing
+            // it as an error stops the gateway instead of leaving it
+            // silently spinning on a config the user needs to fix.
+            let status = resp.status();
+            if matches!(status.as_u16(), 401 | 403 | 404) {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "telegram rejected the bot token ({status}): {}. \
+                     Check `telegram.token` in your config.",
+                    truncate_bytes(&body, 256)
+                );
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    %status,
+                    body = %truncate_bytes(&body, 256),
+                    backoff = ?backoff,
+                    "telegram getUpdates returned an error"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
+                continue;
+            }
+
             let body: UpdateResponse = match resp.json().await {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(error = %e, "telegram getUpdates parse");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tracing::warn!(error = %e, backoff = ?backoff, "telegram getUpdates parse");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
                     continue;
                 }
             };
+            backoff = Duration::from_secs(2);
 
             for upd in body.result {
                 if let Some(msg) = upd.message {
@@ -83,6 +129,7 @@ impl Channel for TelegramChannel {
                         if !self.cfg.allowed_chats.is_empty()
                             && !self.cfg.allowed_chats.contains(&msg.chat.id)
                         {
+                            tracing::warn!(chat_id = %chat_id, "ignoring message from chat outside allowed_chats");
                             offset = Some(upd.update_id + 1);
                             continue;
                         }
@@ -96,6 +143,8 @@ impl Channel for TelegramChannel {
                                 continue;
                             }
                         }
+                        let timestamp = chrono::DateTime::from_timestamp(msg.date, 0)
+                            .unwrap_or_else(chrono::Utc::now);
                         let inbound = InboundMessage {
                             channel: "telegram".to_string(),
                             chat_id,
@@ -103,8 +152,8 @@ impl Channel for TelegramChannel {
                             user_name: msg.from.as_ref().map(|u| {
                                 u.username.clone().unwrap_or_else(|| u.first_name.clone())
                             }),
-                            timestamp: chrono::Utc::now(),
-                            text: text.clone(),
+                            timestamp,
+                            text,
                             command: cmd,
                             args,
                         };
@@ -119,40 +168,38 @@ impl Channel for TelegramChannel {
         }
     }
 
+    /// Send a reply, splitting it across as many messages as the 4096-char
+    /// limit requires. A long agent answer used to be rejected wholesale
+    /// and logged as a warning, so the user simply got nothing back.
     async fn send(&self, chat_id: &str, text: &str) -> Result<()> {
         let url = format!("{}/sendMessage", self.cfg.base_url());
-        let payload = SendMessagePayload {
-            chat_id,
-            text,
-            parse_mode: None,
-        };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("telegram send: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "telegram send {}: {}",
-                status,
-                truncate(&body, 256)
-            ));
+        for chunk in chunk_text(text, TELEGRAM_MAX_MESSAGE_CHARS) {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            let payload = SendMessagePayload {
+                chat_id,
+                text: &chunk,
+                parse_mode: None,
+            };
+            let resp = self
+                .client
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("telegram send: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "telegram send {}: {}",
+                    status,
+                    truncate_bytes(&body, 256)
+                ));
+            }
         }
         Ok(())
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut t = s[..max].to_string();
-        t.push('…');
-        t
     }
 }
 
@@ -179,7 +226,6 @@ struct UpdateMessage {
     chat: UpdateChat,
     #[serde(default)]
     text: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     date: i64,
 }

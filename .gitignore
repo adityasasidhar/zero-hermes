@@ -1,4 +1,12 @@
 target/
 *.swp
 .DS_Store
-
+# Local runtime state. A literal `~` directory used to get created here by
+# an unexpanded `~/...` memory path; config paths are expanded now, but keep
+# the guard so a stray one is never committed again.
+/~/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+zero_hermes.toml
+.env

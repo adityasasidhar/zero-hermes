@@ -9,7 +9,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use http_body_util::BodyStream;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use zero_hermes::agent::{Message, ToolContext};
@@ -23,12 +23,13 @@ fn test_state() -> AppState {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     AppState {
         events: tx,
-        history: Arc::new(RwLock::new(Vec::<Message>::new())),
+        history: Arc::new(Mutex::new(Vec::<Message>::new())),
         system: "you are zero-hermes".into(),
         provider: Arc::new(zero_hermes::agent::mock::MockProvider::text_only("hi")),
         tools: Arc::new(ToolRegistry::new()),
         memory: Arc::new(Memory::in_memory().unwrap()),
-        max_iterations: 3,
+        limits: zero_hermes::agent::RunLimits::iterations(3),
+        csrf_token: "test-token".to_string(),
     }
 }
 
@@ -78,7 +79,7 @@ async fn send_routes_with_empty_message() {
                 .method("POST")
                 .uri("/send")
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("message="))
+                .body(Body::from("csrf=test-token&message="))
                 .unwrap(),
         )
         .await
@@ -105,7 +106,7 @@ async fn send_with_message_returns_redirect_and_emits_user_event() {
                 .method("POST")
                 .uri("/send")
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("message=hello"))
+                .body(Body::from("csrf=test-token&message=hello"))
                 .unwrap(),
         )
         .await
@@ -245,4 +246,60 @@ async fn tool_context_default_is_empty() {
     assert!(ctx.cwd.is_none());
     assert!(ctx.session_id.is_none());
     assert!(ctx.memory.is_none());
+}
+
+#[tokio::test]
+async fn send_without_csrf_token_is_rejected() {
+    // A cross-origin form POST is a "simple request" — no preflight — so
+    // without this check any page the user visits could drive the agent's
+    // bash tool on localhost.
+    let app = router(test_state());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("message=rm%20-rf%20%2F"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn send_with_wrong_csrf_token_is_rejected() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("csrf=guessed&message=hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn index_embeds_the_live_csrf_token() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("value=\"test-token\""),
+        "token should be injected into the form"
+    );
+    assert!(
+        !html.contains("{{CSRF_TOKEN}}"),
+        "placeholder should be fully substituted"
+    );
 }
