@@ -92,6 +92,41 @@ impl SkillRegistry {
         out
     }
 
+    /// Render a budgeted index for the system prompt (E24).
+    ///
+    /// The full index is ~7k tokens for the vendored pack; every prompt
+    /// would pay that. This lists entries alphabetically until `max_chars`
+    /// would be exceeded, then appends a `+N more` hint pointing at the
+    /// `skill` tool's `list` action for discovery. At least one entry is
+    /// always shown so a tiny budget still names something. `render_index`
+    /// remains the complete listing used by the `skill(list)` tool itself.
+    pub fn render_index_capped(&self, max_chars: usize) -> String {
+        if self.skills.is_empty() {
+            return "(no skills loaded)".to_string();
+        }
+        let total = self.skills.len();
+        let mut out = String::new();
+        let mut shown = 0usize;
+        for s in self.skills.values() {
+            let line = format!("{}\n", s.index_line());
+            if shown > 0 && out.len() + line.len() > max_chars {
+                break;
+            }
+            out.push_str(&line);
+            shown += 1;
+            if out.len() >= max_chars {
+                break;
+            }
+        }
+        if shown < total {
+            out.push_str(&format!(
+                "... +{} more; use skill(list) for the full index\n",
+                total - shown
+            ));
+        }
+        out
+    }
+
     /// Build the registry by recursively scanning `dir` for `SKILL.md` and
     /// `skill.md` files. This accepts the nested category layout shipped by
     /// Hermes Agent as well as zero-hermes' original one-directory-per-skill
@@ -240,6 +275,148 @@ fn find_frontmatter_close(s: &str) -> Option<usize> {
     None
 }
 
+// --- Skills hub (E17) ----------------------------------------------------
+
+/// One entry in a hub manifest: where to fetch a missing `SKILL.md`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HubSkillEntry {
+    /// Skill name (letters, digits, `_`, `-` only).
+    pub name: String,
+    /// One-line description shown before sync.
+    #[serde(default)]
+    pub description: String,
+    /// URL of the raw `SKILL.md` to download.
+    pub url: String,
+}
+
+/// Remote manifest listing skills the hub offers.
+///
+/// JSON shape: `{skills:[{name, description, url}]}`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HubManifest {
+    /// Skills advertised by the hub.
+    #[serde(default)]
+    pub skills: Vec<HubSkillEntry>,
+}
+
+/// Hub URL precedence: explicit config value, else
+/// `ZERO_HERMES_SKILLS_HUB` env var. `None` means the vendored pack is
+/// used as-is (no network).
+pub fn resolve_hub_url(configured: Option<&str>) -> Option<String> {
+    if let Some(url) = configured {
+        if !url.trim().is_empty() {
+            return Some(url.trim().to_string());
+        }
+    }
+    std::env::var("ZERO_HERMES_SKILLS_HUB")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Fetch and validate a hub manifest (JSON).
+///
+/// Only `http(s)://` URLs are accepted; anything else errors without
+/// network access so tests stay offline.
+pub async fn fetch_hub_manifest(url: &str) -> Result<HubManifest> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        anyhow::bail!("hub manifest URL must start with http:// or https://: {url}");
+    }
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| anyhow::anyhow!("hub client build: {e}"))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("hub fetch failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("hub returned {status}"));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("hub body read: {e}"))?;
+    let manifest: HubManifest =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("hub manifest not JSON: {e}"))?;
+    validate_hub_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+/// Reject manifests with unsafe skill names or non-http(s) file URLs.
+pub fn validate_hub_manifest(manifest: &HubManifest) -> Result<()> {
+    for entry in &manifest.skills {
+        if entry.name.is_empty()
+            || !entry
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            anyhow::bail!("hub entry has invalid skill name: {:?}", entry.name);
+        }
+        if !(entry.url.starts_with("http://") || entry.url.starts_with("https://")) {
+            anyhow::bail!(
+                "hub entry {:?} has non-http(s) url: {}",
+                entry.name,
+                entry.url
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Download every hub skill missing from `root`.
+///
+/// Each missing entry is fetched from its `url` and written to
+/// `<root>/<name>/SKILL.md`. Returns the names that were added.
+///
+/// TODO(curator): run this as a background cron custom job (Wave D owns
+/// the scheduler) that periodically diffs the vendored pack against the
+/// hub manifest and files an update note instead of syncing inline, so
+/// upstream drift (29 changed / 32 neither per bug 17) is surfaced
+/// without blocking agent turns.
+pub async fn sync_missing_skills(root: &Path, manifest_url: &str) -> Result<Vec<String>> {
+    let manifest = fetch_hub_manifest(manifest_url).await?;
+    let existing = SkillRegistry::load_dir(root).unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| anyhow::anyhow!("hub client build: {e}"))?;
+    let mut added = Vec::new();
+    for entry in manifest.skills {
+        if existing.get(&entry.name).is_some() {
+            continue;
+        }
+        if root.join(&entry.name).join("SKILL.md").exists() {
+            continue;
+        }
+        let resp = client
+            .get(&entry.url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("hub download {} failed: {e}", entry.name))?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "hub download {} returned {}",
+                entry.name,
+                resp.status()
+            ));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("hub body read: {e}"))?;
+        let dest = root.join(&entry.name).join("SKILL.md");
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, body)?;
+        added.push(entry.name);
+    }
+    Ok(added)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +508,97 @@ mod tests {
         });
         let s = reg.render_index();
         assert!(s.contains("x: x skill"));
+    }
+
+    #[test]
+    fn render_index_capped_hints_at_more() {
+        let mut reg = SkillRegistry::new();
+        for name in ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh"] {
+            reg.insert(Skill {
+                name: name.into(),
+                description: format!("{name} skill"),
+                body: String::new(),
+                path: PathBuf::from(format!("/{name}")),
+            });
+        }
+        let full = reg.render_index();
+        assert!(full.contains("aaa") && full.contains("ddd"));
+        // Tiny budget: first entry plus a "+N more" hint.
+        let capped = reg.render_index_capped(60);
+        assert!(capped.contains("aaa"), "at least one entry: {capped}");
+        assert!(
+            capped.contains("+") && capped.contains("skill(list)"),
+            "must hint at discovery: {capped}"
+        );
+        assert!(capped.len() < full.len());
+        // Generous budget: everything, no hint.
+        let wide = reg.render_index_capped(10_000);
+        assert!(!wide.contains("+"), "no truncation expected: {wide}");
+        assert!(wide.contains("ddd"));
+    }
+
+    #[test]
+    fn render_index_capped_empty_registry() {
+        let reg = SkillRegistry::new();
+        assert_eq!(reg.render_index_capped(2000), "(no skills loaded)");
+    }
+
+    #[tokio::test]
+    async fn hub_rejects_non_http_manifest_url_without_network() {
+        let err = fetch_hub_manifest("file:///tmp/manifest.json")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("http"), "{err}");
+        let err = fetch_hub_manifest("not-a-url").await.unwrap_err();
+        assert!(err.to_string().contains("http"), "{err}");
+    }
+
+    #[test]
+    fn hub_manifest_validation_rejects_unsafe_entries() {
+        let bad_name = HubManifest {
+            skills: vec![HubSkillEntry {
+                name: "../evil".into(),
+                description: "x".into(),
+                url: "https://example.test/evil/SKILL.md".into(),
+            }],
+        };
+        assert!(validate_hub_manifest(&bad_name).is_err());
+        let bad_url = HubManifest {
+            skills: vec![HubSkillEntry {
+                name: "ok".into(),
+                description: "x".into(),
+                url: "file:///etc/passwd".into(),
+            }],
+        };
+        assert!(validate_hub_manifest(&bad_url).is_err());
+        let good = HubManifest {
+            skills: vec![HubSkillEntry {
+                name: "ok-name".into(),
+                description: "fine".into(),
+                url: "https://example.test/ok/SKILL.md".into(),
+            }],
+        };
+        assert!(validate_hub_manifest(&good).is_ok());
+    }
+
+    #[test]
+    fn hub_url_prefers_config_over_env() {
+        std::env::remove_var("ZERO_HERMES_SKILLS_HUB");
+        assert_eq!(resolve_hub_url(None), None);
+        assert_eq!(
+            resolve_hub_url(Some("https://example.test/manifest.json")).as_deref(),
+            Some("https://example.test/manifest.json")
+        );
+        std::env::set_var("ZERO_HERMES_SKILLS_HUB", "https://env.test/m.json");
+        assert_eq!(
+            resolve_hub_url(None).as_deref(),
+            Some("https://env.test/m.json")
+        );
+        // Explicit config wins over env.
+        assert_eq!(
+            resolve_hub_url(Some("https://cfg.test/m.json")).as_deref(),
+            Some("https://cfg.test/m.json")
+        );
+        std::env::remove_var("ZERO_HERMES_SKILLS_HUB");
     }
 }

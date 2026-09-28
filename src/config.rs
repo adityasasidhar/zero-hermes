@@ -31,6 +31,23 @@ pub struct Config {
     /// Skills directory (defaults to `<config_dir>/skills`).
     #[serde(default)]
     pub skills_dir: Option<PathBuf>,
+    /// Optional skills-hub manifest URL for `skill(sync)`.
+    ///
+    /// When set (or `ZERO_HERMES_SKILLS_HUB` is set), the `skill` tool's
+    /// `sync` action fetches a JSON manifest
+    /// (`{skills:[{name,description,url}]}`) and downloads missing
+    /// `SKILL.md` files into the skills dir. Unset by default: the
+    /// vendored pack is used as-is and drift is only reported, never
+    /// auto-pulled (see `skills::fetch_hub_manifest`).
+    #[serde(default)]
+    pub skills_hub_url: Option<String>,
+    /// MCP (Model Context Protocol) stdio servers.
+    ///
+    /// Minimal JSON-RPC 2.0 over stdio client lives in `crate::mcp`;
+    /// each entry spawns `command [args...]` and speaks
+    /// `initialize` / `tools/list` / `tools/call`. Empty by default.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// LLM provider configuration. The `kind` field selects the wire format:
@@ -70,6 +87,21 @@ pub struct ProviderConfig {
     /// forever, taking every chat and cron tick with it.
     #[serde(default = "default_read_timeout")]
     pub read_timeout_secs: u64,
+    /// Ordered fallback providers tried when the primary `complete` fails.
+    ///
+    /// Each entry is a full [`ProviderConfig`] (its own `kind`, `base_url`,
+    /// `api_key`, `model`, ...); nested `fallbacks` inside a fallback entry
+    /// are ignored to keep the retry graph a flat list. Empty by default.
+    ///
+    /// ```toml
+    /// # [[provider.fallbacks]]
+    /// # kind = "openai_compat"
+    /// # base_url = "https://api.openai.com"
+    /// # api_key = "${OPENAI_API_KEY}"
+    /// # model = "gpt-4o-mini"
+    /// ```
+    #[serde(default)]
+    pub fallbacks: Vec<ProviderConfig>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -118,8 +150,37 @@ impl Default for ProviderConfig {
             temperature: None,
             connect_timeout_secs: default_connect_timeout(),
             read_timeout_secs: default_read_timeout(),
+            fallbacks: Vec::new(),
         }
     }
+}
+
+/// One MCP stdio server entry under `[mcp.servers.<name>]`.
+///
+/// ```toml
+/// [mcp.servers.filesystem]
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Binary to spawn (resolved via `PATH` when relative).
+    #[serde(default)]
+    pub command: String,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the child process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// MCP client configuration: named stdio servers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Servers keyed by logical name (`[mcp.servers.<name>]`).
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
 /// Telegram gateway configuration.
@@ -342,7 +403,15 @@ impl Config {
         self.provider.api_key = expand_env_vars(&self.provider.api_key);
         self.provider.base_url = expand_env_vars(&self.provider.base_url);
         self.provider.model = expand_env_vars(&self.provider.model);
+        for fb in &mut self.provider.fallbacks {
+            fb.api_key = expand_env_vars(&fb.api_key);
+            fb.base_url = expand_env_vars(&fb.base_url);
+            fb.model = expand_env_vars(&fb.model);
+        }
         self.telegram.token = expand_env_vars(&self.telegram.token);
+        if let Some(url) = &self.skills_hub_url {
+            self.skills_hub_url = Some(expand_env_vars(url));
+        }
     }
 }
 

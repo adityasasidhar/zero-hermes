@@ -1713,12 +1713,25 @@ impl Tool for CronTool {
 /// the configured skills root, making the learning loop durable and auditable.
 pub struct SkillTool {
     root: PathBuf,
+    hub_url: Option<String>,
 }
 
 impl SkillTool {
     /// Create a skill tool rooted at `root`.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            hub_url: None,
+        }
+    }
+
+    /// Attach a skills-hub manifest URL (from config or env). The `sync`
+    /// action downloads missing `SKILL.md` files from the hub; without a
+    /// URL it errors with "hub not configured" and never touches the
+    /// network.
+    pub fn with_hub_url(mut self, hub_url: Option<String>) -> Self {
+        self.hub_url = hub_url;
+        self
     }
 }
 
@@ -1728,12 +1741,12 @@ impl Tool for SkillTool {
         "skill"
     }
     fn description(&self) -> &str {
-        "List, read, create, or patch reusable SKILL.md procedures."
+        "List, read, create, patch, or sync reusable SKILL.md procedures."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object", "properties": {
-                "action": {"type": "string", "enum": ["list", "read", "write", "patch"]},
+                "action": {"type": "string", "enum": ["list", "read", "write", "patch", "sync"]},
                 "name": {"type": "string", "description": "skill name (letters, digits, _, -)"},
                 "content": {"type": "string", "description": "full SKILL.md content for write (must include --- frontmatter with name: and description:)"},
                 "old_str": {"type": "string", "description": "exact string to replace for patch (must occur once)"},
@@ -1814,6 +1827,28 @@ impl Tool for SkillTool {
                         Ok(ToolOutput::ok(format!("patched skill {name}")))
                     }
                     Err(e) => Ok(ToolOutput::err(e)),
+                }
+            }
+            "sync" => {
+                let url = self
+                    .hub_url
+                    .clone()
+                    .or_else(|| crate::skills::resolve_hub_url(None))
+                    .filter(|s| !s.trim().is_empty());
+                let Some(url) = url else {
+                    return Ok(ToolOutput::err(
+                        "hub not configured (set skills_hub_url or ZERO_HERMES_SKILLS_HUB)",
+                    ));
+                };
+                match crate::skills::sync_missing_skills(&self.root, &url).await {
+                    Ok(added) if added.is_empty() => {
+                        Ok(ToolOutput::ok("skills hub: already up to date"))
+                    }
+                    Ok(added) => Ok(ToolOutput::ok(format!(
+                        "skills hub: added {}",
+                        added.join(", ")
+                    ))),
+                    Err(e) => Ok(ToolOutput::err(format!("skills hub sync failed: {e}"))),
                 }
             }
             other => Ok(ToolOutput::err(format!("unknown action: {other}"))),
@@ -2792,5 +2827,32 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+    #[test]
+    fn skill_schema_advertises_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = SkillTool::new(tmp.path().to_path_buf());
+        assert!(tool.schema()["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "sync"));
+    }
+
+    #[tokio::test]
+    async fn skill_sync_without_hub_errors_without_network() {
+        std::env::remove_var("ZERO_HERMES_SKILLS_HUB");
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = SkillTool::new(tmp.path().to_path_buf());
+        let out = tool
+            .execute(json!({"action": "sync"}), &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("hub not configured"),
+            "{}",
+            out.content
+        );
     }
 }

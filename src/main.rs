@@ -860,6 +860,14 @@ connect_timeout_secs = 10
 read_timeout_secs    = 120
 # OpenAI-compat-only (ignored when kind = "anthropic"):
 # temperature = 0.7
+# Ordered fallbacks: if the primary `complete` fails, each fallback is
+# tried once in order. `api_key` may hold a `;`-separated pool that is
+# rotated round-robin per call.
+# [[provider.fallbacks]]
+# kind = "openai_compat"
+# base_url = "https://api.openai.com"
+# api_key = "${OPENAI_API_KEY}"
+# model = "gpt-4o-mini"
 
 [telegram]
 token = ""

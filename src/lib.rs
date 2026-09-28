@@ -7,6 +7,7 @@ pub mod channels;
 pub mod config;
 pub mod cron;
 pub mod error;
+pub mod mcp;
 pub mod memory;
 pub mod skills;
 pub mod tools;
