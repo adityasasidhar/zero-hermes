@@ -104,7 +104,7 @@ async fn fetch_tool_against_local_server() {
         }
     });
 
-    let tool = FetchTool::default();
+    let tool = FetchTool::with_private_allowed();
     let url = format!("http://{addr}/json");
     let out = tool
         .execute(json!({"url": url}), &ToolContext::default())

@@ -14,7 +14,7 @@ use crate::agent::{LlmProvider, RunLimits};
 use crate::config::Config;
 use crate::skills::SkillRegistry;
 use crate::tools::builtin::{
-    BashTool, FetchTool, MemoryTool, ReadTool, SkillTool, SubAgentTool, WriteTool,
+    BashTool, CronTool, FetchTool, MemoryTool, ReadTool, SkillTool, SubAgentTool, WriteTool,
 };
 use crate::tools::ToolRegistry;
 
@@ -126,6 +126,7 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     reg.insert(Arc::new(WriteTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(FetchTool::default()), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(MemoryTool), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(CronTool), &cfg.agent.enabled_tools);
     reg.insert(
         Arc::new(SkillTool::new(skills_dir(cfg))),
         &cfg.agent.enabled_tools,
@@ -152,8 +153,15 @@ pub fn build_system_prompt(cfg: &Config, skills: &SkillRegistry) -> String {
         .system
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    base.replace("{{SKILLS}}", &skills.render_index())
-        .replace("{{MEMORY}}", &load_markdown_memory(cfg))
+    let rendered = base
+        .replace("{{SKILLS}}", &skills.render_index())
+        .replace("{{MEMORY}}", &load_markdown_memory(cfg));
+    let soul = load_soul_files();
+    if soul.is_empty() {
+        rendered
+    } else {
+        format!("{rendered}\n\n# Project instructions (SOUL/AGENTS)\n{soul}")
+    }
 }
 
 /// Load user-owned Markdown memory for injection into the system prompt.
@@ -182,6 +190,46 @@ fn load_markdown_memory(cfg: &Config) -> String {
             "(memory: in-process SQLite; Markdown memory file could not be read)".to_string()
         }
     }
+}
+
+/// Load Hermes-style soul files for injection into the system prompt.
+///
+/// Searches the current directory and the user config directory for
+/// `SOUL.md`, `AGENTS.md`, `.hermes.md` and `.hermes/SOUL.md`. Each file
+/// present is capped at 4KB so a large `AGENTS.md` cannot blow the
+/// context window. Absent files are silently skipped.
+pub fn load_soul_files() -> String {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for name in ["SOUL.md", "AGENTS.md", ".hermes.md"] {
+        candidates.push(PathBuf::from(name));
+    }
+    candidates.push(PathBuf::from(".hermes/SOUL.md"));
+    if let Some(dir) = crate::config::config_dir() {
+        for name in ["SOUL.md", "AGENTS.md", ".hermes.md"] {
+            candidates.push(dir.join(name));
+        }
+        candidates.push(dir.join(".hermes/SOUL.md"));
+    }
+    load_soul_files_from(&candidates)
+}
+
+/// Load and concatenate soul files from explicit candidate paths.
+///
+/// Exported for tests; [`load_soul_files`] supplies the real candidates.
+pub fn load_soul_files_from(candidates: &[PathBuf]) -> String {
+    let mut sections = Vec::new();
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let capped = crate::util::truncate_bytes(trimmed, 4096);
+        sections.push(format!("## {}\n{capped}", path.display()));
+    }
+    sections.join("\n\n")
 }
 
 /// Resolve the skills directory and load it.
@@ -233,7 +281,7 @@ mod tests {
         let reg = build_tool_registry(&Config::default(), provider());
         assert_eq!(
             reg.names(),
-            vec!["bash", "fetch", "memory", "read", "skill", "subagent", "write"]
+            vec!["bash", "cron", "fetch", "memory", "read", "skill", "subagent", "write"]
         );
     }
 
@@ -310,5 +358,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(skills_dir(&cfg), PathBuf::from("/explicit/skills"));
+    }
+
+    #[test]
+    fn soul_files_absent_yields_empty_string() {
+        let out = load_soul_files_from(&[PathBuf::from("/definitely/missing/SOUL.md")]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn soul_files_concatenate_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let soul = dir.path().join("SOUL.md");
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(&soul, "be kind").unwrap();
+        std::fs::write(&agents, "   ").unwrap();
+        let out = load_soul_files_from(&[soul, agents]);
+        assert!(out.contains("be kind"));
     }
 }

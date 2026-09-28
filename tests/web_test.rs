@@ -12,10 +12,10 @@ use http_body_util::BodyStream;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-use zero_hermes::agent::{Message, ToolContext};
+use zero_hermes::agent::ToolContext;
 use zero_hermes::memory::Memory;
 use zero_hermes::tools::ToolRegistry;
-use zero_hermes::web::{router, AppState, UiEvent};
+use zero_hermes::web::{normalize_web_session, router, AppState, UiEvent};
 
 /// Build a minimal `AppState` for tests — no network calls, in-memory
 /// everything.
@@ -23,7 +23,7 @@ fn test_state() -> AppState {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     AppState {
         events: tx,
-        history: Arc::new(Mutex::new(Vec::<Message>::new())),
+        histories: Arc::new(Mutex::new(std::collections::HashMap::new())),
         system: "you are zero-hermes".into(),
         provider: Arc::new(zero_hermes::agent::mock::MockProvider::text_only("hi")),
         tools: Arc::new(ToolRegistry::new()),
@@ -302,4 +302,58 @@ async fn index_embeds_the_live_csrf_token() {
         !html.contains("{{CSRF_TOKEN}}"),
         "placeholder should be fully substituted"
     );
+}
+
+#[test]
+fn web_session_normalization() {
+    assert_eq!(normalize_web_session(None), "web-default");
+    assert_eq!(normalize_web_session(Some("")), "web-default");
+    assert_eq!(normalize_web_session(Some("alice")), "web-alice");
+    assert_eq!(
+        normalize_web_session(Some("web-alice")),
+        "web-alice",
+        "already-prefixed ids are kept"
+    );
+}
+
+#[tokio::test]
+async fn send_persists_session_to_memory() {
+    let state = test_state();
+    let memory = state.memory.clone();
+    let mut rx = state.events.subscribe();
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("csrf=test-token&message=hello+web"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    // Wait for the turn to finish, then poll SQLite until the background
+    // task persists the transcript.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(UiEvent::Done)) => break,
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(history) = memory.load_history("web-default") {
+            if !history.is_empty() {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("expected web-default session to be persisted to memory");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
