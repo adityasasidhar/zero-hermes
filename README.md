@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/zero-hermes-logo.png" width="220" alt="zero-hermes logo — a winged terminal mark inside a zero" />
+  <img src="assets/zero_hermes_logo.png" width="220" alt="zero-hermes logo — a winged terminal mark inside a zero" />
 </p>
 
 <h1 align="center">zero-hermes</h1>

@@ -75,6 +75,10 @@ pub enum UiEvent {
     Lagged { missed: u64 },
 }
 
+/// Per-session turn locks: same session serializes, different sessions stay
+/// concurrent. See [`session_turn_lock`].
+pub type SessionLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
 /// Shared state for the web server.
 #[derive(Clone)]
 pub struct AppState {
@@ -83,11 +87,17 @@ pub struct AppState {
     /// Per-session conversation histories, keyed by `web-*` session id.
     ///
     /// `tokio::sync::Mutex` (not `RwLock`): turns clone a snapshot, run
-    /// without the lock, then store back (last-writer-wins per session).
-    /// Each session is also persisted to SQLite via [`Memory::save_history`]
-    /// so it survives restarts. The SSE broadcast stays global: every
-    /// browser tab sees every turn's events.
+    /// without the lock, then store back. Same-session turns are serialized
+    /// via [`AppState::session_locks`] so concurrent posts to one session
+    /// cannot interleave positions (last-writer-wins only across *different*
+    /// sessions, which stay concurrent). Each turn appends its delta via
+    /// [`Memory::append_messages`] so a restart resumes the transcript.
+    /// The SSE broadcast stays global: every browser tab sees every turn's
+    /// events.
     pub histories: Arc<Mutex<HashMap<String, Vec<Message>>>>,
+    /// Per-session turn locks: same session serializes, different sessions
+    /// stay concurrent. See [`session_turn_lock`].
+    pub session_locks: SessionLocks,
     /// System prompt (built from skills + provider.system).
     pub system: String,
     /// Provider for the agent loop.
@@ -115,6 +125,19 @@ impl AppState {
     pub fn emit(&self, ev: UiEvent) {
         let _ = self.events.send(ev);
     }
+}
+
+/// Acquire (creating on first use) the per-session turn lock.
+///
+/// Same session serializes; different sessions stay concurrent. The
+/// returned `Arc` is held across the whole turn (snapshot → LLM → store)
+/// so two posts to one session cannot duplicate positions.
+pub async fn session_turn_lock(map: &SessionLocks, session_id: &str) -> Arc<Mutex<()>> {
+    let mut guard = map.lock().await;
+    guard
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Build the axum router.
@@ -227,6 +250,7 @@ async fn send_handler(
     });
 
     let histories = state.histories.clone();
+    let session_locks = state.session_locks.clone();
     let provider = state.provider.clone();
     let tools = state.tools.clone();
     let memory = state.memory.clone();
@@ -236,10 +260,14 @@ async fn send_handler(
 
     // Spawn the agent loop on its own task so the HTTP handler can return
     // immediately and the browser can keep the SSE stream open to receive
-    // events as they happen. The turn clones its session history, runs
-    // without holding the lock, then stores back (last-writer-wins) and
-    // persists to SQLite.
+    // events as they happen. Same-session turns serialize on the
+    // per-session lock; different sessions stay concurrent. The turn
+    // snapshots history, runs without the histories lock, then stores back
+    // and appends the delta to SQLite. The `message` tool outbox is
+    // gateway-only (n/a here): this single UI already streams the turn.
     tokio::spawn(async move {
+        let turn_lock = session_turn_lock(&session_locks, &session_id).await;
+        let _turn_guard = turn_lock.lock().await;
         let snapshot = {
             let guard = histories.lock().await;
             if let Some(h) = guard.get(&session_id) {
@@ -324,6 +352,19 @@ async fn send_handler(
                 state_for_loop.emit(UiEvent::Error {
                     message: e.to_string(),
                 });
+                // `run_stream` pushes the user message before the first LLM
+                // call, so a failure leaves an orphan trailing user turn.
+                // Pop it so the next turn doesn't start with `user,user`,
+                // then persist the repaired history.
+                crate::agent::repair_history_after_failure(&mut history);
+                {
+                    let mut guard = histories.lock().await;
+                    guard.insert(session_id.clone(), history.clone());
+                }
+                let start = len_before.min(history.len());
+                if let Err(e) = memory.append_messages(&session_id, &history[start..]) {
+                    tracing::warn!(error = %e, "saving web session history after failure failed");
+                }
             }
         }
     });

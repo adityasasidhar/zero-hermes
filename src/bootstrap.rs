@@ -203,11 +203,22 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     // borrow problem and means sub-agents see the parent's tools without
     // being able to recurse (we strip `subagent` itself in the tool).
     //
+    // MCP: `mcp::build_mcp_tools` discovery is async (spawns stdio servers)
+    // and this constructor is sync, so no `mcp_*` tools are registered here
+    // and none are advertised in `tools list` until async wiring lands.
+    // `McpConfig::is_configured()` + `mcp::mcp_tool_names(&cfg.mcp)` report
+    // configured server names for prompt diagnostics only. See `src/mcp.rs`.
     // TODO(wave-e): wire MCP tools here via `mcp::list_remote_tools` +
     // `mcp::build_mcp_tools_from_list` + `insert_always`. Left out
     // deliberately: discovery is async (spawns stdio servers) and the
     // registry shape is Wave D territory — merging a sync constructor
     // now would conflict. See `src/mcp.rs`.
+    if cfg.mcp.is_configured() {
+        tracing::warn!(
+            servers = ?crate::mcp::mcp_tool_names(&cfg.mcp),
+            "mcp servers configured but not wired into the sync tool registry; no mcp_* tools advertised"
+        );
+    }
     let sibling = Arc::new(reg.clone());
     let mut reg = reg;
     reg.insert_always(Arc::new(SubAgentTool::new(

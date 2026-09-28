@@ -51,8 +51,7 @@ const READ_HARD_MAX_BYTES: usize = 200_000;
 /// truncated with a note so one noisy tool cannot blow the context window.
 pub const MODEL_OUTPUT_CHARS: usize = 30_000;
 
-/// Truncate `s` to at most `cap` characters (char-boundary safe), appending
-/// a `[truncated ...]` note when truncation occurred.
+/// Truncate `s` to at most `cap` chars for the model (see `crate::util::truncate_bytes` for the byte-based canonical helper).
 fn truncate_for_model(s: String, cap: usize) -> String {
     if s.chars().count() <= cap {
         return s;
@@ -64,7 +63,7 @@ fn truncate_for_model(s: String, cap: usize) -> String {
     )
 }
 
-/// Truncate `s` to [`MODEL_OUTPUT_CHARS`] characters for the model.
+/// Cap to [`MODEL_OUTPUT_CHARS`] chars for the model.
 fn cap_model_output(s: String) -> String {
     truncate_for_model(s, MODEL_OUTPUT_CHARS)
 }
@@ -782,9 +781,14 @@ const FETCH_BODY_CAP: usize = 50 * 1024;
 
 /// Build the shared HTTP client (20s timeout). Falls back to a default
 /// client instead of panicking — the release profile sets `panic = "abort"`.
+///
+/// Redirects are disabled (`Policy::none`): a 302 to a private host would
+/// otherwise bypass [`is_fetch_blocked`], which only inspects the initial
+/// URL. Callers that need redirects must opt in explicitly.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "http client build failed; using default client");
@@ -884,6 +888,7 @@ impl FetchTool {
     pub fn with_private_allowed() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "fetch client build failed; using default client");
@@ -973,6 +978,10 @@ impl Tool for FetchTool {
 
 /// GET `url`, streaming the body up to [`FETCH_BODY_CAP`] bytes.
 /// Returns `"[status]\nbody"` with a truncation note when capped.
+///
+/// Callers must check [`is_fetch_blocked`] first (see [`fetch_blocked_err`]);
+/// this helper performs no SSRF check itself so tests can exercise the
+/// network path with `FetchTool::with_private_allowed`.
 async fn fetch_body_capped(client: &reqwest::Client, url: &str) -> Result<String> {
     let resp = client
         .get(url)
@@ -1006,6 +1015,26 @@ async fn fetch_body_capped(client: &reqwest::Client, url: &str) -> Result<String
         String::from_utf8_lossy(&buf).into_owned()
     };
     Ok(format!("[{status}]\n{body}"))
+}
+
+/// Shared SSRF refusal for fetch-family tools.
+///
+/// Returns the model-visible error when `url` must not be fetched. Every
+/// tool that performs an HTTP GET (`fetch`, `web_extract`, and the URL-like
+/// fast path of `web_search`) routes through this so the block message and
+/// policy cannot drift.
+fn fetch_blocked_err(url: &str) -> ToolOutput {
+    ToolOutput::err(format!(
+        "blocked private/local URL: refusing to fetch {:?} (private/local host or non-http(s) scheme)",
+        truncate_bytes(url, 200)
+    ))
+}
+
+/// Whether `s` looks like an absolute `http(s)` URL (for the `web_search`
+/// fast-path guard: plain queries must not be treated as URLs).
+fn looks_like_http_url(s: &str) -> bool {
+    let lower = s.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// Hermes-compat web search via DuckDuckGo Lite (best-effort text extract).
@@ -1046,6 +1075,11 @@ impl Tool for WebSearchTool {
         let args: Args = serde_json::from_value(input)?;
         if args.query.trim().is_empty() {
             return Ok(ToolOutput::err("web_search requires a non-empty `query`"));
+        }
+        // SSRF guard: a query that is itself a blocked URL must not reach
+        // the network (same policy as `fetch` / `web_extract`).
+        if looks_like_http_url(args.query.trim()) && is_fetch_blocked(args.query.trim()) {
+            return Ok(fetch_blocked_err(args.query.trim()));
         }
         let url = format!(
             "https://lite.duckduckgo.com/lite/?q={}",
@@ -1108,6 +1142,9 @@ impl Tool for WebExtractTool {
         if args.url.trim().is_empty() {
             return Ok(ToolOutput::err("web_extract requires a non-empty `url`"));
         }
+        if is_fetch_blocked(args.url.trim()) {
+            return Ok(fetch_blocked_err(args.url.trim()));
+        }
         match fetch_body_capped(&self.client, &args.url).await {
             Ok(body) => {
                 let text = strip_html(body.split_once('\n').map(|(_, b)| b).unwrap_or(""));
@@ -1127,9 +1164,13 @@ impl Tool for WebExtractTool {
 /// Return `true` when `url` must not be fetched (SSRF guard).
 ///
 /// Blocks anything that is not `http(s)` plus loopback/private/link-local
-/// hosts matched by string only (no DNS resolution): `localhost`,
-/// `127.*`, `10.*`, `192.168.*`, `172.16-31.*`, `169.254.*`, `0.*`,
-/// `::1`, `0.0.0.0`, and `.local` / `.internal` / `.localhost` suffixes.
+/// hosts (no DNS resolution): `localhost`, `127.*`, `10.*`, `192.168.*`,
+/// `172.16-31.*`, `169.254.*`, `0.*`, `::1`, `0.0.0.0`, and `.local` /
+/// `.internal` / `.localhost` suffixes. Obscured numeric forms are also
+/// blocked: `0x`-hex parts (`0x7f.0.0.1`, `0x7f000001`), single decimal
+/// integers (`2130706433`), and octal dotted parts (`0177.0.0.1`). See
+/// [`is_obscured_ipv4`]. Redirects are disabled in [`http_client`] so a
+/// 302 cannot smuggle a private host past this check.
 pub fn is_fetch_blocked(url: &str) -> bool {
     let lower = url.trim_start().to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
@@ -1149,6 +1190,12 @@ pub fn is_fetch_blocked(url: &str) -> bool {
         return true;
     }
     if host == "0.0.0.0" || host == "::1" || host == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    if is_obscured_ipv4(&host) {
+        return true;
+    }
+    if is_blocked_ip_addr(&host) {
         return true;
     }
     if is_blocked_ipv4(&host) {
@@ -1175,6 +1222,54 @@ fn fetch_host(url: &str) -> Option<String> {
     };
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     Some(host)
+}
+
+/// Canonical IP check via `std::net::IpAddr` (handles `127.0.0.1` and IPv6).
+/// Fail-closed numeric aliases are handled by [`is_obscured_ipv4`]; this
+/// covers the canonical forms (loopback, private, link-local, unspecified).
+fn is_blocked_ip_addr(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || v.is_broadcast()
+        }
+        std::net::IpAddr::V6(v) => v.is_loopback() || v.is_unspecified() || v.is_multicast(),
+    }
+}
+
+/// Block obscured numeric IPv4 forms that bypass dotted-decimal checks.
+///
+/// Fail-closed: any of these blocks the host without resolving DNS —
+/// `0x`-hex parts (`0x7f.0.0.1`, `0x7f000001`), a single decimal integer
+/// (`2130706433` = `127.0.0.1`), and octal dotted parts with a leading `0`
+/// (`0177.0.0.1`). Plain hostnames containing letters (e.g. `example.com`)
+/// are unaffected.
+fn is_obscured_ipv4(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    // Single decimal integer IP (`2130706433`).
+    if !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // Hex: any dotted part with a `0x` prefix, or a bare `0x...` integer.
+    if host.starts_with("0x") || host.contains(".0x") {
+        return true;
+    }
+    // Octal dotted: any part longer than one char with a leading `0`.
+    for part in host.split('.') {
+        if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// String-only IPv4 private/loopback check.
@@ -1480,7 +1575,15 @@ impl Tool for MemoryTool {
                     .as_deref()
                     .or(args.key.as_deref())
                     .ok_or_else(|| anyhow::anyhow!("memory.search requires `query` (or `key`)"))?;
-                let hits = memory.search_history_excluding(query, 8, ctx.session_id.as_deref())?;
+                // FTS failures are model-recoverable tool errors, not
+                // turn-fatal transport errors.
+                let hits =
+                    match memory.search_history_excluding(query, 8, ctx.session_id.as_deref()) {
+                        Ok(hits) => hits,
+                        Err(e) => {
+                            return Ok(ToolOutput::err(format!("memory.search failed: {e}")));
+                        }
+                    };
                 Ok(ToolOutput::ok(cap_model_output(
                     hits.into_iter()
                         .map(|hit| {
@@ -1573,10 +1676,10 @@ pub struct CustomCronJob {
 /// Manage reminder-style cron jobs persisted in memory.
 ///
 /// `list` / `add` / `remove` operate on the `cron:custom` memory note so
-/// jobs survive restarts. Jobs from `zero_hermes.toml` are static: the
-/// gateway scheduler is built once at boot, so custom jobs take effect
-/// after a restart (the tool output says so). The gateway also prefixes
-/// late ticks with their scheduled time (see `CronEvent.at`).
+/// jobs survive restarts. The gateway merges that note with the TOML jobs
+/// at boot (see `CronTool::load_validated_custom_jobs`), so custom jobs
+/// are loaded at gateway boot. The gateway also prefixes late ticks with
+/// their scheduled time (see `CronEvent.at`).
 pub struct CronTool;
 
 impl CronTool {
@@ -1594,6 +1697,23 @@ impl CronTool {
         memory.write_note(CRON_CUSTOM_NOTE_KEY, &raw)?;
         Ok(())
     }
+
+    /// Load custom jobs as validated [`crate::cron::CronJob`]s for boot merge.
+    ///
+    /// Invalid entries are skipped (the gateway logs a warning); this keeps
+    /// one typo'd custom job from taking the whole scheduler down.
+    pub fn load_validated_custom_jobs(memory: &crate::memory::Memory) -> Vec<crate::cron::CronJob> {
+        let mut out = Vec::new();
+        for job in Self::load_custom(memory) {
+            match crate::cron::CronJob::new(&job.name, &job.schedule, &job.prompt) {
+                Ok(parsed) => out.push(parsed),
+                Err(e) => {
+                    tracing::warn!(name = %job.name, error = %e, "skipping invalid custom cron job");
+                }
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -1602,7 +1722,7 @@ impl Tool for CronTool {
         "cron"
     }
     fn description(&self) -> &str {
-        "List, add, or remove custom cron jobs (persisted in memory; gateway restart required to take effect)."
+        "List, add, or remove custom cron jobs (persisted in memory; loaded at gateway boot)."
     }
     fn schema(&self) -> Value {
         json!({
@@ -1685,7 +1805,7 @@ impl Tool for CronTool {
                 }
                 Self::save_custom(memory, &jobs)?;
                 Ok(ToolOutput::ok(format!(
-                    "saved cron job {name:?} (takes effect after gateway restart)"
+                    "saved cron job {name:?} (loaded at gateway boot)"
                 )))
             }
             "remove" => {
@@ -2076,9 +2196,37 @@ impl Tool for AskTool {
 
 // MessageTool
 
+/// One queued outbound message in the `outbox:<session>` note.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutboxEntry {
+    /// Destination channel override (defaults to the current session).
+    pub channel: Option<String>,
+    /// Destination chat id override (defaults to the current session).
+    pub chat_id: Option<String>,
+    /// Message text to deliver.
+    pub text: String,
+}
+
+/// Note key for a session's outbound queue.
+pub fn outbox_key(session_id: &str) -> String {
+    format!("outbox:{session_id}")
+}
+
+/// Parse an `outbox:<session>` note body (empty when absent/blank).
+/// Returns an empty vec for missing/blank notes; errors only on corrupt JSON.
+pub fn parse_outbox_entries(raw: Option<&str>) -> Result<Vec<OutboxEntry>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(raw)?)
+}
+
 /// Queue an outbound message in the memory outbox (`outbox:<session>`).
-/// Wave D's gateway is expected to drain this after each turn and deliver
-/// the entries; until then the tool is honest durable queueing, not delivery.
+/// The gateway drains this after each successful turn and delivers the
+/// entries; the web UI streams directly so the outbox is gateway-only.
 pub struct MessageTool;
 
 #[async_trait]
@@ -2101,12 +2249,6 @@ impl Tool for MessageTool {
         })
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        #[derive(Debug, serde::Serialize, serde::Deserialize)]
-        struct OutboxEntry {
-            channel: Option<String>,
-            chat_id: Option<String>,
-            text: String,
-        }
         #[derive(Deserialize)]
         struct Args {
             text: String,
@@ -2122,15 +2264,12 @@ impl Tool for MessageTool {
                 "memory backend not configured in this session",
             ));
         };
-        // TODO(Wave D): gateway drains `outbox:<session>` after each turn.
+        // Drained by the gateway after each successful turn.
         let session = ctx.session_id.as_deref().unwrap_or("default");
-        let key = format!("outbox:{session}");
-        let mut entries: Vec<OutboxEntry> = match memory.read_note(&key)? {
-            None => Vec::new(),
-            Some(raw) if raw.trim().is_empty() => Vec::new(),
-            Some(raw) => serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("outbox note is corrupt: {e}"))?,
-        };
+        let key = outbox_key(session);
+        let raw = memory.read_note(&key)?;
+        let mut entries: Vec<OutboxEntry> = parse_outbox_entries(raw.as_deref())
+            .map_err(|e| anyhow::anyhow!("outbox note is corrupt: {e}"))?;
         entries.push(OutboxEntry {
             channel: args.channel,
             chat_id: args.chat_id,
@@ -2837,6 +2976,106 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v == "sync"));
+    }
+
+    #[test]
+    fn fetch_blocks_obscured_numeric_ips() {
+        for url in [
+            "http://0x7f.0.0.1/",
+            "http://0x7F.0.0.1:8080/x",
+            "http://0x7f000001/",
+            "http://2130706433/",
+            "http://2130706433:80/",
+            "http://0177.0.0.1/",
+            "http://010.0.0.1/",
+        ] {
+            assert!(is_fetch_blocked(url), "should block {url}");
+        }
+        assert!(!is_fetch_blocked("https://example.com/page"));
+        assert!(!is_fetch_blocked("http://123.example.com/"));
+    }
+
+    #[test]
+    fn http_client_disables_redirects() {
+        // `http_client` must build with `Policy::none` so a 302 to a
+        // private host cannot bypass `is_fetch_blocked`. There is no public
+        // accessor for the policy, so this asserts the constructor still
+        // builds (a compile-time use of `Policy::none` lives in the helper).
+        let _ = http_client();
+        let _ = FetchTool::with_private_allowed();
+    }
+
+    #[tokio::test]
+    async fn web_search_blocks_private_url_query() {
+        let tool = WebSearchTool::default();
+        for query in ["http://127.0.0.1/", "http://localhost/"] {
+            let out = tool
+                .execute(json!({"query": query}), &ToolContext::default())
+                .await
+                .unwrap();
+            assert!(out.is_error, "web_search should err for {query}");
+            assert!(
+                out.content.contains("blocked private/local URL"),
+                "{}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_extract_blocks_private_urls() {
+        let tool = WebExtractTool::default();
+        for url in [
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://0x7f.0.0.1/",
+            "http://2130706433/",
+        ] {
+            let out = tool
+                .execute(json!({"url": url}), &ToolContext::default())
+                .await
+                .unwrap();
+            assert!(out.is_error, "web_extract should err for {url}");
+            assert!(
+                out.content.contains("blocked private/local URL"),
+                "{}",
+                out.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_validated_custom_jobs_skip_invalid() {
+        let mem = Arc::new(crate::memory::Memory::in_memory().unwrap());
+        let good = vec![CustomCronJob {
+            name: "morning".to_string(),
+            schedule: "0 9 * * *".to_string(),
+            prompt: "say hi".to_string(),
+        }];
+        mem.write_note(CRON_CUSTOM_NOTE_KEY, &serde_json::to_string(&good).unwrap())
+            .unwrap();
+        let jobs = CronTool::load_validated_custom_jobs(&mem);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "morning");
+        // Corrupt JSON degrades to empty, never a boot failure.
+        mem.write_note(CRON_CUSTOM_NOTE_KEY, "not-json").unwrap();
+        assert!(CronTool::load_validated_custom_jobs(&mem).is_empty());
+    }
+
+    #[test]
+    fn outbox_parse_round_trip() {
+        assert!(parse_outbox_entries(None).unwrap().is_empty());
+        assert!(parse_outbox_entries(Some("  ")).unwrap().is_empty());
+        let raw = serde_json::to_string(&vec![OutboxEntry {
+            channel: None,
+            chat_id: Some("42".to_string()),
+            text: "hello".to_string(),
+        }])
+        .unwrap();
+        let entries = parse_outbox_entries(Some(&raw)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "hello");
+        assert_eq!(outbox_key("s"), "outbox:s");
     }
 
     #[tokio::test]

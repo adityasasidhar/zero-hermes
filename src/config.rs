@@ -183,6 +183,24 @@ pub struct McpConfig {
     pub servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
+impl McpConfig {
+    /// Whether any MCP servers are configured.
+    ///
+    /// Discovery is async (`mcp::build_mcp_tools`), so the sync tool
+    /// registry cannot wire them yet — see `bootstrap::build_tool_registry`.
+    /// This reports intent without advertising unwired tools.
+    pub fn is_configured(&self) -> bool {
+        !self.servers.is_empty()
+    }
+
+    /// Sorted configured server names (for prompt hints / diagnostics).
+    pub fn server_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.servers.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
 /// Telegram gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {

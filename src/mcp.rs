@@ -230,6 +230,16 @@ pub fn build_mcp_tools_from_list(
         .collect()
 }
 
+/// Sync hint of configured MCP servers (no discovery, no I/O).
+///
+/// Returns sorted server names (`cfg.mcp.server_names()`). The sync tool
+/// registry cannot perform async stdio discovery, so no `mcp_*` tools are
+/// advertised until `build_mcp_tools` is wired at startup; use this hint
+/// for prompt diagnostics instead of claiming tools that do not exist.
+pub fn mcp_tool_names(cfg: &McpConfig) -> Vec<String> {
+    cfg.server_names()
+}
+
 /// Discover tools on every configured server, skipping failures.
 ///
 /// One stdio spawn per server; a server that fails discovery is skipped
@@ -284,6 +294,10 @@ mod tests {
         assert_eq!(srv.command, "npx");
         assert_eq!(srv.args, vec!["-y", "srv"]);
         assert_eq!(mcp_tool_name("filesystem", "read"), "mcp_filesystem_read");
+        assert!(cfg.mcp.is_configured());
+        assert_eq!(mcp_tool_names(&cfg.mcp), vec!["filesystem".to_string()]);
+        assert!(!McpConfig::default().is_configured());
+        assert!(mcp_tool_names(&McpConfig::default()).is_empty());
     }
 
     #[tokio::test]

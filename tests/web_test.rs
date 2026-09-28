@@ -24,6 +24,7 @@ fn test_state() -> AppState {
     AppState {
         events: tx,
         histories: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        session_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         system: "you are zero-hermes".into(),
         provider: Arc::new(zero_hermes::agent::mock::MockProvider::text_only("hi")),
         tools: Arc::new(ToolRegistry::new()),
