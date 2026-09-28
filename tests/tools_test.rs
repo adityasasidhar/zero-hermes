@@ -81,7 +81,8 @@ async fn read_and_write_tools() {
         .execute(json!({"path": "out.txt", "max_bytes": 2}), &ctx)
         .await
         .unwrap();
-    assert_eq!(out.content, "ab");
+    assert!(out.content.starts_with("ab"));
+    assert!(out.content.contains("[truncated to 2 bytes"));
 }
 
 #[tokio::test]
