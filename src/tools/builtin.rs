@@ -263,6 +263,20 @@ fn run_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> std::i
     use std::sync::mpsc;
     use std::thread;
 
+    // Start the child in its own process group so a timeout can take the
+    // whole tree down, not just the shell.
+    //
+    // `/bin/sh -c "sleep 30"` *forks* rather than execs, so SIGKILLing the
+    // shell leaves the real work running as an orphan. The orphan inherits
+    // the stdout/stderr pipes, which keeps the reader threads below blocked
+    // until it exits on its own — so a command with `timeout: 1` used to
+    // return only after the full 30 seconds had elapsed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
@@ -344,6 +358,12 @@ fn run_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> std::i
 #[cfg(unix)]
 fn kill_process(pid: u32) {
     unsafe {
+        // Negative pid signals the entire process group. `run_with_timeout`
+        // starts the child with `process_group(0)`, so its pgid equals its
+        // pid and this reaches every descendant that has not detached.
+        libc::kill(-(pid as i32), libc::SIGKILL);
+        // Belt and braces for a child that is not a group leader: the group
+        // signal above is then a harmless no-op, so kill the pid as well.
         libc::kill(pid as i32, libc::SIGKILL);
     }
 }
@@ -1106,14 +1126,34 @@ impl Tool for WebSearchTool {
 }
 
 /// Hermes-compat readable-page fetch: like `fetch`, but de-HTML-ed.
+///
+/// Issues the same GET as [`FetchTool`] against the same model-supplied URL,
+/// so it carries the same guard and the same test seam.
 pub struct WebExtractTool {
     client: reqwest::Client,
+    /// See [`FetchTool::allow_private`].
+    allow_private: bool,
+}
+
+impl WebExtractTool {
+    /// Build an extract tool that permits private/loopback hosts.
+    ///
+    /// Used by tests that spin up a local HTTP server on 127.0.0.1. Without
+    /// it there is no way to exercise the HTML-to-text path at all, because
+    /// every local server is blocked.
+    pub fn with_private_allowed() -> Self {
+        Self {
+            client: http_client(),
+            allow_private: true,
+        }
+    }
 }
 
 impl Default for WebExtractTool {
     fn default() -> Self {
         Self {
             client: http_client(),
+            allow_private: false,
         }
     }
 }
@@ -1142,7 +1182,7 @@ impl Tool for WebExtractTool {
         if args.url.trim().is_empty() {
             return Ok(ToolOutput::err("web_extract requires a non-empty `url`"));
         }
-        if is_fetch_blocked(args.url.trim()) {
+        if !self.allow_private && is_fetch_blocked(args.url.trim()) {
             return Ok(fetch_blocked_err(args.url.trim()));
         }
         match fetch_body_capped(&self.client, &args.url).await {
@@ -1201,7 +1241,41 @@ pub fn is_fetch_blocked(url: &str) -> bool {
     if is_blocked_ipv4(&host) {
         return true;
     }
+    // IPv4-mapped/translated IPv6 (`[::ffff:127.0.0.1]`, `[::ffff:7f00:1]`)
+    // connects to the embedded IPv4 address, but `Ipv6Addr::is_loopback()` is
+    // false for it and it is not an "obscured" dotted quad — so without its
+    // own check the guard is defeated by spelling alone.
+    if is_blocked_mapped_ipv4(&host) {
+        return true;
+    }
     false
+}
+
+/// Is `host` an IPv4-mapped/translated IPv6 literal wrapping a blocked IPv4
+/// address? Handles the dotted (`::ffff:127.0.0.1`), hex-group
+/// (`::ffff:7f00:1`) and fully expanded (`0:0:0:0:0:ffff:127.0.0.1`) forms.
+fn is_blocked_mapped_ipv4(host: &str) -> bool {
+    if !host.contains(':') {
+        return false;
+    }
+    // `rfind` matches both the short `::ffff:` and the expanded form.
+    let Some(idx) = host.rfind("ffff:") else {
+        return false;
+    };
+    let rest = &host[idx + "ffff:".len()..];
+    if rest.contains('.') {
+        return is_obscured_ipv4(rest) || is_blocked_ip_addr(rest);
+    }
+    let Some((hi, lo)) = rest.split_once(':') else {
+        return false;
+    };
+    match (u16::from_str_radix(hi, 16), u16::from_str_radix(lo, 16)) {
+        (Ok(hi), Ok(lo)) => {
+            let v4 = std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+            is_blocked_ip_addr(&v4.to_string())
+        }
+        _ => false,
+    }
 }
 
 /// Extract the lowercase host from an `http(s)` URL without new deps.
@@ -2896,7 +2970,7 @@ mod tests {
         ] {
             assert!(is_fetch_blocked(url), "should block {url}");
         }
-        assert!(is_fetch_blocked("http://172.32.0.1/") == false);
+        assert!(!is_fetch_blocked("http://172.32.0.1/"));
         assert!(!is_fetch_blocked("https://example.com/page"));
         assert!(!is_fetch_blocked("http://example.com:8080/a?b=c"));
     }

@@ -183,7 +183,12 @@ async fn main() -> Result<()> {
         .config
         .clone()
         .or_else(|| std::env::var("ZERO_HERMES_CONFIG").ok().map(PathBuf::from))
-        .or_else(zero_hermes::config::config_file)
+        // `config_file()` returns a path whether or not it exists, so it has
+        // to be filtered on existence. Without the filter the documented
+        // `./zero_hermes.toml` fallback was unreachable on any machine with a
+        // home directory: the missing `~/.config/.../zero_hermes.toml` won,
+        // and `config::load` quietly used defaults instead of stepping down.
+        .or_else(|| zero_hermes::config::config_file().filter(|p| p.exists()))
         .unwrap_or_else(|| PathBuf::from("zero_hermes.toml"));
     let cfg = zero_hermes::config::load(&cfg_path).context("loading config")?;
 

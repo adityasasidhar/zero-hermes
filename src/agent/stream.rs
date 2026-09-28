@@ -72,7 +72,7 @@ pub fn one_shot_stream<'a, P: LlmProvider + ?Sized>(
 pub fn parse_anthropic_sse(response: reqwest::Response) -> EventStream {
     Box::pin(AnthropicSse {
         inner: Box::pin(response.bytes_stream()),
-        buffer: String::new(),
+        buffer: Vec::new(),
         text: String::new(),
         tool_calls: Vec::new(),
         // 0 = no current block, 1 = text block, 2 = tool_use block
@@ -87,7 +87,15 @@ pub fn parse_anthropic_sse(response: reqwest::Response) -> EventStream {
 
 struct AnthropicSse {
     inner: ByteStream,
-    buffer: String,
+    /// Raw bytes of the current, not-yet-newline-terminated line.
+    ///
+    /// Deliberately `Vec<u8>` and not `String`: a network read can end in
+    /// the middle of a multi-byte UTF-8 sequence, and decoding per-chunk
+    /// with `from_utf8_lossy` would turn the halves into U+FFFD instead of
+    /// joining them. Since `0x0A` can never occur inside a multi-byte
+    /// sequence, splitting on the raw byte and decoding whole *lines* is
+    /// both safe and lossless.
+    buffer: Vec<u8>,
     text: String,
     tool_calls: Vec<ToolCall>,
     in_block: u8,
@@ -227,18 +235,27 @@ impl Stream for AnthropicSse {
             if let Some(ev) = self.pending.pop_front() {
                 return Poll::Ready(Some(Ok(ev)));
             }
+            // The protocol end marker is authoritative. Once it has been
+            // seen the stream is over, whether or not the peer closes the
+            // body — a keep-alive connection that never sends EOF used to
+            // leave the consumer waiting forever.
+            if self.finished {
+                return Poll::Ready(None);
+            }
 
             // Try to drain any complete lines already in the buffer.
-            if let Some(idx) = self.buffer.find('\n') {
+            if let Some(idx) = self.buffer.iter().position(|b| *b == b'\n') {
                 // Vec::split_off takes ownership of the tail [at, len) and
                 // leaves [0, at) in self.buffer with no allocation. We then
                 // swap so self.buffer holds the remainder and `line_buf`
                 // holds the line (still ending in '\n', which we pop).
-                let line_buf = self.buffer.split_off(idx + 1);
-                let mut line_buf = line_buf;
+                let mut line_buf = self.buffer.split_off(idx + 1);
                 std::mem::swap(&mut self.buffer, &mut line_buf);
                 line_buf.pop(); // drop the trailing '\n'
-                let line = line_buf.trim_end_matches('\r');
+                                // A complete line is a complete UTF-8 unit, so decoding here
+                                // (rather than per chunk) cannot split a codepoint.
+                let line = String::from_utf8_lossy(&line_buf);
+                let line = line.trim_end_matches('\r');
                 if line.is_empty() {
                     continue;
                 }
@@ -249,10 +266,8 @@ impl Stream for AnthropicSse {
             // Need more bytes from the underlying byte stream.
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    // String::from_utf8_lossy is zero-copy when the bytes are
-                    // valid UTF-8 (the normal case); the only allocation is
-                    // when copying into self.buffer below.
-                    self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    // Buffer raw bytes; decoding waits for a full line.
+                    self.buffer.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("SSE read error: {e}"))));
@@ -279,7 +294,7 @@ impl Stream for AnthropicSse {
 pub fn parse_openai_sse(response: reqwest::Response) -> EventStream {
     Box::pin(OpenAiSse {
         inner: Box::pin(response.bytes_stream()),
-        buffer: String::new(),
+        buffer: Vec::new(),
         text: String::new(),
         tool_calls: Vec::new(),
         // Per-index tool call accumulators keyed by `index` field.
@@ -302,7 +317,9 @@ struct OpenAiToolBuilder {
 
 struct OpenAiSse {
     inner: ByteStream,
-    buffer: String,
+    /// Raw bytes of the current, not-yet-newline-terminated line; see
+    /// [`AnthropicSse::buffer`] for why this is not a `String`.
+    buffer: Vec<u8>,
     text: String,
     tool_calls: Vec<ToolCall>,
     builders: std::collections::HashMap<usize, OpenAiToolBuilder>,
@@ -452,12 +469,19 @@ impl Stream for OpenAiSse {
             if let Some(ev) = self.pending.pop_front() {
                 return Poll::Ready(Some(Ok(ev)));
             }
-            if let Some(idx) = self.buffer.find('\n') {
-                let line_buf = self.buffer.split_off(idx + 1);
-                let mut line_buf = line_buf;
+            // See AnthropicSse::poll_next: `[DONE]` ends the stream even if
+            // the peer leaves the body open.
+            if self.finished {
+                return Poll::Ready(None);
+            }
+            if let Some(idx) = self.buffer.iter().position(|b| *b == b'\n') {
+                let mut line_buf = self.buffer.split_off(idx + 1);
                 std::mem::swap(&mut self.buffer, &mut line_buf);
                 line_buf.pop();
-                let line = line_buf.trim_end_matches('\r');
+                // Decode a whole line at a time so a codepoint split across
+                // two chunks survives.
+                let line = String::from_utf8_lossy(&line_buf);
+                let line = line.trim_end_matches('\r');
                 if line.is_empty() {
                     continue;
                 }
@@ -466,7 +490,7 @@ impl Stream for OpenAiSse {
             }
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    self.buffer.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("SSE read error: {e}"))));
@@ -488,11 +512,83 @@ impl Stream for OpenAiSse {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::time::Duration;
 
     fn chunk(data: &[u8]) -> std::result::Result<bytes::Bytes, reqwest::Error> {
         Ok(bytes::Bytes::copy_from_slice(data))
     }
 
+    /// Build the private parser state around an arbitrary byte stream.
+    fn anthropic_with(inner: ByteStream) -> AnthropicSse {
+        AnthropicSse {
+            inner,
+            buffer: Vec::new(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+            in_block: 0,
+            cur_tool_id: String::new(),
+            cur_tool_name: String::new(),
+            cur_tool_input: String::new(),
+            pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    fn openai_with(inner: ByteStream) -> OpenAiSse {
+        OpenAiSse {
+            inner,
+            buffer: Vec::new(),
+            text: String::new(),
+            tool_calls: Vec::new(),
+            builders: std::collections::HashMap::new(),
+            pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    /// A byte stream that yields `chunks` verbatim, then ends.
+    fn stream_of(chunks: Vec<Vec<u8>>) -> ByteStream {
+        Box::pin(futures::stream::iter(
+            chunks.into_iter().map(|c| chunk(&c)).collect::<Vec<_>>(),
+        ))
+    }
+
+    /// A byte stream that yields `chunks` and then stays open forever — what
+    /// a keep-alive HTTP body looks like when it never sends EOF.
+    fn stream_of_then_open(chunks: Vec<Vec<u8>>) -> ByteStream {
+        Box::pin(
+            futures::stream::iter(chunks.into_iter().map(|c| chunk(&c)).collect::<Vec<_>>())
+                .chain(futures::stream::pending()),
+        )
+    }
+
+    fn byte_stream_from_strings(events: Vec<String>) -> ByteStream {
+        stream_of(events.into_iter().map(String::into_bytes).collect())
+    }
+
+    /// Project events onto a comparable shape (`StreamEvent` has no `PartialEq`).
+    fn shape(events: &[StreamEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::TextDelta(t) => format!("text:{t}"),
+                StreamEvent::ToolUseBlock(tc) => {
+                    format!("tool:{}:{}:{}", tc.id, tc.name, tc.input)
+                }
+                StreamEvent::Done(c) => format!(
+                    "done:{}:{}",
+                    c.text.clone().unwrap_or_default(),
+                    c.tool_calls
+                        .iter()
+                        .map(|t| format!("{}={}", t.name, t.input))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            })
+            .collect()
+    }
+
+    /// Drain a stream on the current (single) thread. Used by the sync tests.
     fn sse_events<S: Stream<Item = Result<StreamEvent>> + Unpin>(mut s: S) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         futures::executor::block_on(async {
@@ -503,39 +599,333 @@ mod tests {
         out
     }
 
-    fn byte_stream_from_strings(events: Vec<String>) -> ByteStream {
-        Box::pin(futures::stream::iter(
-            events
-                .into_iter()
-                .map(|s| chunk(s.as_bytes()))
-                .collect::<Vec<_>>(),
-        ))
+    /// Drain a stream, failing loudly instead of hanging if it never ends.
+    async fn drain_with_deadline<S>(mut s: S) -> Vec<StreamEvent>
+    where
+        S: Stream<Item = Result<StreamEvent>> + Unpin,
+    {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), s.next()).await {
+                Ok(Some(ev)) => out.push(ev.expect("stream error")),
+                Ok(None) => return out,
+                Err(_) => panic!("stream never terminated; got {out:?}"),
+            }
+        }
+    }
+
+    // The reference payloads below deliberately contain non-ASCII text.
+    // Real model output is multilingual, and a multi-byte character landing
+    // on a chunk boundary is the single most likely way for the parser to
+    // corrupt an answer.
+    const ANTHROPIC_TEXT_FRAMES: [&str; 5] = [
+        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ünïcøde €100 🎉 ✓ nihongo 日本語\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ];
+
+    const ANTHROPIC_TOOL_FRAMES: [&str; 5] = [
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls 🎉\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ];
+
+    const OPENAI_TEXT_FRAMES: [&str; 4] = [
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Ünïcøde €100 🎉\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\" ✓ 日本語\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+
+    const OPENAI_TOOL_FRAMES: [&str; 4] = [
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls 🎉\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+
+    fn transcript(frames: &[&str]) -> Vec<u8> {
+        frames.concat().into_bytes()
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk-boundary handling
+    // -----------------------------------------------------------------------
+    //
+    // Every test in this section feeds the *same* bytes as the happy-path
+    // tests above, just cut into pieces at a different place. A parser that
+    // only works when a frame arrives in one piece is broken against any
+    // real network.
+
+    /// The exact regressions this guards: before the fix, both parsers
+    /// decoded each network chunk independently with
+    /// `String::from_utf8_lossy`, so a multi-byte character straddling a
+    /// chunk boundary became two U+FFFD replacement characters.
+    #[test]
+    fn anthropic_text_is_identical_under_every_two_way_byte_split() {
+        let bytes = transcript(&ANTHROPIC_TEXT_FRAMES);
+        let reference = shape(&sse_events(anthropic_with(stream_of(vec![bytes.clone()]))));
+        assert_eq!(
+            reference,
+            vec![
+                "text:Ünïcøde €100 🎉 ✓ nihongo 日本語".to_string(),
+                "done:Ünïcøde €100 🎉 ✓ nihongo 日本語:".to_string(),
+            ],
+            "the unsplit reference run should see the deltas verbatim"
+        );
+
+        for split in 1..bytes.len() {
+            let chunks = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+            let got = shape(&sse_events(anthropic_with(stream_of(chunks))));
+            assert_eq!(
+                got, reference,
+                "splitting the body at byte {split} changed the parsed stream"
+            );
+        }
     }
 
     #[test]
+    fn openai_text_is_identical_under_every_two_way_byte_split() {
+        let bytes = transcript(&OPENAI_TEXT_FRAMES);
+        let reference = shape(&sse_events(openai_with(stream_of(vec![bytes.clone()]))));
+        assert_eq!(
+            reference,
+            vec![
+                "text:Ünïcøde €100 🎉".to_string(),
+                "text: ✓ 日本語".to_string(),
+                "done:Ünïcøde €100 🎉 ✓ 日本語:".to_string(),
+            ]
+        );
+
+        for split in 1..bytes.len() {
+            let chunks = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+            let got = shape(&sse_events(openai_with(stream_of(chunks))));
+            assert_eq!(
+                got, reference,
+                "splitting the body at byte {split} changed the parsed stream"
+            );
+        }
+    }
+
+    /// The pathological case: one byte per read. Exercises a boundary at
+    /// every offset at once, including inside the JSON escapes and inside
+    /// four-byte codepoints.
+    #[test]
+    fn parsers_survive_byte_at_a_time_delivery() {
+        let bytes = transcript(&ANTHROPIC_TEXT_FRAMES);
+        let whole = shape(&sse_events(anthropic_with(stream_of(vec![bytes.clone()]))));
+        let bytewise = shape(&sse_events(anthropic_with(stream_of(
+            bytes.iter().map(|b| vec![*b]).collect(),
+        ))));
+        assert_eq!(bytewise, whole, "anthropic parser, 1 byte per chunk");
+
+        let bytes = transcript(&OPENAI_TEXT_FRAMES);
+        let whole = shape(&sse_events(openai_with(stream_of(vec![bytes.clone()]))));
+        let bytewise = shape(&sse_events(openai_with(stream_of(
+            bytes.iter().map(|b| vec![*b]).collect(),
+        ))));
+        assert_eq!(bytewise, whole, "openai parser, 1 byte per chunk");
+    }
+
+    #[test]
+    fn anthropic_tool_call_is_identical_under_every_two_way_byte_split() {
+        let bytes = transcript(&ANTHROPIC_TOOL_FRAMES);
+        let reference = shape(&sse_events(anthropic_with(stream_of(vec![bytes.clone()]))));
+        assert!(
+            reference[0].contains("ls 🎉"),
+            "reference run should carry the tool argument: {reference:?}"
+        );
+        for split in 1..bytes.len() {
+            let chunks = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+            let got = shape(&sse_events(anthropic_with(stream_of(chunks))));
+            assert_eq!(
+                got, reference,
+                "splitting the body at byte {split} changed the tool call"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_tool_call_is_identical_under_every_two_way_byte_split() {
+        let bytes = transcript(&OPENAI_TOOL_FRAMES);
+        let reference = shape(&sse_events(openai_with(stream_of(vec![bytes.clone()]))));
+        assert!(
+            reference[0].contains("ls 🎉"),
+            "reference run should carry the tool argument: {reference:?}"
+        );
+        for split in 1..bytes.len() {
+            let chunks = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+            let got = shape(&sse_events(openai_with(stream_of(chunks))));
+            assert_eq!(
+                got, reference,
+                "splitting the body at byte {split} changed the tool call"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Line framing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anthropic_accepts_crlf_line_endings() {
+        // SSE permits CRLF; a proxy or a Windows-based shim will use it.
+        let frames: Vec<String> = ANTHROPIC_TEXT_FRAMES
+            .iter()
+            .map(|f| f.replace('\n', "\r\n"))
+            .collect();
+        let events = sse_events(anthropic_with(byte_stream_from_strings(frames)));
+        assert_eq!(
+            shape(&events),
+            vec![
+                "text:Ünïcøde €100 🎉 ✓ nihongo 日本語".to_string(),
+                "done:Ünïcøde €100 🎉 ✓ nihongo 日本語:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_accepts_crlf_line_endings() {
+        let frames: Vec<String> = OPENAI_TEXT_FRAMES
+            .iter()
+            .map(|f| f.replace('\n', "\r\n"))
+            .collect();
+        let events = sse_events(openai_with(byte_stream_from_strings(frames)));
+        assert_eq!(
+            shape(&events),
+            vec![
+                "text:Ünïcøde €100 🎉".to_string(),
+                "text: ✓ 日本語".to_string(),
+                "done:Ünïcøde €100 🎉 ✓ 日本語:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_data_and_unparseable_lines_are_skipped() {
+        // Providers interleave `event:`/`id:`/`retry:` lines with keep-alive
+        // comments and the occasional malformed payload. None of it may fail
+        // the stream or leak into the user's answer.
+        let frames = vec![
+            ": keep-alive comment\n\n".to_string(),
+            "event: message_start\ndata: not-json-at-all\n\n".to_string(),
+            "id: 42\n".to_string(),
+            "data: {\"type\":\"ping\"}\n\n".to_string(),
+            ANTHROPIC_TEXT_FRAMES[2].to_string(),
+            "data: {\"unterminated\":\n\n".to_string(),
+            ANTHROPIC_TEXT_FRAMES[4].to_string(),
+        ];
+        let events = sse_events(anthropic_with(byte_stream_from_strings(frames)));
+        assert_eq!(
+            shape(&events),
+            vec![
+                "text:Ünïcøde €100 🎉 ✓ nihongo 日本語".to_string(),
+                "done:Ünïcøde €100 🎉 ✓ nihongo 日本語:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_skips_unparseable_lines() {
+        let frames = vec![
+            ": keep-alive\n\n".to_string(),
+            "data: {\"choices\":oops\n\n".to_string(),
+            OPENAI_TEXT_FRAMES[1].to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let events = sse_events(openai_with(byte_stream_from_strings(frames)));
+        assert_eq!(
+            shape(&events),
+            vec![
+                "text:Ünïcøde €100 🎉".to_string(),
+                "done:Ünïcøde €100 🎉:".to_string(),
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Termination
+    // -----------------------------------------------------------------------
+
+    /// A stream that is cut off before its end marker (dropped connection,
+    /// cancelled request) must still produce a `Done`, otherwise the agent
+    /// loop waits on a stream that will never yield a completion.
+    #[test]
+    fn truncated_streams_still_emit_done() {
+        // message_start + content_block_start + one delta, then the
+        // connection drops before message_stop.
+        let frames: Vec<String> = ANTHROPIC_TEXT_FRAMES[..3]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let events = sse_events(anthropic_with(byte_stream_from_strings(frames)));
+        match events.last() {
+            Some(StreamEvent::Done(c)) => {
+                assert_eq!(c.text.as_deref(), Some("Ünïcøde €100 🎉 ✓ nihongo 日本語"));
+            }
+            other => panic!("expected a trailing Done, got {other:?}"),
+        }
+
+        let frames: Vec<String> = OPENAI_TEXT_FRAMES[..3]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let events = sse_events(openai_with(byte_stream_from_strings(frames)));
+        match events.last() {
+            Some(StreamEvent::Done(c)) => {
+                assert_eq!(c.text.as_deref(), Some("Ünïcøde €100 🎉 ✓ 日本語"));
+            }
+            other => panic!("expected a trailing Done, got {other:?}"),
+        }
+    }
+
+    /// The end marker is authoritative: a peer that keeps the body open
+    /// after `message_stop` / `[DONE]` used to strand the consumer, because
+    /// the parser only finished when the underlying body reported EOF.
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_finishes_on_message_stop_even_if_the_body_stays_open() {
+        let s = anthropic_with(stream_of_then_open(vec![transcript(
+            &ANTHROPIC_TEXT_FRAMES,
+        )]));
+        let events = drain_with_deadline(s).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+        assert_eq!(shape(&events).len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_finishes_on_done_marker_even_if_the_body_stays_open() {
+        let s = openai_with(stream_of_then_open(vec![transcript(&OPENAI_TEXT_FRAMES)]));
+        let events = drain_with_deadline(s).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+        assert_eq!(shape(&events).len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_finishes_when_the_body_ends_without_any_end_marker() {
+        // Only the first three frames: no message_stop, then EOF.
+        let s = anthropic_with(stream_of(vec![transcript(&ANTHROPIC_TEXT_FRAMES[..3])]));
+        let events = drain_with_deadline(s).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy paths (kept from the original suite, now built via the helpers)
+    // -----------------------------------------------------------------------
+
+    #[test]
     fn anthropic_text_stream() {
-        let events: Vec<String> = vec![
+        let events = sse_events(anthropic_with(byte_stream_from_strings(vec![
             "event: message_start\ndata: {\"type\":\"message_start\"}\n\n".into(),
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".into(),
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n".into(),
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n".into(),
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".into(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into(),
-        ];
-        let mut s = AnthropicSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            in_block: 0,
-            cur_tool_id: String::new(),
-            cur_tool_name: String::new(),
-            cur_tool_input: String::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
-        // Expect 2 text deltas + 1 done.
+        ])));
         assert!(matches!(events[0], StreamEvent::TextDelta(ref s) if s == "hello "));
         assert!(matches!(events[1], StreamEvent::TextDelta(ref s) if s == "world"));
         match &events[2] {
@@ -549,27 +939,13 @@ mod tests {
 
     #[test]
     fn anthropic_tool_use_stream() {
-        let events: Vec<String> = vec![
+        let events = sse_events(anthropic_with(byte_stream_from_strings(vec![
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{}}}\n\n".into(),
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\n".into(),
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n".into(),
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".into(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into(),
-        ];
-        let mut s = AnthropicSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            in_block: 0,
-            cur_tool_id: String::new(),
-            cur_tool_name: String::new(),
-            cur_tool_input: String::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
-        // Expect one ToolUseBlock followed by Done.
+        ])));
         match &events[0] {
             StreamEvent::ToolUseBlock(tc) => {
                 assert_eq!(tc.id, "call_1");
@@ -587,25 +963,33 @@ mod tests {
         }
     }
 
+    /// A tool call whose partial JSON never becomes valid (truncated stream)
+    /// must still reach the model as *something*, rather than being dropped.
+    #[test]
+    fn anthropic_truncated_tool_json_falls_back_to_raw_string() {
+        let events = sse_events(anthropic_with(byte_stream_from_strings(vec![
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{}}}\n\n".into(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"ls\"}}\n\n".into(),
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".into(),
+        ])));
+        match &events[0] {
+            StreamEvent::ToolUseBlock(tc) => {
+                assert_eq!(tc.name, "bash");
+                assert_eq!(tc.input, serde_json::json!("{\"command\": \"ls"));
+            }
+            other => panic!("expected ToolUseBlock, got {other:?}"),
+        }
+    }
+
     #[test]
     fn openai_text_stream() {
-        let events: Vec<String> = vec![
+        let events = sse_events(openai_with(byte_stream_from_strings(vec![
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"
                 .into(),
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n".into(),
             "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n".into(),
             "data: [DONE]\n\n".into(),
-        ];
-        let mut s = OpenAiSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            builders: std::collections::HashMap::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
+        ])));
         assert!(matches!(events[0], StreamEvent::TextDelta(ref s) if s == "hello "));
         assert!(matches!(events[1], StreamEvent::TextDelta(ref s) if s == "world"));
         match &events[2] {
@@ -618,23 +1002,12 @@ mod tests {
     fn openai_tool_call_stream_with_finish_reason() {
         // The "real" OpenAI flow: tool-call deltas followed by a
         // finish_reason:"tool_calls" marker.
-        let events: Vec<String> = vec![
+        let events = sse_events(openai_with(byte_stream_from_strings(vec![
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n".into(),
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n".into(),
             "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n".into(),
             "data: [DONE]\n\n".into(),
-        ];
-        let mut s = OpenAiSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            builders: std::collections::HashMap::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
-        // ToolUseBlock should fire before Done.
+        ])));
         match &events[0] {
             StreamEvent::ToolUseBlock(tc) => {
                 assert_eq!(tc.name, "bash");
@@ -655,21 +1028,11 @@ mod tests {
     fn openai_tool_call_stream_flushes_on_done() {
         // Some servers don't emit finish_reason. The parser should still
         // surface tool calls at [DONE].
-        let events: Vec<String> = vec![
+        let events = sse_events(openai_with(byte_stream_from_strings(vec![
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n".into(),
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}\n\n".into(),
             "data: [DONE]\n\n".into(),
-        ];
-        let mut s = OpenAiSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            builders: std::collections::HashMap::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
+        ])));
         match events.last().unwrap() {
             StreamEvent::Done(c) => {
                 assert_eq!(c.tool_calls.len(), 1);
@@ -682,21 +1045,11 @@ mod tests {
     #[test]
     fn openai_multiple_tool_calls() {
         // Two tool calls flushed together when finish_reason arrives.
-        let events: Vec<String> = vec![
+        let events = sse_events(openai_with(byte_stream_from_strings(vec![
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n".into(),
             "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n".into(),
             "data: [DONE]\n\n".into(),
-        ];
-        let mut s = OpenAiSse {
-            inner: byte_stream_from_strings(events),
-            buffer: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            builders: std::collections::HashMap::new(),
-            pending: VecDeque::new(),
-            finished: false,
-        };
-        let events = sse_events(&mut s);
+        ])));
         let blocks: Vec<&ToolCall> = events
             .iter()
             .filter_map(|e| match e {

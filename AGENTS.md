@@ -18,7 +18,21 @@ cargo fmt --all -- --check     # formatting must be clean
 Integration tests live in `tests/` and exercise the library crate directly
 (`zero_hermes::agent`, `zero_hermes::tools::builtin`, `zero_hermes::web`,
 `zero_hermes::channels::telegram`, `zero_hermes::cron`, `zero_hermes::memory`,
-`zero_hermes::skills`).
+`zero_hermes::skills`). Four of them cover ground the library tests cannot
+reach:
+
+- `cli_test.rs` spawns the real binary in a throwaway `HOME` (via
+  `env_clear()` + `XDG_*`), so config discovery, the safety gates and the web
+  socket are exercised as a user would hit them. `src/main.rs` is otherwise
+  invisible to every other test.
+- `provider_http_test.rs` runs both providers against a local mock HTTP server
+  to cover URLs, auth headers, status/parse failures, read timeouts and the
+  streaming path end to end.
+- `agent_stream_test.rs` drives `run_stream` with a scripted event stream
+  (tool dispatch, think-block filtering, retry-before-output only).
+- `builtin_tools_test.rs` covers the tools' failure branches, the output caps
+  and the skills-root boundary (a model-supplied skill name must never write
+  outside the root).
 
 Bench (binary size / cold start / idle RSS): `./bench/measure.sh 30`.
 
@@ -103,6 +117,21 @@ to translate those into separate `role:"tool"` messages — handling only a
 literal `"tool"` role silently dropped every tool result. Any test
 covering that path must build history with `Message::tool_results`, not by
 hand-writing `role: "tool"`.
+
+**SSE parser gotchas.** Three things in `src/agent/stream.rs` are load-bearing,
+and each was a real bug once:
+
+- `buffer` is `Vec<u8>`, never `String`. A network read can end mid-codepoint,
+  so `String::from_utf8_lossy` per chunk turns every split multi-byte
+  character into U+FFFD. Splitting on the raw `\n` byte (which cannot occur
+  inside a multi-byte sequence) and decoding whole *lines* is lossless.
+- Once `finished` is set — `message_stop` for Anthropic, `[DONE]` for
+  OpenAI — the stream must return `None` even if the peer leaves the body
+  open. Otherwise a keep-alive connection strands the consumer forever.
+- `run_stream` must honour text delivered in a `Done` event with no preceding
+  deltas: that is exactly what the trait's default `one_shot_stream` produces
+  for a provider without real SSE support, and dropping it made every such
+  provider look like it returned an empty answer.
 
 `build_provider(&cfg.provider)` (`src/agent/provider.rs`) returns the
 right impl from the kind. `MockProvider` (`src/agent/mock.rs`) is only
@@ -218,6 +247,28 @@ parent registry, they automatically become available to sub-agents.
   declares (`src/main.rs`, `src/lib.rs`) plus `web/index.html`, and the
   build stage must `COPY web` — `src/web.rs` pulls the page in with
   `include_str!`.
+- **`bash`/`execute_code` timeouts must kill the process tree, not just the
+  shell.** `run_with_timeout` starts the child with `process_group(0)` and
+  `kill_process` signals the negative pid (the whole group). `/bin/sh -c "…"`
+  *forks* rather than execs, so SIGKILLing only the shell orphans the real
+  work; the orphan then inherits the stdout/stderr pipes, keeping the reader
+  threads blocked, so a `timeout: 1` call still took the full 30 seconds.
+- **Every tool that GETs a model-supplied URL needs the SSRF guard.**
+  `is_fetch_blocked` rejects non-`http(s)` schemes, loopback/private/
+  link-local hosts, `localhost`/`.local`/`.internal`, obscured numeric IPv4
+  spellings (`is_obscured_ipv4`: `2130706433`, `0x7f000001`, `0177.0.0.1`),
+  canonical addresses via `std::net` (`is_blocked_ip_addr`) and
+  IPv4-mapped/translated IPv6 (`is_blocked_mapped_ipv4`: `[::ffff:127.0.0.1]`,
+  `[::ffff:7f00:1]` — note `Ipv6Addr::is_loopback()` is *false* for these, so
+  `std::net` alone does not catch them). `FetchTool` and `WebExtractTool`
+  both call it and both expose `with_private_allowed()` for tests that need a
+  local server — without that seam the HTML path is untestable, since every
+  local server is blocked. Redirects are disabled outright
+  (`redirect::Policy::none()`), so a 302 to `169.254.169.254` cannot slip
+  past the initial-URL check. **What is still not covered:** no DNS
+  resolution happens, so a *name* that resolves to a private address gets
+  through — closing that needs resolving and re-checking the result, or
+  pinning the connection to the checked address.
 - Don't add heavy deps (no `axum`-style web stack beyond what's there,
   no `sqlx`, `bson`, `prost`). The brief is explicit about this.
 - `.hermes/environment.json` is for the Lemma recipe system; leave it

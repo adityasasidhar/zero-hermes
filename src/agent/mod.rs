@@ -455,6 +455,24 @@ where
                                 emitted_any = true;
                                 current_text.push_str(&visible);
                             }
+                            // A provider that relies on the trait's default
+                            // `stream()` — i.e. has no real Server-Sent-Events
+                            // support — delivers the whole answer inside
+                            // `Done` and emits no deltas at all. Overwriting
+                            // `completion.text` with `current_text` then
+                            // dropped it, so `chat` and the web UI showed an
+                            // empty reply for every such provider.
+                            if current_text.is_empty() {
+                                if let Some(text) = completion.text.clone() {
+                                    let mut visible = think_filter.push(&text);
+                                    visible.push_str(&think_filter.finish());
+                                    if !visible.is_empty() {
+                                        on_event(StreamTurn::TextDelta(visible.clone()));
+                                        emitted_any = true;
+                                        current_text.push_str(&visible);
+                                    }
+                                }
+                            }
                             completion.text =
                                 (!current_text.is_empty()).then(|| current_text.clone());
                             event = Some(StreamEvent::Done(completion));
