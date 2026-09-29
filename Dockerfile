@@ -6,18 +6,21 @@ FROM rust:1.85-slim AS builder
 WORKDIR /build
 
 # Cache deps first. The stub tree must cover every target declared in
-# Cargo.toml — there is a [lib] as well as a [[bin]] — and `web/index.html`
-# because `src/web.rs` pulls it in with include_str!.
+# Cargo.toml — there is a [lib] as well as a [[bin]] — plus `web/index.html`
+# and `assets/*.png`, which `src/web.rs` pulls in with include_str!/include_bytes!.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src web \
+RUN mkdir -p src web assets \
     && echo "fn main(){}" > src/main.rs \
     && : > src/lib.rs \
     && : > web/index.html \
+    && : > assets/hermes-mark.png \
+    && : > assets/hermes-favicon.png \
     && cargo build --release \
-    && rm -rf src web target/release/deps/zero_hermes* target/release/deps/libzero_hermes*
+    && rm -rf src web assets target/release/deps/zero_hermes* target/release/deps/libzero_hermes*
 
 COPY src ./src
 COPY web ./web
+COPY assets ./assets
 COPY skills ./skills
 RUN cargo build --release \
     && strip target/release/zero-hermes

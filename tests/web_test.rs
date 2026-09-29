@@ -17,6 +17,14 @@ use zero_hermes::memory::Memory;
 use zero_hermes::tools::ToolRegistry;
 use zero_hermes::web::{normalize_web_session, router, AppState, UiEvent};
 
+/// Read buffer for the whole-page assertions below. `index.html` is embedded
+/// into the binary as a single file, so "one page" is a fixed ~70 KB blob and
+/// this is only a guard against reading something absurd — it is not a budget
+/// the UI has to fit in. It used to be 64 KiB, which the page quietly outgrew:
+/// the tests then failed with `LengthLimitError` on every full-page read, long
+/// before the tokenizer turned the page into a "data" blob in `file(1)`.
+const PAGE_READ_LIMIT: usize = 256 * 1024;
+
 /// Build a minimal `AppState` for tests — no network calls, in-memory
 /// everything.
 fn test_state() -> AppState {
@@ -42,7 +50,9 @@ async fn index_html_serves() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body = to_bytes(response.into_body(), PAGE_READ_LIMIT)
+        .await
+        .unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("<textarea"), "missing textarea: {html}");
     assert!(
@@ -293,7 +303,9 @@ async fn index_embeds_the_live_csrf_token() {
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body = to_bytes(response.into_body(), PAGE_READ_LIMIT)
+        .await
+        .unwrap();
     let html = String::from_utf8_lossy(&body);
     assert!(
         html.contains("value=\"test-token\""),
@@ -302,6 +314,70 @@ async fn index_embeds_the_live_csrf_token() {
     assert!(
         !html.contains("{{CSRF_TOKEN}}"),
         "placeholder should be fully substituted"
+    );
+}
+
+#[tokio::test]
+async fn assets_route_serves_the_logo() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/hermes-mark.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(ct, "image/png");
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    // A real PNG: 8-byte signature, then IHDR.
+    assert_eq!(&body[1..4], b"PNG", "not a PNG: {body:?}");
+    assert!(body.len() > 100, "suspiciously small logo");
+}
+
+#[tokio::test]
+async fn assets_route_404s_an_unknown_file() {
+    // The asset set is a closed literal, so nothing resolves from disk.
+    let app = router(test_state());
+    for uri in [
+        "/assets/nope.png",
+        "/assets/../../../etc/passwd",
+        "/assets/hermes-mark.png.bak",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri} should 404");
+    }
+}
+
+#[tokio::test]
+async fn index_references_the_logo_asset() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), PAGE_READ_LIMIT)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("/assets/hermes-mark.png"),
+        "the page should use the Hermes mark"
+    );
+    assert!(
+        html.contains("/assets/hermes-favicon.png"),
+        "the page should declare a favicon"
     );
 }
 

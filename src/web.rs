@@ -8,6 +8,8 @@
 //! - `GET /events` is an SSE endpoint that subscribes to the broadcast and
 //!   streams events to the browser.
 //! - `GET /` serves the static `index.html`.
+//! - `GET /assets/…` serves the embedded Hermes mark — one static route per
+//!   entry in [`ASSETS`], not a catch-all.
 //!
 //! The UI is one HTML file — no framework, no bundler, no build step — but a
 //! complete console: it submits with `fetch` so a turn never navigates away,
@@ -25,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{
     sse::{Event, Sse},
     Html, IntoResponse, Redirect, Response,
@@ -142,12 +144,19 @@ pub async fn session_turn_lock(map: &SessionLocks, session_id: &str) -> Arc<Mute
 
 /// Build the axum router.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/", get(serve_index))
         .route("/events", get(sse_handler))
         .route("/send", post(send_handler))
-        .route("/health", get(health_handler))
-        .with_state(state)
+        .route("/health", get(health_handler));
+    // One static route per embedded image rather than a `/assets/{*path}`
+    // catch-all: the asset set is a closed literal, so an exact match is all
+    // that is ever needed, and a request for anything else falls through to
+    // axum's 404 without ever naming a file.
+    for (path, _) in ASSETS {
+        app = app.route(path, get(asset_handler));
+    }
+    app.with_state(state)
 }
 
 /// The page itself — vanilla DOM, no dependencies. See the `index.html`
@@ -157,8 +166,54 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 /// Placeholder in `web/index.html` replaced with the live CSRF token.
 const CSRF_PLACEHOLDER: &str = "{{CSRF_TOKEN}}";
 
+/// The Hermes mark, greyscaled and head-cropped to a square so it still reads
+/// as a face at favicon size. Embedded rather than read from disk: the binary
+/// has to stay self-contained, and this is how `index.html` already ships.
+const LOGO_MARK: &[u8] = include_bytes!("../assets/hermes-mark.png");
+const LOGO_FAVICON: &[u8] = include_bytes!("../assets/hermes-favicon.png");
+
+/// Every embedded image, keyed by the exact public path it is served at. The
+/// path doubles as the routing key, so listing an image here is all it takes
+/// to publish it.
+const ASSETS: &[(&str, &[u8])] = &[
+    ("/assets/hermes-mark.png", LOGO_MARK),
+    ("/assets/hermes-favicon.png", LOGO_FAVICON),
+];
+
 async fn serve_index(State(state): State<AppState>) -> Html<String> {
     Html(INDEX_HTML.replace(CSRF_PLACEHOLDER, &state.csrf_token))
+}
+
+/// Serve one of the embedded images. Each is registered under its own exact
+/// path, so the lookup is a scan of a two-entry literal and an unknown asset
+/// never reaches here.
+async fn asset_handler(uri: Uri) -> Response {
+    match ASSETS.iter().find(|(path, _)| *path == uri.path()) {
+        Some((_, bytes)) => png_response(bytes),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Wrap embedded image bytes in a response. The PNG signature is a cheap guard
+/// against wiring the wrong file to a path. Immutable per process, so a day
+/// of caching is safe and keeps repeat page loads off the wire.
+///
+/// `'static` because [`ASSETS`] holds `&'static [u8]`, so every byte served
+/// comes from the binary rather than a caller.
+fn png_response(bytes: &'static [u8]) -> Response {
+    const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(PNG_MAGIC) {
+        tracing::warn!("embedded asset is not a PNG; serving it as one would be a lie");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "corrupt asset").into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn health_handler() -> impl IntoResponse {
