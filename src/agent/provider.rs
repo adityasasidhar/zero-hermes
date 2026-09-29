@@ -217,6 +217,14 @@ impl AnthropicMessages {
     /// hits (see E23). We only *build* the body here, so parsing is
     /// unaffected.
     pub fn build_body(system: Option<&str>, messages: &[Message], tools: &[Value]) -> Value {
+        // SQLite-loaded history can carry orphaned tool blocks (results
+        // without their assistant `tool_use`); either wire format 400s on
+        // those, so filter them before rendering. See `sanitize_tool_pairing`.
+        let clean = crate::agent::tool::sanitize_tool_pairing(messages);
+        // The Messages API requires the conversation to start with a user
+        // turn; a stored transcript that opens mid-exchange (or whose head
+        // was just filtered away) must not go out as-is.
+        let messages: Vec<&Message> = clean.iter().skip_while(|m| m.role != "user").collect();
         let rendered: Vec<Value> = messages
             .iter()
             .map(|m| {
@@ -557,6 +565,38 @@ mod tests {
     }
 
     #[test]
+    fn build_body_drops_orphan_tool_result() {
+        // Regression test for a real bricked session: SQLite held a user
+        // message with only a `tool_result` whose assistant `tool_use` was
+        // gone, and every turn re-sent it until the provider 400s.
+        let history = vec![
+            Message::user("hey"),
+            Message::assistant_text("Hey!"),
+            Message::tool_results(vec![crate::agent::tool::ToolResult::ok(
+                "ghost-1",
+                "stale output",
+            )]),
+            Message::user("hey again"),
+        ];
+        let body = AnthropicMessages::build_body(None, &history, &[]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "orphan message must go: {msgs:?}");
+        assert_eq!(msgs[2]["content"][0]["text"], "hey again");
+    }
+
+    #[test]
+    fn build_body_skips_a_leading_non_user_head() {
+        let history = vec![
+            Message::assistant_text("mid-exchange leftover"),
+            Message::user("hey"),
+        ];
+        let body = AnthropicMessages::build_body(None, &history, &[]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[test]
     fn key_pool_splits_and_rotates() {
         let pool = split_key_pool("sk-a; sk-b ; ;sk-c");
         assert_eq!(pool, vec!["sk-a", "sk-b", "sk-c"]);
@@ -693,6 +733,11 @@ impl OpenAiCompat {
 
     /// Convert internal `Message`s + tool schemas to the OpenAI request shape.
     pub fn build_body(system: Option<&str>, messages: &[Message], tools: &[Value]) -> Value {
+        // Same orphan rule as the Anthropic builder: a `role:"tool"` reply
+        // with no matching assistant `tool_calls` is a 400 on strict
+        // validators. Filter before rendering; see `sanitize_tool_pairing`.
+        let clean = crate::agent::tool::sanitize_tool_pairing(messages);
+        let messages = &clean;
         let mut msgs: Vec<Value> = Vec::new();
 
         if let Some(sys) = system {
@@ -1116,28 +1161,71 @@ mod openai_tests {
         // A single assistant turn can request several tools; the loop packs
         // every result into one user message, and each needs its own
         // role:tool reply keyed by tool_call_id.
+        let assistant = Message::assistant(vec![
+            ContentBlock::ToolUse(ToolCall {
+                id: "call_a".into(),
+                name: "bash".into(),
+                input: json!({}),
+            }),
+            ContentBlock::ToolUse(ToolCall {
+                id: "call_b".into(),
+                name: "read".into(),
+                input: json!({}),
+            }),
+        ]);
         let m = Message::tool_results(vec![
             crate::agent::tool::ToolResult::ok("call_a", "out-a"),
             crate::agent::tool::ToolResult::err("call_b", "boom"),
         ]);
-        let body = OpenAiCompat::build_body(None, &[m], &[]);
+        let body = OpenAiCompat::build_body(None, &[assistant, m], &[]);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["tool_call_id"], "call_a");
-        assert_eq!(msgs[0]["content"], "out-a");
-        assert_eq!(msgs[1]["tool_call_id"], "call_b");
-        assert_eq!(msgs[1]["content"], "[is_error=true] boom");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["tool_call_id"], "call_a");
+        assert_eq!(msgs[1]["content"], "out-a");
+        assert_eq!(msgs[2]["tool_call_id"], "call_b");
+        assert_eq!(msgs[2]["content"], "[is_error=true] boom");
     }
 
     #[test]
     fn openai_body_marks_is_error_in_content() {
+        // Paired history (the shape `run` produces): the result is anchored
+        // by its assistant `tool_use`, so it survives sanitization.
+        let assistant = Message::assistant(vec![ContentBlock::ToolUse(ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        })]);
         let tool_result = Message::tool_results(vec![crate::agent::tool::ToolResult::err(
             "call_1",
             "command timed out",
         )]);
-        let body = OpenAiCompat::build_body(None, &[tool_result], &[]);
-        let content = body["messages"][0]["content"].as_str().unwrap();
+        let body = OpenAiCompat::build_body(None, &[assistant, tool_result], &[]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let content = msgs[1]["content"].as_str().unwrap();
         assert!(content.starts_with("[is_error=true]"));
+    }
+
+    #[test]
+    fn openai_body_drops_orphan_tool_result() {
+        // Same poison as the Anthropic regression test, translated: an
+        // unanchored `role:"tool"` message is a 400 on strict validators.
+        let history = vec![
+            Message::user("hey"),
+            Message::assistant_text("Hey!"),
+            Message::tool_results(vec![crate::agent::tool::ToolResult::ok(
+                "ghost-1",
+                "stale output",
+            )]),
+            Message::user("hey again"),
+        ];
+        let body = OpenAiCompat::build_body(None, &history, &[]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m["role"] == "tool"),
+            "no unanchored tool message may be emitted: {msgs:?}"
+        );
+        assert_eq!(msgs.last().unwrap()["content"], "hey again");
     }
 
     #[test]

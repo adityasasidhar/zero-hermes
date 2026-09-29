@@ -14,3 +14,5 @@ zero_hermes.toml
 .hermes/
 .remember/
 .worktrees/
+# Local dev shortcut (symlink to target/debug/zero-hermes; see README).
+/zero

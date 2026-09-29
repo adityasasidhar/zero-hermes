@@ -165,6 +165,16 @@ literal `"tool"` role silently dropped every tool result. Any test
 covering that path must build history with `Message::tool_results`, not by
 hand-writing `role: "tool"`.
 
+**Orphan tool blocks brick a session.** Both builders filter history
+through `tool::sanitize_tool_pairing` before rendering: a `tool_result`
+with no adjacent preceding `tool_use` (or vice versa) is a hard 400 on
+either wire format, and SQLite can hold such orphans from older turns. The
+filter is send-time only — the stored transcript is never rewritten — so a
+poisoned prefix fails the same way forever without it. Tests for this must
+use realistic paired history (assistant `tool_use` immediately followed by
+its `tool_results` user message); a bare `Message::tool_results` with no
+preceding use is now correctly dropped.
+
 **SSE parser gotchas.** Three things in `src/agent/stream.rs` are load-bearing,
 and each was a real bug once:
 
