@@ -1,12 +1,42 @@
 # AGENTS.md
 
-Guidance for OpenCode sessions working in `zero-hermes`. The repo is a small
-Rust crate (binary `zero-hermes` + library `zero_hermes`). Read this before
-touching anything beyond a one-line change.
+**zero-hermes** — a small, self-hosted Hermes-inspired agent that runs in one
+Rust binary on low-power hardware (target: Raspberry Pi). It bundles a
+tool-calling loop, SQLite memory, skills, cron, sub-agents, a Telegram
+gateway and a local axum web UI. Guidance for agents working in this repo;
+read it before touching anything beyond a one-line change.
+
+## Tech stack
+
+- Rust 2021, single cargo crate: binary `zero-hermes` (`src/main.rs`) +
+  library `zero_hermes` (`src/lib.rs`).
+- tokio (async runtime), reqwest + rustls (providers), axum + tokio-stream
+  (web UI / SSE), rusqlite `bundled` (memory), clap (CLI), cron, serde.
+- cargo is the only build/package manager — there is no Node or Python step.
+
+## Layout (top level)
+
+`src/` agent loop, providers, tools, channels, web; `tests/` integration
+tests; `skills/` vendored Hermes skill pack (loaded recursively); `web/`
+single-file UI embedded via `include_str!`; `assets/` logos; `bench/`
+size/cold-start/RSS script; `.github/workflows/` CI. Full map under
+[Architecture map](#architecture-map).
+
+## CI
+
+GitHub Actions — `.github/workflows/ci.yml`, on push to `main`/`master` and
+every pull request:
+
+```sh
+cargo build --release
+cargo test --release
+cargo clippy --release -- -D warnings   # warnings are fatal
+cargo fmt --all -- --check
+```
 
 ## Build / verify
 
-CI order (`.github/workflows/ci.yml`) — run in this order locally too:
+Run in the same order locally:
 
 ```sh
 cargo build --release          # produces target/release/zero-hermes
@@ -111,6 +141,23 @@ Both clients set `connect_timeout_secs` / `read_timeout_secs` from config.
 The read timeout is per-read, not a request deadline, so streaming still
 works while a wedged provider cannot stall the gateway forever.
 
+**Headers and `base_url` normalisation.** `[provider.headers]` is a
+`HashMap<String, String>` applied by `apply_headers` to every request, and
+expanded from the environment in `Config::expand_env`. It is parsed in
+`build_headers` at provider construction, not at request time: release builds
+set `panic = "abort"`, so a header name that dies inside reqwest's builder
+would take the daemon with it. `apply_headers` also sends
+`user-agent: zero-hermes/<CARGO_PKG_VERSION>` unless the config sets one,
+because gateways reject a bare SDK/HTTP-library user agent (OpenCode asks
+clients to name themselves and to send `x-opencode-session`, a stable
+per-conversation id; without it it answers `400 MissingSessionID`).
+
+`base_url` goes through `normalize_base_url`, which strips a trailing `/` *and*
+a trailing `/v1`. Both clients append `/v1/...` themselves, and the README's own
+Ollama example is `http://127.0.0.1:11434/v1`, so without the strip that config
+would request `/v1/v1/chat/completions`. A bare `base_url = "/v1"` is left
+alone so the mistake stays visible.
+
 **Wire-format gotcha.** `Message::tool_results` stores results in a
 *user*-role message (the Anthropic shape). `OpenAiCompat::build_body` has
 to translate those into separate `role:"tool"` messages — handling only a
@@ -149,6 +196,10 @@ src/
                        lives in the lib so integration tests can reach it
   util.rs              truncate_bytes, expand_tilde, chunk_text, random_hex,
                        load_dotenv, expand_env_vars
+  mcp.rs               MCP stdio client (JSON-RPC 2.0 initialize / tools/list /
+                       tools/call). McpTool wraps a remote tool as
+                       mcp_<server>_<tool>; discovery is async and NOT yet wired
+                       into the sync registry — see the TODO in bootstrap.rs
   agent/
     mod.rs             the loop: agent::run + agent::run_stream + dispatch_tool
                        + RunLimits (max_iterations + context_window)
@@ -160,8 +211,13 @@ src/
   tools/
     mod.rs             ToolRegistry (insert respects [agent].enabled_tools allowlist;
                        insert_always is unconditional)
-    builtin.rs         BashTool, ReadTool, WriteTool, FetchTool, MemoryTool,
-                       SkillTool (read/write SKILL.md), SubAgentTool
+    builtin.rs         ~20 Tool impls: bash, read/write/edit/search_files,
+                       fetch, web_search, web_extract, memory, cron, todo, ask,
+                       message, execute_command, execute_code, read_file,
+                       write_file, skill, skill_view, subagent. Hermes-compat
+                       aliases (execute_command/execute_code/read_file/
+                       write_file/search_files/skill_view/web_search/
+                       web_extract) are registered so vendored skills resolve
   memory.rs            rusqlite (bundled): durable session transcripts, notes,
                        and an FTS5 `message_search` index for cross-session
                        recall; `Memory::in_memory()` for tests
@@ -172,14 +228,21 @@ src/
   channels/
     mod.rs             Channel trait, InboundMessage, parse_command, strip_bot_mention
     telegram.rs        getUpdates long-poll + sendMessage
-  web.rs               axum router: /, /events (SSE), /send, /health;
-                       serves web/index.html (vanilla JS, EventSource).
+  web.rs               axum router: /, /events (SSE), /send, /health and one
+                       static route per entry in ASSETS; serves web/index.html
+                       (vanilla JS, EventSource).
                        /send requires the per-process CSRF token injected
                        into the page — a form POST needs no preflight, so
                        without it any site could drive the bash tool
 skills/                the vendored Hermes-compatible skill pack
                        (~130 SKILL.md files); loaded recursively
 web/index.html         single-file UI; embedded into the binary via include_str!
+assets/                zero_hermes_logo.png is the full-colour master (README
+                       hero only); hermes-mark.png (192px) and
+                       hermes-favicon.png (32px) are the greyscaled,
+                       head-cropped derivatives the UI serves via
+                       include_bytes! — brand mark, welcome mark, assistant
+                       avatar, working row, favicon, mobile topbar
 bench/measure.sh       binary size + cold-start + idle-RSS benchmark
 Dockerfile             multi-stage; sets ZERO_HERMES_CONFIG=/config/zero_hermes.toml,
                        ZERO_HERMES_SKILLS_DIR=/opt/zero-hermes/skills; volumes /config, /data
@@ -244,9 +307,25 @@ parent registry, they automatically become available to sub-agents.
   directory over changing the loader. The stub directories from v0.1
   (`stub-1`, `stub-2`) were removed once the real pack landed.
 - The Dockerfile's dep-cache stage must stub **every** target Cargo.toml
-  declares (`src/main.rs`, `src/lib.rs`) plus `web/index.html`, and the
-  build stage must `COPY web` — `src/web.rs` pulls the page in with
-  `include_str!`.
+  declares (`src/main.rs`, `src/lib.rs`) plus every file pulled in by
+  `include_str!`/`include_bytes!` — currently `web/index.html`,
+  `assets/hermes-mark.png` and `assets/hermes-favicon.png` — and the build
+  stage must `COPY web` and `COPY assets`. A missing stub fails the *dep*
+  build, not the real one, so it looks like a cache problem.
+- **The web UI is strictly achromatic** — black, white and greys only, in
+  both themes. Every token in `web/index.html`'s `:root` block must have
+  `r == g == b`; state (live / busy / error / in-flight) is carried by value
+  and *treatment* instead of hue, e.g. a filled status dot vs a hollow ring, a
+  2px solid border on an error vs a dashed one on a running badge. Re-deriving
+  a coloured accent breaks the whole point, so check a change by grepping for
+  `#hex`/`rgb(` outside the token block.
+- The Hermes mark is greyscaled and head-cropped, not tinted: it is a
+  greyscale PNG so one file serves both themes, and it is embedded
+  (`include_bytes!`) rather than read from disk so the binary stays
+  self-contained. Adding a UI image means adding it to `ASSETS` in
+  `src/web.rs` — the path there is the route, so no catch-all and no
+  traversal surface. Keep derivatives small: the release profile is
+  size-optimized and the binary budget is <15 MB.
 - **`bash`/`execute_code` timeouts must kill the process tree, not just the
   shell.** `run_with_timeout` starts the child with `process_group(0)` and
   `kill_process` signals the negative pid (the whole group). `/bin/sh -c "…"`
@@ -288,6 +367,8 @@ cargo build --release
 ./target/release/zero-hermes tools --mock            # honours [agent].enabled_tools
 ./target/release/zero-hermes web --bind 127.0.0.1:8088 &
 curl -fsS http://127.0.0.1:8088/health                 # should print "ok"
+curl -fsS -o /dev/null -w '%{http_code} %{content_type}\n' \
+  http://127.0.0.1:8088/assets/hermes-mark.png          # expect 200 image/png
 curl -fsS -X POST http://127.0.0.1:8088/send -d 'message=hi'   # expect 403 (no CSRF token)
 ```
 

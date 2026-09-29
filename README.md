@@ -190,6 +190,27 @@ Use `./target/release/zero-hermes show-config` to inspect the resolved config.
 `$VAR` and `${VAR}` references are expanded in provider credentials and
 endpoint settings; a local `.env` is loaded before configuration.
 
+### Request headers
+
+`[provider.headers]` adds headers to every request from either client. Values
+may reference environment variables, so a session id can stay in `.env`:
+
+```toml
+[provider.headers]
+"x-opencode-session" = "${OPENCODE_SESSION_ID}"
+```
+
+This exists because gateways that route, cache and bill per conversation
+reject a request that arrives without a session header — OpenCode Go and Zen
+answer `400 MissingSessionID` — and increasingly refuse a client that
+identifies as a generic SDK or HTTP library. zero-hermes therefore always
+sends `user-agent: zero-hermes/<version>`; a `user-agent` here replaces it.
+
+`base_url` may include the `/v1` suffix or not: each client appends
+`/v1/messages` or `/v1/chat/completions` itself, so a trailing `/v1` (as
+Ollama, NVIDIA NIM and OpenCode publish it) or a trailing slash is absorbed
+rather than doubled.
+
 ## Memory, learning, and skills
 
 zero-hermes has three complementary forms of memory:
