@@ -248,6 +248,7 @@ fn config(kind: ProviderKind, base_url: &str) -> ProviderConfig {
         max_tokens: 128,
         system: None,
         temperature: None,
+        headers: HashMap::new(),
         connect_timeout_secs: 5,
         read_timeout_secs: 5,
         // No fallbacks: these tests assert what a single configured endpoint
@@ -339,6 +340,67 @@ async fn anthropic_complete_tolerates_a_trailing_slash_in_the_base_url() {
     .await;
 
     let base = format!("{}/", server.url());
+    let provider = AnthropicMessages::new(&anthropic_cfg(&base)).unwrap();
+    provider.complete(None, &user("hi"), &[]).await.unwrap();
+    assert_eq!(server.last_request().path, "/v1/messages");
+}
+
+/// Endpoints publish their `base_url` with `/v1` already on it — Ollama, NVIDIA
+/// NIM, the opencode gateway, and the README's own OpenAI-compatible example
+/// (`http://127.0.0.1:11434/v1`). The client appends `/v1/chat/completions`
+/// itself, so the suffix has to be absorbed; otherwise every such config
+/// silently requests `/v1/v1/chat/completions` and 404s.
+#[tokio::test]
+async fn openai_complete_tolerates_a_base_url_that_already_ends_in_v1() {
+    let server = Server::start(vec![json_reply(
+        200,
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    )])
+    .await;
+
+    let base = format!("{}/v1/", server.url());
+    let provider = OpenAiCompat::new(&openai_cfg(&base)).unwrap();
+    provider.complete(None, &user("hi"), &[]).await.unwrap();
+    assert_eq!(server.last_request().path, "/v1/chat/completions");
+}
+
+/// Some gateways route, cache and bill per conversation and refuse a request
+/// that arrives without a session header: OpenCode Go answers
+/// `400 MissingSessionID` unless `x-opencode-session` is present, and asks
+/// clients to identify themselves rather than masquerade as the HTTP library.
+#[tokio::test]
+async fn openai_complete_sends_configured_headers_and_a_user_agent() {
+    let server = Server::start(vec![json_reply(
+        200,
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    )])
+    .await;
+
+    let mut cfg = openai_cfg(&server.url());
+    cfg.headers = HashMap::from([(
+        "x-opencode-session".to_string(),
+        "zero-hermes-test".to_string(),
+    )]);
+    let provider = OpenAiCompat::new(&cfg).unwrap();
+    provider.complete(None, &user("hi"), &[]).await.unwrap();
+
+    let req = server.last_request();
+    assert_eq!(req.header("x-opencode-session"), Some("zero-hermes-test"));
+    let ua = req.header("user-agent").expect("a user agent must be sent");
+    assert!(ua.starts_with("zero-hermes/"), "user agent was {ua:?}");
+}
+
+/// Same artifact on the Anthropic wire format: `https://api.anthropic.com/v1`
+/// must not become `/v1/v1/messages`.
+#[tokio::test]
+async fn anthropic_complete_tolerates_a_base_url_that_already_ends_in_v1() {
+    let server = Server::start(vec![json_reply(
+        200,
+        r#"{"content":[{"type":"text","text":"ok"}]}"#,
+    )])
+    .await;
+
+    let base = format!("{}/v1", server.url());
     let provider = AnthropicMessages::new(&anthropic_cfg(&base)).unwrap();
     provider.complete(None, &user("hi"), &[]).await.unwrap();
     assert_eq!(server.last_request().path, "/v1/messages");

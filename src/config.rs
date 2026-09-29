@@ -4,6 +4,7 @@
 //! When the file is absent we fall back to defaults so the binary still runs
 //! (matches the "minimal binary should always start" intent of the brief).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,18 @@ pub struct ProviderConfig {
     /// OpenAI-compat-only: optional `temperature` (0.0–2.0).
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Extra HTTP headers sent with every request to this provider.
+    ///
+    /// Values may reference environment variables (`${VAR}`), so a session id
+    /// can stay out of the file people copy around. A `user-agent` here
+    /// overrides the built-in `zero-hermes/<version>`.
+    ///
+    /// Some gateways route, cache and bill per conversation and reject
+    /// requests that arrive without a session header — OpenCode Go answers
+    /// `400 MissingSessionID` unless `x-opencode-session` is present, and asks
+    /// clients not to identify as a generic SDK or HTTP library.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Seconds to wait for the TCP+TLS connection to the provider.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
@@ -148,6 +161,7 @@ impl Default for ProviderConfig {
             max_tokens: default_max_tokens(),
             system: None,
             temperature: None,
+            headers: HashMap::new(),
             connect_timeout_secs: default_connect_timeout(),
             read_timeout_secs: default_read_timeout(),
             fallbacks: Vec::new(),
@@ -421,10 +435,16 @@ impl Config {
         self.provider.api_key = expand_env_vars(&self.provider.api_key);
         self.provider.base_url = expand_env_vars(&self.provider.base_url);
         self.provider.model = expand_env_vars(&self.provider.model);
+        for value in self.provider.headers.values_mut() {
+            *value = expand_env_vars(value);
+        }
         for fb in &mut self.provider.fallbacks {
             fb.api_key = expand_env_vars(&fb.api_key);
             fb.base_url = expand_env_vars(&fb.base_url);
             fb.model = expand_env_vars(&fb.model);
+            for value in fb.headers.values_mut() {
+                *value = expand_env_vars(value);
+            }
         }
         self.telegram.token = expand_env_vars(&self.telegram.token);
         if let Some(url) = &self.skills_hub_url {
@@ -576,6 +596,28 @@ prompt = "say pong"
         assert_eq!(cfg.provider.api_key, "sk-from-env");
         assert_eq!(cfg.provider.base_url, "https://example.test");
         assert_eq!(cfg.telegram.token, "123:abc");
+    }
+
+    #[test]
+    fn provider_header_values_are_expanded_from_the_environment() {
+        std::env::set_var("ZH_CFG_SESSION", "session-from-env");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("zero_hermes.toml");
+        std::fs::write(
+            &p,
+            "[provider]\napi_key = \"k\"\n\n[provider.headers]\n\"x-opencode-session\" = \"${ZH_CFG_SESSION}\"\n\"x-tenant\" = \"literal\"\n",
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert_eq!(
+            cfg.provider.headers.get("x-opencode-session"),
+            Some(&"session-from-env".to_string()),
+            "a session id can live in .env rather than the config file"
+        );
+        assert_eq!(
+            cfg.provider.headers.get("x-tenant"),
+            Some(&"literal".to_string())
+        );
     }
 
     #[test]

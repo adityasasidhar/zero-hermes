@@ -9,7 +9,9 @@
 use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
+use reqwest::header::{HeaderName, HeaderValue, USER_AGENT};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,6 +20,47 @@ use crate::agent::tool::{ContentBlock, Message, ToolCall};
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::error::Result;
 use crate::util::truncate_bytes;
+
+/// How zero-hermes identifies itself to a provider.
+///
+/// Some gateways reject a generic SDK or HTTP-library user agent and ask
+/// clients to name themselves (`my-coding-agent/1.0`); reqwest's default is
+/// exactly the library name they warn about.
+const DEFAULT_USER_AGENT: &str = concat!("zero-hermes/", env!("CARGO_PKG_VERSION"));
+
+/// Validate `[provider.headers]` once, at construction.
+///
+/// Config text must not reach reqwest's request builder unchecked: the release
+/// profile sets `panic = "abort"`, so an invalid header name or a value with a
+/// stray newline would take down the whole daemon rather than one turn.
+/// Failing here reports it as a startup error instead.
+fn build_headers(raw: &HashMap<String, String>) -> Result<Vec<(HeaderName, HeaderValue)>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (name, value) in raw {
+        let parsed = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| anyhow::anyhow!("[provider.headers] invalid header name {name:?}: {e}"))?;
+        let parsed_value = HeaderValue::from_str(value)
+            .map_err(|e| anyhow::anyhow!("[provider.headers] invalid value for {name}: {e}"))?;
+        out.push((parsed, parsed_value));
+    }
+    Ok(out)
+}
+
+/// Attach the configured headers to a request, plus a self-identifying
+/// `user-agent` unless the config sets one.
+fn apply_headers(
+    req: reqwest::RequestBuilder,
+    headers: &[(HeaderName, HeaderValue)],
+) -> reqwest::RequestBuilder {
+    let mut req = req;
+    for (name, value) in headers {
+        req = req.header(name.clone(), value.clone());
+    }
+    if !headers.iter().any(|(name, _)| *name == USER_AGENT) {
+        req = req.header(USER_AGENT, DEFAULT_USER_AGENT);
+    }
+    req
+}
 
 /// Build the shared HTTP client for a provider.
 ///
@@ -113,6 +156,27 @@ fn pick_key(pool: &[String], counter: &AtomicUsize) -> String {
     pool[i].clone()
 }
 
+/// Normalise a configured `base_url` before an endpoint path is appended.
+///
+/// Both clients append the versioned path themselves (`/v1/messages`,
+/// `/v1/chat/completions`), so two copy-paste artifacts in `base_url` must be
+/// absorbed rather than trusted: a trailing slash would give `//v1/...`, and a
+/// trailing `/v1` would give `/v1/v1/...`. This is the common case, not the
+/// exotic one — Ollama, NVIDIA NIM and the opencode gateway all publish their
+/// base URL with the `/v1` suffix already on it, and the README's own
+/// OpenAI-compatible example is `http://127.0.0.1:11434/v1`.
+fn normalize_base_url(raw: &str) -> String {
+    let no_slash = raw.trim().trim_end_matches('/');
+    // Only drop the version segment if a host is left: `base_url = "/v1"` on
+    // its own is nonsense, and silently emptying it would turn a confusing
+    // config error into a confusing URL error.
+    let no_version = no_slash
+        .strip_suffix("/v1")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(no_slash);
+    no_version.trim_end_matches('/').to_string()
+}
+
 /// Anthropic-Messages provider (compatible with the minimax endpoint).
 pub struct AnthropicMessages {
     base_url: String,
@@ -120,6 +184,7 @@ pub struct AnthropicMessages {
     key_idx: AtomicUsize,
     model: String,
     max_tokens: u32,
+    headers: Vec<(HeaderName, HeaderValue)>,
     client: reqwest::Client,
 }
 
@@ -127,11 +192,12 @@ impl AnthropicMessages {
     /// Build a new provider from a [`ProviderConfig`].
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(&cfg.base_url),
             api_keys: split_key_pool(&cfg.api_key),
             key_idx: AtomicUsize::new(0),
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
+            headers: build_headers(&cfg.headers)?,
             client: build_client(cfg)?,
         })
     }
@@ -267,16 +333,18 @@ impl LlmProvider for AnthropicMessages {
 
         let url = format!("{}/v1/messages", self.base_url);
         let api_key = self.api_key();
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("LLM request failed: {e}"))?;
+        let resp = apply_headers(
+            self.client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json"),
+            &self.headers,
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("LLM request failed: {e}"))?;
 
         let status = resp.status();
         let text = resp
@@ -316,18 +384,22 @@ impl LlmProvider for AnthropicMessages {
         let url = format!("{}/v1/messages", self.base_url);
         let client = self.client.clone();
         let api_key = self.api_key();
+        let headers = self.headers.clone();
 
         Box::pin(
             futures::stream::once(async move {
-                let resp = client
-                    .post(&url)
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
+                let resp = apply_headers(
+                    client
+                        .post(&url)
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("content-type", "application/json"),
+                    &headers,
+                )
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
 
                 let status = resp.status();
                 if !status.is_success() {
@@ -355,6 +427,118 @@ impl LlmProvider for AnthropicMessages {
 mod tests {
     use super::*;
     use crate::agent::tool::Message;
+
+    #[test]
+    fn normalize_base_url_absorbs_version_and_slash_artifacts() {
+        // A host is left behind, so the version segment is absorbed: the
+        // endpoint path is appended by the client, never by the config.
+        for (raw, want) in [
+            ("https://example.test", "https://example.test"),
+            ("https://example.test/", "https://example.test"),
+            ("https://example.test/v1", "https://example.test"),
+            ("https://example.test/v1/", "https://example.test"),
+            ("https://example.test/api/v1", "https://example.test/api"),
+            ("  https://example.test/v1  ", "https://example.test"),
+            ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434"),
+            // Paths that merely contain `v1` are untouched.
+            ("https://v1.example.test", "https://v1.example.test"),
+            (
+                "https://example.test/anthropic",
+                "https://example.test/anthropic",
+            ),
+            ("https://example.test/v11", "https://example.test/v11"),
+        ] {
+            assert_eq!(normalize_base_url(raw), want, "base_url = {raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_base_url_keeps_a_bare_v1() {
+        // `base_url = "/v1"` is a broken config, not a host: emptying it would
+        // turn the mistake into a relative URL instead of a visible one.
+        assert_eq!(normalize_base_url("/v1"), "/v1");
+    }
+
+    #[test]
+    fn provider_new_uses_the_normalised_base_url() {
+        let mut cfg = ProviderConfig {
+            base_url: "https://example.test/v1/".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            ..ProviderConfig::default()
+        };
+        assert_eq!(
+            AnthropicMessages::new(&cfg).unwrap().base_url,
+            "https://example.test"
+        );
+        assert_eq!(
+            OpenAiCompat::new(&cfg).unwrap().base_url,
+            "https://example.test"
+        );
+        // An already-clean URL is left alone.
+        cfg.base_url = "https://example.test/anthropic".into();
+        assert_eq!(
+            AnthropicMessages::new(&cfg).unwrap().base_url,
+            "https://example.test/anthropic"
+        );
+    }
+
+    #[test]
+    fn build_headers_rejects_config_that_reqwest_would_reject_at_runtime() {
+        let mut raw = HashMap::new();
+        raw.insert("bad header".to_string(), "v".to_string());
+        assert!(
+            build_headers(&raw).is_err(),
+            "a header name with a space is invalid"
+        );
+        raw.clear();
+        raw.insert("x-ok".to_string(), "line\nbreak".to_string());
+        assert!(
+            build_headers(&raw).is_err(),
+            "a value containing a newline is a header-injection attempt"
+        );
+        raw.clear();
+        raw.insert("x-ok".to_string(), "fine".to_string());
+        assert_eq!(build_headers(&raw).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_headers_identifies_the_client_unless_the_config_overrides_it() {
+        let client = reqwest::Client::new();
+
+        let bare = apply_headers(client.get("http://example.test"), &[])
+            .build()
+            .unwrap();
+        assert_eq!(
+            bare.headers().get(USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some(DEFAULT_USER_AGENT),
+            "reqwest's bare library name is what gateways reject"
+        );
+
+        let raw = HashMap::from([
+            ("user-agent".to_string(), "my-agent/9".to_string()),
+            ("x-opencode-session".to_string(), "s1".to_string()),
+        ]);
+        let headers = build_headers(&raw).unwrap();
+        let configured = apply_headers(client.get("http://example.test"), &headers)
+            .build()
+            .unwrap();
+        assert_eq!(
+            configured
+                .headers()
+                .get(USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("my-agent/9"),
+            "a configured user-agent wins instead of duplicating the default"
+        );
+        assert_eq!(
+            configured
+                .headers()
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok()),
+            Some("s1")
+        );
+    }
 
     #[test]
     fn build_body_minimal() {
@@ -428,6 +612,7 @@ pub struct OpenAiCompat {
     model: String,
     max_tokens: u32,
     temperature: Option<f32>,
+    headers: Vec<(HeaderName, HeaderValue)>,
     client: reqwest::Client,
 }
 
@@ -485,12 +670,13 @@ impl OpenAiCompat {
     /// Build a new provider from a [`ProviderConfig`].
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(&cfg.base_url),
             api_keys: split_key_pool(&cfg.api_key),
             key_idx: AtomicUsize::new(0),
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
+            headers: build_headers(&cfg.headers)?,
             client: build_client(cfg)?,
         })
     }
@@ -676,15 +862,17 @@ impl LlmProvider for OpenAiCompat {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let api_key = self.api_key();
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("LLM request failed: {e}"))?;
+        let resp = apply_headers(
+            self.client
+                .post(&url)
+                .bearer_auth(&api_key)
+                .header("content-type", "application/json"),
+            &self.headers,
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("LLM request failed: {e}"))?;
 
         let status = resp.status();
         let text = resp
@@ -724,17 +912,21 @@ impl LlmProvider for OpenAiCompat {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let client = self.client.clone();
         let api_key = self.api_key();
+        let headers = self.headers.clone();
 
         Box::pin(
             futures::stream::once(async move {
-                let resp = client
-                    .post(&url)
-                    .bearer_auth(&api_key)
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
+                let resp = apply_headers(
+                    client
+                        .post(&url)
+                        .bearer_auth(&api_key)
+                        .header("content-type", "application/json"),
+                    &headers,
+                )
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("LLM streaming request failed: {e}"))?;
 
                 let status = resp.status();
                 if !status.is_success() {
