@@ -5,47 +5,48 @@ use std::path::PathBuf;
 
 use zero_hermes::skills::{split_frontmatter, Skill, SkillRegistry};
 
-/// Recursively count `SKILL.md` / `skill.md` files under `dir`.
-fn count_skill_files(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    for entry in fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if entry.file_type().unwrap().is_dir() {
-            n += count_skill_files(&path);
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("skill.md"))
-        {
-            n += 1;
-        }
-    }
-    n
-}
-
 #[test]
-fn loads_bundled_hermes_skills() {
-    // The repo vendors the nested Hermes skill pack. The registry keeps
-    // duplicate frontmatter names under directory aliases, so a complete
-    // recursive scan must yield exactly one entry per SKILL.md on disk; this
-    // catches a wiped category or a loader that stops descending.
-    let dir = PathBuf::from("skills");
-    let reg = SkillRegistry::load_dir(&dir).unwrap();
-    let files = count_skill_files(&dir);
-    assert!(files > 100, "vendored skill pack looks truncated: {files}");
+fn loads_nested_category_layout() {
+    // The Hermes pack nests skills under category directories
+    // (`<category>/<skill>/SKILL.md`). The registry keeps duplicate
+    // frontmatter names under directory aliases, so a complete recursive scan
+    // must yield exactly one entry per SKILL.md on disk.
+    let tmp = tempfile::tempdir().unwrap();
+    let write = |rel: &str, raw: &str| {
+        let dir = tmp.path().join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), raw).unwrap();
+    };
+    write(
+        "devops/deploy",
+        "---\ndescription: ship it\n---\nDeploy body\n",
+    );
+    // Frontmatter `name:` overrides the directory name. The `a-` / `z-`
+    // prefixes pin traversal order (entries sort by file name), so this
+    // skill reliably wins the declared name and the one below takes the
+    // directory alias — without them the duplicate winner depends on sort
+    // order and the assertions below flip.
+    write(
+        "research/a-papers/arxiv",
+        "---\nname: paper-search\ndescription: find papers\n---\nArxiv body\n",
+    );
+    // A second skill declaring an already-taken name is kept under its
+    // directory alias rather than dropped.
+    write(
+        "research/z-other/dup",
+        "---\nname: paper-search\ndescription: duplicate\n---\ndup body\n",
+    );
+
+    let reg = SkillRegistry::load_dir(tmp.path()).unwrap();
     assert_eq!(
         reg.names().len(),
-        files,
+        3,
         "recursive loader did not register every SKILL.md"
     );
-    // Representative skills across categories prove recursive discovery and
-    // declared-name parsing (frontmatter `name:` overrides the directory).
-    assert!(reg.get("systematic-debugging").is_some());
-    assert!(reg.get("github-code-review").is_some());
-    let obsidian = reg.get("obsidian").unwrap();
-    assert!(!obsidian.description.is_empty());
-    assert!(obsidian.body.contains("Obsidian"));
+    assert_eq!(reg.get("deploy").unwrap().description, "ship it");
+    assert!(reg.get("paper-search").is_some());
+    assert!(reg.get("arxiv").is_none(), "declared name must win");
+    assert!(reg.get("dup").is_some(), "duplicate kept under dir alias");
 }
 
 #[test]

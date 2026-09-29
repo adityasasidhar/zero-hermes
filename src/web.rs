@@ -26,14 +26,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{
     sse::{Event, Sse},
     Html, IntoResponse, Redirect, Response,
 };
-use axum::routing::{get, post};
-use axum::{Form, Router};
+use axum::routing::{delete, get, post};
+use axum::{Form, Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
@@ -49,32 +49,56 @@ use crate::tools::ToolRegistry;
 pub const WEB_SESSION_ID: &str = "web-default";
 
 /// Events the web UI cares about. Anything an agent does that's user-visible.
+///
+/// Every turn-scoped variant carries the owning `session` id (`web-*`) so a
+/// browser with several conversations open can ignore traffic for background
+/// sessions instead of interleaving every turn into the active view.
+/// `Lagged` stays global: it reports transport loss on the shared broadcast,
+/// not one turn's output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiEvent {
     /// A user turn was submitted (echoed back so the UI can append it
     /// immediately rather than waiting for the agent).
-    User { text: String },
+    User { session: String, text: String },
     /// A chunk of assistant text arrived.
-    TextDelta { delta: String },
+    TextDelta { session: String, delta: String },
     /// The assistant emitted a tool call request.
     ToolUse {
+        session: String,
         name: String,
         input: serde_json::Value,
     },
     /// A tool call completed (with its output).
     ToolResult {
+        session: String,
         name: String,
         output: String,
         is_error: bool,
     },
     /// The agent loop finished for this turn.
-    Done,
+    Done { session: String },
     /// The agent loop failed.
-    Error { message: String },
+    Error { session: String, message: String },
     /// The broadcast channel lagged: a slow client missed `missed` events.
     /// Surfaced once per lag so the UI can warn the user.
     Lagged { missed: u64 },
+}
+
+impl UiEvent {
+    /// Owning session for turn-scoped events; `None` for transport-level
+    /// `Lagged`, which belongs to no single conversation.
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            UiEvent::User { session, .. }
+            | UiEvent::TextDelta { session, .. }
+            | UiEvent::ToolUse { session, .. }
+            | UiEvent::ToolResult { session, .. }
+            | UiEvent::Done { session }
+            | UiEvent::Error { session, .. } => Some(session),
+            UiEvent::Lagged { .. } => None,
+        }
+    }
 }
 
 /// Per-session turn locks: same session serializes, different sessions stay
@@ -94,8 +118,9 @@ pub struct AppState {
     /// cannot interleave positions (last-writer-wins only across *different*
     /// sessions, which stay concurrent). Each turn appends its delta via
     /// [`Memory::append_messages`] so a restart resumes the transcript.
-    /// The SSE broadcast stays global: every browser tab sees every turn's
-    /// events.
+    /// The SSE broadcast stays global: every browser tab receives every
+    /// turn's events, each tagged with its `session`, and the page filters
+    /// to the active conversation.
     pub histories: Arc<Mutex<HashMap<String, Vec<Message>>>>,
     /// Per-session turn locks: same session serializes, different sessions
     /// stay concurrent. See [`session_turn_lock`].
@@ -148,7 +173,10 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/events", get(sse_handler))
         .route("/send", post(send_handler))
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/sessions/:id/history", get(session_history_handler))
+        .route("/api/sessions/:id", delete(delete_session_handler));
     // One static route per embedded image rather than a `/assets/{*path}`
     // catch-all: the asset set is a closed literal, so an exact match is all
     // that is ever needed, and a request for anything else falls through to
@@ -278,6 +306,283 @@ fn tokens_match(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// One row in the session picker: the durable id plus enough transcript
+/// shape to render a useful label without loading every history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOverview {
+    pub id: String,
+    pub message_count: usize,
+    pub preview: Option<String>,
+    pub created_at: String,
+}
+
+/// `POST /api/sessions` body. `name` is optional: omitted means
+/// "mint me a fresh id". `csrf` follows the same per-process token rule
+/// as `/send` — the agent has a shell tool, so JSON endpoints that mutate
+/// state need it too. Browsers can also send it as `x-csrf-token`.
+#[derive(Debug, Deserialize, Default)]
+struct CreateSessionRequest {
+    #[serde(default)]
+    csrf: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionResponse {
+    session: SessionOverview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryResponse {
+    session: String,
+    messages: Vec<HistoryMessage>,
+}
+
+/// Short chat id for a `web-*` session id (`web-alice` -> `alice`).
+fn web_chat_id(session_id: &str) -> &str {
+    session_id.strip_prefix("web-").unwrap_or(session_id)
+}
+
+/// Pull the caller's CSRF token from a JSON body field or the
+/// `x-csrf-token` header (the page sends the header; curl sends either).
+fn request_csrf(body_csrf: Option<&str>, headers: &HeaderMap) -> String {
+    if let Some(v) = body_csrf {
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    headers
+        .get("x-csrf-token")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Build one picker row: durable count + preview, preferring the live
+/// in-memory history (which includes the in-flight turn) over SQLite.
+async fn session_overview(
+    state: &AppState,
+    session_id: &str,
+    created_at: String,
+) -> SessionOverview {
+    let (count, preview) = {
+        let guard = state.histories.lock().await;
+        if let Some(h) = guard.get(session_id) {
+            let preview = h
+                .iter()
+                .rev()
+                .map(|m| m.text())
+                .find(|t| !t.trim().is_empty())
+                .map(|t| crate::util::truncate_bytes(t.trim(), 120));
+            (h.len(), preview)
+        } else {
+            drop(guard);
+            let count = state.memory.session_message_count(session_id).unwrap_or(0);
+            let preview = state.memory.session_last_text(session_id).unwrap_or(None);
+            (count, preview)
+        }
+    };
+    SessionOverview {
+        id: session_id.to_string(),
+        message_count: count,
+        preview,
+        created_at,
+    }
+}
+
+/// GET /api/sessions — every `web-*` conversation, newest first.
+///
+/// Merges durable SQLite rows with live in-memory histories so a session
+/// created this process but not yet turned still shows up. The picker
+/// polls this after every completed turn to refresh counts/previews.
+async fn list_sessions(State(state): State<AppState>) -> Response {
+    let mut by_id: HashMap<String, String> = HashMap::new();
+    if let Ok(rows) = state.memory.list_sessions_limited(200) {
+        for row in rows {
+            if row.channel == "web" || row.id.starts_with("web-") {
+                by_id
+                    .entry(row.id.clone())
+                    .or_insert(row.created_at.clone());
+            }
+        }
+    }
+    {
+        let guard = state.histories.lock().await;
+        for id in guard.keys() {
+            if id.starts_with("web-") && !by_id.contains_key(id) {
+                by_id.insert(id.clone(), String::new());
+            }
+        }
+        // Guarantee the default exists so a fresh profile still renders one row.
+        if !by_id.contains_key(WEB_SESSION_ID) {
+            by_id.insert(WEB_SESSION_ID.to_string(), String::new());
+        }
+    }
+    let mut out = Vec::with_capacity(by_id.len());
+    for (id, created_at) in by_id {
+        out.push(session_overview(&state, &id, created_at).await);
+    }
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+    Json(out).into_response()
+}
+
+/// POST /api/sessions — create (or ensure) one `web-*` conversation.
+///
+/// An explicit `name` is normalized (`alice` -> `web-alice`); omitted means
+/// a fresh `web-<hex>` id. Idempotent: re-posting an existing name returns
+/// its current overview instead of duplicating it.
+async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateSessionRequest>,
+) -> Response {
+    let csrf = request_csrf(body.csrf.as_deref(), &headers);
+    if !tokens_match(&csrf, &state.csrf_token) {
+        return (StatusCode::FORBIDDEN, "invalid or missing CSRF token").into_response();
+    }
+    let session_id = match body.name {
+        Some(name) if !name.trim().is_empty() => normalize_web_session(Some(&name)),
+        _ => format!("web-{}", crate::util::random_hex(4)),
+    };
+    if let Err(e) = state
+        .memory
+        .upsert_session(&session_id, "web", web_chat_id(&session_id))
+    {
+        tracing::warn!(error = %e, "creating web session failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create session",
+        )
+            .into_response();
+    }
+    {
+        let mut guard = state.histories.lock().await;
+        guard.entry(session_id.clone()).or_insert_with(Vec::new);
+    }
+    let created_at = state
+        .memory
+        .list_sessions_limited(200)
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.id == session_id)
+                .map(|r| r.created_at)
+        })
+        .unwrap_or_default();
+    let overview = session_overview(&state, &session_id, created_at).await;
+    (
+        StatusCode::CREATED,
+        Json(CreateSessionResponse { session: overview }),
+    )
+        .into_response()
+}
+
+/// GET /api/sessions/:id/history — durable + live transcript as
+/// `{role, text}` pairs, skipping empty tool-only chatter the picker
+/// cannot render. Tool-use/result blocks surface via their text payload
+/// (results) or are dropped (bare tool_use has no text).
+async fn session_history_handler(
+    State(state): State<AppState>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let session_id = normalize_web_session(Some(&raw_id));
+    let history = {
+        let guard = state.histories.lock().await;
+        if let Some(h) = guard.get(&session_id) {
+            h.clone()
+        } else {
+            drop(guard);
+            match state.memory.load_history(&session_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, "loading session history failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "could not load history")
+                        .into_response();
+                }
+            }
+        }
+    };
+    let messages: Vec<HistoryMessage> = history
+        .iter()
+        .filter_map(|m| {
+            let text = m.text();
+            if m.role == "user"
+                && text.trim().is_empty()
+                && m.content
+                    .iter()
+                    .any(|c| matches!(c, crate::agent::ContentBlock::ToolUse(_)))
+            {
+                // Assistant tool_use blocks live in role=assistant messages,
+                // which have no text — drop them, the turn's text/tool cards
+                // stream separately. User tool_result blocks DO have text.
+                return None;
+            }
+            if text.trim().is_empty() {
+                return None;
+            }
+            let role = if m.role == "assistant" || m.role == "user" {
+                m.role.clone()
+            } else {
+                "system".to_string()
+            };
+            Some(HistoryMessage { role, text })
+        })
+        .collect();
+    Json(HistoryResponse {
+        session: session_id,
+        messages,
+    })
+    .into_response()
+}
+
+/// DELETE /api/sessions/:id — drop the transcript and the session row.
+///
+/// Idempotent: unknown ids still return 200. The CSRF token arrives via
+/// `x-csrf-token` (page) or `?csrf=` (curl); either is accepted.
+async fn delete_session_handler(
+    State(state): State<AppState>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let csrf = request_csrf(q.get("csrf").map(String::as_str), &headers);
+    if !tokens_match(&csrf, &state.csrf_token) {
+        return (StatusCode::FORBIDDEN, "invalid or missing CSRF token").into_response();
+    }
+    let session_id = normalize_web_session(Some(&raw_id));
+    if session_id == WEB_SESSION_ID {
+        // The default conversation is the picker's anchor: clear its
+        // transcript but keep the row so the list never renders empty.
+        if let Err(e) = state.memory.save_history(&session_id, &[]) {
+            tracing::warn!(error = %e, "clearing default session failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not clear session").into_response();
+        }
+        let mut guard = state.histories.lock().await;
+        guard.insert(session_id, Vec::new());
+        return Json(serde_json::json!({"ok": true})).into_response();
+    }
+    if let Err(e) = state.memory.delete_session(&session_id) {
+        tracing::warn!(error = %e, "deleting session failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not delete session",
+        )
+            .into_response();
+    }
+    {
+        let mut guard = state.histories.lock().await;
+        guard.remove(&session_id);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
 /// POST /send — kick off one agent turn for the submitted message.
 /// Streams events on the broadcast channel as the loop runs.
 async fn send_handler(
@@ -298,9 +603,19 @@ async fn send_handler(
         return Redirect::to("/").into_response();
     }
     let session_id = normalize_web_session(form.session.as_deref().or(query.session.as_deref()));
+    // Ensure the durable row exists before the first turn: ad-hoc web
+    // sessions (picker-created or hand-typed) otherwise appear in the
+    // picker only after their turn persists.
+    if let Err(e) = state
+        .memory
+        .upsert_session(&session_id, "web", web_chat_id(&session_id))
+    {
+        tracing::warn!(error = %e, "upserting web session failed");
+    }
     // Echo the user message immediately so the UI shows it before the agent
     // loop starts (which can take a few hundred ms for the LLM round-trip).
     state.emit(UiEvent::User {
+        session: session_id.clone(),
         text: message.clone(),
     });
 
@@ -364,10 +679,14 @@ async fn send_handler(
             &ctx,
             |ev| match ev {
                 StreamTurn::TextDelta(s) => {
-                    state_for_loop.emit(UiEvent::TextDelta { delta: s });
+                    state_for_loop.emit(UiEvent::TextDelta {
+                        session: session_id.clone(),
+                        delta: s,
+                    });
                 }
                 StreamTurn::ToolUse(tc) => {
                     state_for_loop.emit(UiEvent::ToolUse {
+                        session: session_id.clone(),
                         name: tc.name,
                         input: tc.input,
                     });
@@ -378,13 +697,16 @@ async fn send_handler(
                     is_error,
                 } => {
                     state_for_loop.emit(UiEvent::ToolResult {
+                        session: session_id.clone(),
                         name,
                         output,
                         is_error,
                     });
                 }
                 StreamTurn::Done(_) => {
-                    state_for_loop.emit(UiEvent::Done);
+                    state_for_loop.emit(UiEvent::Done {
+                        session: session_id.clone(),
+                    });
                 }
             },
         )
@@ -405,6 +727,7 @@ async fn send_handler(
             }
             Err(e) => {
                 state_for_loop.emit(UiEvent::Error {
+                    session: session_id.clone(),
                     message: e.to_string(),
                 });
                 // `run_stream` pushes the user message before the first LLM
@@ -537,15 +860,21 @@ mod tests {
 
     #[test]
     fn ui_event_round_trip_text_delta() {
-        let ev = UiEvent::TextDelta { delta: "hi".into() };
+        let ev = UiEvent::TextDelta {
+            session: "web-a".into(),
+            delta: "hi".into(),
+        };
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains("\"text_delta\""));
         assert!(s.contains("\"hi\""));
+        assert!(s.contains("web-a"));
+        assert_eq!(ev.session(), Some("web-a"));
     }
 
     #[test]
     fn ui_event_round_trip_tool_use() {
         let ev = UiEvent::ToolUse {
+            session: "web-a".into(),
             name: "bash".into(),
             input: serde_json::json!({"command": "ls"}),
         };
@@ -557,8 +886,22 @@ mod tests {
 
     #[test]
     fn ui_event_round_trip_done() {
-        let ev = UiEvent::Done;
+        let ev = UiEvent::Done {
+            session: "web-a".into(),
+        };
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains("\"done\""));
+        assert!(s.contains("web-a"));
+    }
+
+    #[test]
+    fn lagged_has_no_session() {
+        assert_eq!(UiEvent::Lagged { missed: 2 }.session(), None);
+    }
+
+    #[test]
+    fn web_chat_id_strips_prefix() {
+        assert_eq!(web_chat_id("web-alice"), "alice");
+        assert_eq!(web_chat_id("web-default"), "default");
     }
 }

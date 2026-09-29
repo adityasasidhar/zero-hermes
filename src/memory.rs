@@ -182,6 +182,65 @@ impl Memory {
         Ok(out)
     }
 
+    /// Delete a session and its transcript atomically.
+    ///
+    /// Used by the web UI's session picker: deleting `web-xyz` drops the
+    /// `sessions` row plus every `messages` / `message_search` row, so the
+    /// id disappears from the list instead of lingering as a 0-message row.
+    /// Unknown ids are a no-op rather than an error, keeping DELETE
+    /// idempotent.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM message_search WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count durable messages in one session (0 for unknown ids).
+    pub fn session_message_count(&self, session_id: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Newest durable message text in one session, if any.
+    ///
+    /// Powers the session picker's preview line without loading the whole
+    /// transcript. Blank/whitespace-only transcripts report `None` so the
+    /// picker can fall back to "No messages yet".
+    pub fn session_last_text(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT text FROM messages WHERE session_id = ?1 ORDER BY position DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![session_id])?;
+        if let Some(row) = rows.next()? {
+            let text: String = row.get(0)?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(crate::util::truncate_bytes(trimmed, 120)))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Replace a session transcript atomically. Storing the full message JSON
     /// preserves tool-use/result pairing across restarts; a separate FTS5
     /// index supports low-cost cross-session recall.
@@ -562,5 +621,35 @@ mod tests {
         assert!(section.contains("[s]"));
         assert!(recall_section(&m, "no such words xyzzy", None, 4).is_none());
         assert!(recall_section(&m, "   ", None, 4).is_none());
+    }
+
+    #[test]
+    fn session_stats_and_delete_round_trip() {
+        let m = Memory::in_memory().unwrap();
+        m.upsert_session("web-a", "web", "a").unwrap();
+        assert_eq!(m.session_message_count("web-a").unwrap(), 0);
+        assert_eq!(m.session_last_text("web-a").unwrap(), None);
+        m.save_history(
+            "web-a",
+            &[
+                Message::user("first question"),
+                Message::assistant_text("first answer"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(m.session_message_count("web-a").unwrap(), 2);
+        assert_eq!(
+            m.session_last_text("web-a").unwrap().as_deref(),
+            Some("first answer")
+        );
+        m.delete_session("web-a").unwrap();
+        assert_eq!(m.session_message_count("web-a").unwrap(), 0);
+        assert_eq!(m.session_last_text("web-a").unwrap(), None);
+        assert!(
+            !m.list_sessions().unwrap().iter().any(|s| s.id == "web-a"),
+            "deleted session should leave the list"
+        );
+        // Idempotent on unknown ids.
+        m.delete_session("web-missing").unwrap();
     }
 }

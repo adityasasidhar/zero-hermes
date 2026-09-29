@@ -239,6 +239,32 @@
   .side-btn:hover svg { color: var(--accent-2); }
   .side-btn kbd { margin-left: auto; }
 
+  /* Sessions picker: one row per web-* conversation. The active row is the
+     only one with a solid accent border; the rest sit quiet so the list
+     reads at a glance with no hue. */
+  .session-list { display: grid; gap: 6px; margin-bottom: 8px; }
+  .session-row { display: flex; gap: 6px; align-items: stretch; }
+  .session-main {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+    align-items: flex-start; text-align: left;
+    background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+    border: 1px solid var(--border); color: var(--text);
+    border-radius: var(--radius); padding: 9px 12px;
+    transition: background 0.18s, border-color 0.18s;
+  }
+  .session-main:hover { background: var(--surface-3); border-color: var(--border-strong); }
+  .session-main.active { border: 2px solid var(--accent-2); padding: 8px 11px; background: var(--accent-soft); }
+  .session-name { font-size: 12.5px; font-weight: 600; font-family: var(--mono); color: var(--text-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .session-meta { font-size: 11px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .session-del {
+    flex: none; width: 34px; border-radius: var(--radius);
+    background: transparent; border: 1px solid transparent; color: var(--muted-3);
+    font-size: 15px; line-height: 1;
+    transition: background 0.18s, border-color 0.18s, color 0.18s;
+  }
+  .session-del:hover { background: var(--surface-2); border-color: var(--border); color: var(--text); }
+  .session-empty { font-size: 12px; color: var(--muted-3); padding: 4px 8px; }
+
   .shortcut { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); padding: 5px 6px; }
   .shortcut span { color: var(--text); }
   kbd {
@@ -677,7 +703,20 @@
       </div>
 
       <div class="side-section">
-        <p class="side-label">Session</p>
+        <p class="side-label">Sessions</p>
+        <div class="session-list" id="session-list" role="listbox" aria-label="Conversations"></div>
+        <div class="side-actions">
+          <button class="side-btn" id="btn-new-session" type="button" title="Start a fresh conversation">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+            New session
+          </button>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <p class="side-label">View</p>
         <div class="side-actions">
           <button class="side-btn" id="btn-new" type="button" title="Clears this page only — the agent still remembers the conversation">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
@@ -731,6 +770,7 @@
         <div class="topbar-title">Conversation</div>
       </div>
       <span class="topbar-sub" id="endpoint"></span>
+      <span class="topbar-sub" id="session-pill" title="Active conversation">web-default</span>
       <div class="topbar-spacer"></div>
       <button class="icon-btn" id="btn-theme" type="button" aria-label="Toggle light and dark theme" title="Toggle theme">
         <svg id="theme-dark" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -832,13 +872,33 @@
     streaming: null,     // element receiving text deltas for the current turn
     streamText: '',      // raw markdown accumulated for that element
     pendingEcho: null,   // user text we rendered optimistically
+    pendingSession: null, // session the optimistic echo belongs to
     waiting: [],         // tool cards awaiting a result (FIFO per name)
     working: null,       // the animated "working" row
     atBottom: true,
     turns: 0,
     transcript: [],      // { role, text } for "copy transcript"
-    started: false       // welcome screen removed once the first message lands
+    started: false,      // welcome screen removed once the first message lands
+    session: null,       // active web-* conversation id
+    sessions: []         // last GET /api/sessions payload
   };
+
+  // Active conversation, persisted across reloads. Anything that is not a
+  // plausible web-* id falls back to the default rather than 404ing history.
+  function storedSession() {
+    try {
+      var s = localStorage.getItem('zh-session');
+      if (s && /^web-[A-Za-z0-9_-]{1,64}$/.test(s)) return s;
+    } catch (e) { /* private mode */ }
+    return 'web-default';
+  }
+  state.session = storedSession();
+  function setActiveSession(id) {
+    state.session = id;
+    try { localStorage.setItem('zh-session', id); } catch (e) { /* ignore */ }
+    $('session-pill').textContent = id;
+  }
+  setActiveSession(state.session);
 
   if (navigator.platform && /mac/i.test(navigator.platform)) $('mod-k').textContent = '⌘';
 
@@ -1249,6 +1309,139 @@
     input.focus();
   }
 
+  // ---------------------------------------------------------- sessions
+  // Hermes keeps every conversation resumable; the picker is the web UI's
+  // version of that. The SSE stream is shared, so each event carries its
+  // owning session and the page ignores traffic for background sessions.
+  function shortName(id) { return id.replace(/^web-/, ''); }
+  function csrfToken() { return csrf.value; }
+
+  async function fetchSessions() {
+    var res;
+    try {
+      res = await fetch('/api/sessions', { headers: { 'Accept': 'application/json' } });
+    } catch (e) { return; }
+    if (!res.ok) return;
+    var list;
+    try { list = await res.json(); } catch (e) { return; }
+    if (!Array.isArray(list)) return;
+    state.sessions = list;
+    renderSessionList();
+  }
+
+  function renderSessionList() {
+    var box = $('session-list');
+    box.replaceChildren();
+    if (!state.sessions.length) {
+      box.appendChild(el('div', 'session-empty', 'No conversations yet'));
+      return;
+    }
+    state.sessions.forEach(function (s) {
+      var row = el('div', 'session-row');
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', String(s.id === state.session));
+      var main = el('button', 'session-main' + (s.id === state.session ? ' active' : ''));
+      main.type = 'button';
+      main.title = s.id;
+      main.appendChild(el('span', 'session-name', shortName(s.id)));
+      var meta = (s.message_count || 0) + (s.message_count === 1 ? ' msg' : ' msgs');
+      if (s.preview) meta += ' · ' + s.preview;
+      else if (!s.message_count) meta += ' · empty';
+      main.appendChild(el('span', 'session-meta', meta));
+      main.addEventListener('click', function () { selectSession(s.id); });
+      row.appendChild(main);
+      // The default conversation is the picker's anchor: it can be cleared
+      // but never removed, so it gets no delete button.
+      if (s.id !== 'web-default') {
+        var del = el('button', 'session-del', '×');
+        del.type = 'button';
+        del.title = 'Delete ' + s.id;
+        del.setAttribute('aria-label', 'Delete ' + s.id);
+        del.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          deleteSession(s.id);
+        });
+        row.appendChild(del);
+      }
+      box.appendChild(row);
+    });
+  }
+
+  function renderHistory(messages) {
+    resetView();
+    (messages || []).forEach(function (m) {
+      if (m.role === 'user' || m.role === 'assistant') {
+        addMsg(m.role, m.text);
+        state.transcript.push({ role: m.role, text: m.text });
+      } else {
+        addMsg('system', m.text, { label: 'System' });
+      }
+    });
+    if ((messages || []).length) showWelcome(false);
+    updateJump();
+  }
+
+  async function selectSession(id) {
+    if (state.busy) return; // keep one in-flight turn per page; the lock is per session server-side
+    setActiveSession(id);
+    renderSessionList();
+    var res;
+    try {
+      res = await fetch('/api/sessions/' + encodeURIComponent(id) + '/history', {
+        headers: { 'Accept': 'application/json' }
+      });
+    } catch (e) {
+      resetView();
+      return;
+    }
+    if (!res.ok) { resetView(); return; }
+    var data;
+    try { data = await res.json(); } catch (e) { resetView(); return; }
+    renderHistory(data.messages);
+    fetchSessions();
+  }
+
+  async function createSession() {
+    if (state.busy) return;
+    var res;
+    try {
+      res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken() },
+        body: JSON.stringify({})
+      });
+    } catch (e) {
+      announce('Could not create a session.');
+      return;
+    }
+    if (res.status === 403) {
+      addMsg('error', 'The session token was rejected. Reload the page to get a fresh one.');
+      return;
+    }
+    if (!res.ok) return;
+    var data;
+    try { data = await res.json(); } catch (e) { return; }
+    var id = data && data.session && data.session.id;
+    if (!id) return;
+    await fetchSessions();
+    selectSession(id);
+    document.body.classList.remove('nav-open');
+  }
+
+  async function deleteSession(id) {
+    if (state.busy) return;
+    if (!window.confirm('Delete conversation "' + shortName(id) + '" and its transcript?')) return;
+    try {
+      await fetch('/api/sessions/' + encodeURIComponent(id), {
+        method: 'DELETE',
+        headers: { 'x-csrf-token': csrfToken() }
+      });
+    } catch (e) { /* fall through to refresh */ }
+    await fetchSessions();
+    if (state.session === id) selectSession('web-default');
+    else renderSessionList();
+  }
+
   // ------------------------------------------------------------- submit flow
   async function submit() {
     var text = input.value.trim();
@@ -1258,6 +1451,7 @@
     addMsg('user', text);
     state.transcript.push({ role: 'user', text: text });
     state.pendingEcho = text;
+    state.pendingSession = state.session;
     input.value = '';
     autosize();
     setBusy(true);
@@ -1268,6 +1462,7 @@
     var body = new URLSearchParams();
     body.set('csrf', csrf.value);
     body.set('message', text);
+    body.set('session', state.session);
     try {
       var res = await fetch('/send', {
         method: 'POST',
@@ -1296,12 +1491,23 @@
   }
 
   // ------------------------------------------------------------- event wiring
+  // Background sessions multiplex over one shared EventSource: anything
+  // tagged for another conversation only refreshes the picker's counts.
+  function eventSession(e) {
+    return e && typeof e.session === 'string' ? e.session : null;
+  }
   function handleEvent(e) {
+    var sid = eventSession(e);
+    if (sid !== null && sid !== state.session) {
+      if (e.type === 'done' || e.type === 'error') fetchSessions();
+      return;
+    }
     switch (e.type) {
       case 'user':
         // Skip the echo of a message we already rendered optimistically.
-        if (state.pendingEcho !== null && e.text === state.pendingEcho) {
+        if (state.pendingEcho !== null && state.pendingSession === state.session && e.text === state.pendingEcho) {
           state.pendingEcho = null;
+          state.pendingSession = null;
           break;
         }
         addMsg('user', e.text);
@@ -1324,18 +1530,22 @@
       case 'done':
         finishAssistant();
         state.pendingEcho = null;
+        state.pendingSession = null;
         setBusy(false);
         setTurn('', 'idle');
         input.focus();
         announce('Agent finished.');
+        fetchSessions();
         break;
       case 'error':
         finishAssistant();
         state.pendingEcho = null;
+        state.pendingSession = null;
         setBusy(false);
         setTurn('', 'idle');
         addMsg('error', e.message);
         announce('The agent reported an error.');
+        fetchSessions();
         break;
       case 'lagged':
         addMsg('system', 'The event stream lagged and ' + e.missed + ' event(s) were dropped. Some output is missing from this view.', { label: 'Stream warning' });
@@ -1432,6 +1642,9 @@
     resetView();
     document.body.classList.remove('nav-open');
   });
+  $('btn-new-session').addEventListener('click', function () {
+    createSession();
+  });
   $('btn-copy').addEventListener('click', async function () {
     var label = $('btn-copy-label');
     var text = state.transcript.map(function (m) {
@@ -1490,6 +1703,12 @@
   autosize();
   setConn('reconnecting', 'connecting…');
   setTurn('', 'idle');
+  // Boot the picker first so the active conversation's transcript lands
+  // before the user types: list, then load the stored (or default) session.
+  fetchSessions().then(function () {
+    var known = state.sessions.some(function (s) { return s.id === state.session; });
+    selectSession(known ? state.session : 'web-default');
+  });
 })();
 </script>
 </body>

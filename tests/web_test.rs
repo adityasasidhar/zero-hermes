@@ -129,11 +129,13 @@ async fn send_with_message_returns_redirect_and_emits_user_event() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline && !(saw_user && saw_done) {
         match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
-            Ok(Ok(UiEvent::User { text })) => {
+            Ok(Ok(UiEvent::User { session, text })) => {
                 assert_eq!(text, "hello");
+                assert_eq!(session, "web-default");
                 saw_user = true;
             }
-            Ok(Ok(UiEvent::Done)) => {
+            Ok(Ok(UiEvent::Done { session })) => {
+                assert_eq!(session, "web-default");
                 saw_done = true;
             }
             Ok(Ok(_)) => {}
@@ -200,6 +202,7 @@ async fn sse_format_is_data_lines() {
     // Emit one more event (after subscription) to make sure the connection
     // is alive and reaches the body.
     state.emit(UiEvent::TextDelta {
+        session: "web-default".into(),
         delta: "ping".into(),
     });
     // Drain the body for up to one second to capture the new event.
@@ -381,6 +384,32 @@ async fn index_references_the_logo_asset() {
     );
 }
 
+#[tokio::test]
+async fn index_contains_the_sessions_picker() {
+    let app = router(test_state());
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), PAGE_READ_LIMIT)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("id=\"session-list\""),
+        "picker container missing"
+    );
+    assert!(
+        html.contains("id=\"btn-new-session\""),
+        "new-session button missing"
+    );
+    assert!(html.contains("id=\"session-pill\""), "session pill missing");
+    assert!(
+        html.contains("/api/sessions"),
+        "page should call the sessions API"
+    );
+}
+
 #[test]
 fn web_session_normalization() {
     assert_eq!(normalize_web_session(None), "web-default");
@@ -416,7 +445,7 @@ async fn send_persists_session_to_memory() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
-            Ok(Ok(UiEvent::Done)) => break,
+            Ok(Ok(UiEvent::Done { .. })) => break,
             Ok(_) => continue,
             Err(_) => continue,
         }
@@ -433,4 +462,223 @@ async fn send_persists_session_to_memory() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), PAGE_READ_LIMIT)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn sessions_list_always_contains_the_default() {
+    let (status, json) = get_json(router(test_state()), "/api/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        ids.contains(&"web-default"),
+        "expected web-default in {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_session_mints_an_id_and_is_idempotent() {
+    let state = test_state();
+    // Explicit name normalizes bare -> web-*.
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .header("x-csrf-token", "test-token")
+                .body(Body::from(r#"{"name":"alice"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["session"]["id"], "web-alice");
+
+    // Re-posting the same name returns the same id (no duplicate).
+    let (status, json) = get_json(router(state.clone()), "/api/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    let count = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s.get("id").and_then(|v| v.as_str()) == Some("web-alice"))
+        .count();
+    assert_eq!(count, 1, "re-post must not duplicate: {json}");
+
+    // Omitted name mints a fresh web-<hex> id.
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .header("x-csrf-token", "test-token")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let minted = json["session"]["id"].as_str().unwrap().to_string();
+    assert!(
+        minted.starts_with("web-") && minted.len() > 5,
+        "minted id: {minted}"
+    );
+}
+
+#[tokio::test]
+async fn create_session_rejects_a_bad_csrf_token() {
+    let response = router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"bob"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn send_to_a_named_session_scopes_events_and_history() {
+    let state = test_state();
+    let mut rx = state.events.subscribe();
+    let app = router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("csrf=test-token&message=hi+alice&session=alice"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // The User echo + Done for this turn both carry web-alice.
+    let mut saw_user = false;
+    let mut saw_done = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && !(saw_user && saw_done) {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(UiEvent::User { session, text })) if session == "web-alice" => {
+                assert_eq!(text, "hi alice");
+                saw_user = true;
+            }
+            Ok(Ok(UiEvent::Done { session })) if session == "web-alice" => {
+                saw_done = true;
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    assert!(saw_user, "expected a web-alice User event");
+    assert!(saw_done, "expected a web-alice Done event");
+
+    // History API returns the turn as {role, text} pairs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let (status, json) =
+            get_json(router(state.clone()), "/api/sessions/web-alice/history").await;
+        assert_eq!(status, StatusCode::OK);
+        let messages = json["messages"].as_array().unwrap();
+        if !messages.is_empty() {
+            assert_eq!(json["session"], "web-alice");
+            assert!(messages
+                .iter()
+                .any(|m| m["role"] == "user" && m["text"] == "hi alice"));
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("expected web-alice history to persist");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn delete_session_clears_the_transcript() {
+    let state = test_state();
+    state
+        .memory
+        .upsert_session("web-temp", "web", "temp")
+        .unwrap();
+    state
+        .memory
+        .save_history(
+            "web-temp",
+            &[zero_hermes::agent::Message::user("to be deleted")],
+        )
+        .unwrap();
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/web-temp?csrf=test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, json) = get_json(router(state.clone()), "/api/sessions/web-temp/history").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["messages"].as_array().unwrap().is_empty());
+
+    // Unknown ids stay idempotent (200, empty).
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/web-missing?csrf=test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_session_rejects_a_bad_csrf_token() {
+    let response = router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/sessions/web-temp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
