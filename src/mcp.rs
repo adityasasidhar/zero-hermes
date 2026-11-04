@@ -3,8 +3,9 @@
 //! `tools/list`, `tools/call` are spoken — no extra deps beyond
 //! `tokio::process` + `serde_json`.
 //!
-//! [`McpTool`] wraps one remote tool as `mcp_<server>_<tool>`, and
-//! [`build_mcp_tools`] discovers them (bootstrap wiring deferred, see TODO).
+//! [`McpSession`] keeps one server process alive per configured server
+//! (handshake once, respawn on failure). [`McpTool`] wraps one remote tool as
+//! `mcp_<server>_<tool>`, and [`build_mcp_tools`] discovers them at startup.
 
 use std::time::Duration;
 
@@ -14,9 +15,6 @@ use serde_json::{json, Value};
 use crate::agent::tool::{Tool, ToolContext, ToolOutput};
 use crate::config::{McpConfig, McpServerConfig};
 use crate::error::Result;
-
-/// Default per-RPC timeout for MCP stdio servers.
-const MCP_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Remote tool descriptor returned by `tools/list`.
 #[derive(Debug, Clone)]
@@ -64,63 +62,196 @@ pub fn mcp_tool_name(server: &str, tool: &str) -> String {
     format!("mcp_{}_{}", clean(server), clean(tool))
 }
 
-/// One RPC round-trip: spawn `command [args...]`, send one request line,
-/// read one response line, then kill the child. Stateless per call, so no
-/// session tracking; servers that want a persistent session still answer
-/// after the inline `initialize` in [`list_remote_tools`].
-async fn rpc_once(cfg: &McpServerConfig, method: &str, params: Value) -> Result<Value> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    if cfg.command.trim().is_empty() {
-        anyhow::bail!("mcp server command is empty");
+/// Per-RPC timeouts. `initialize`/`tools/list` get headroom because
+/// `npx`-style servers download and start cold; tool calls can legitimately
+/// run for a while.
+const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A live server process plus its pipes.
+struct Live {
+    // Held so `kill_on_drop` reaps the process when the session dies.
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+}
+
+/// A persistent stdio session with one MCP server.
+///
+/// The process is spawned lazily, handshaken once (`initialize` +
+/// `notifications/initialized`) and reused for every later request, so a slow
+/// `npx` start is paid once instead of per tool call. Requests are serialised
+/// by a mutex. Any I/O failure or timeout drops the process; the next request
+/// respawns it, so a crashed or wedged server heals itself.
+pub struct McpSession {
+    cfg: McpServerConfig,
+    live: tokio::sync::Mutex<Option<Live>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl McpSession {
+    /// New (not yet started) session for `cfg`.
+    pub fn new(cfg: McpServerConfig) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cfg,
+            live: tokio::sync::Mutex::new(None),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        })
     }
-    let mut child = tokio::process::Command::new(&cfg.command)
-        .args(&cfg.args)
-        .envs(&cfg.env)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("mcp spawn {} failed: {e}", cfg.command))?;
-    let outcome = async {
-        let Some(mut writer) = child.stdin.take() else {
-            return Err(anyhow::anyhow!("mcp no stdin"));
-        };
-        let Some(stdout) = child.stdout.take() else {
-            return Err(anyhow::anyhow!("mcp no stdout"));
-        };
-        let mut reader = BufReader::new(stdout);
-        let request = encode_request(1, method, params);
-        if let Err(e) = writer.write_all(request.as_bytes()).await {
-            return Err(anyhow::anyhow!("mcp write: {e}"));
+
+    fn fresh_id(&self) -> u64 {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Spawn the server and complete the MCP handshake.
+    async fn start(&self) -> Result<Live> {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        if self.cfg.command.trim().is_empty() {
+            anyhow::bail!("mcp server command is empty");
         }
-        writer.flush().await.ok();
+        let mut child = tokio::process::Command::new(&self.cfg.command)
+            .args(&self.cfg.args)
+            .envs(&self.cfg.env)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("mcp spawn {} failed: {e}", self.cfg.command))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("mcp no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("mcp no stdout"))?;
+        let mut live = Live {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        round_trip(
+            &mut live,
+            self.fresh_id(),
+            "initialize",
+            init_params(),
+            MCP_INIT_TIMEOUT,
+        )
+        .await?;
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        live.stdin
+            .write_all(format!("{note}\n").as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp write: {e}"))?;
+        live.stdin.flush().await.ok();
+        Ok(live)
+    }
+
+    /// Send one request and return its `result`, (re)starting the server as
+    /// needed. A request that fails on a *reused* process is retried once on
+    /// a fresh one, since the likeliest cause is a server that died idle.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let timeout = if method == "tools/call" {
+            MCP_CALL_TIMEOUT
+        } else {
+            MCP_INIT_TIMEOUT
+        };
+        let mut guard = self.live.lock().await;
+        for attempt in 0..2 {
+            let reused = guard.is_some();
+            if guard.is_none() {
+                *guard = Some(self.start().await?);
+            }
+            let Some(live) = guard.as_mut() else {
+                anyhow::bail!("mcp session unavailable");
+            };
+            match round_trip(live, self.fresh_id(), method, params.clone(), timeout).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let protocol_error = e.to_string().starts_with("mcp error:");
+                    if !protocol_error {
+                        // Transport failure: the process state is unknown.
+                        *guard = None;
+                    }
+                    if protocol_error || !reused || attempt == 1 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("mcp request failed")
+    }
+
+    /// `tools/list`.
+    pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
+        let result = self.request("tools/list", json!({})).await?;
+        parse_tool_list(&result)
+    }
+
+    /// `tools/call`, flattening text content blocks.
+    pub async fn call_tool(&self, tool: &str, args: Value) -> Result<String> {
+        let result = self
+            .request("tools/call", json!({"name": tool, "arguments": args}))
+            .await?;
+        let text = flatten_call_result(&result);
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            anyhow::bail!("{text}");
+        }
+        Ok(text)
+    }
+}
+
+/// Write one request and read lines until the response with the same id,
+/// skipping server notifications, server-initiated requests and log noise.
+async fn round_trip(
+    live: &mut Live,
+    id: u64,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let request = encode_request(id, method, params);
+    let exchange = async {
+        live.stdin
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp write: {e}"))?;
+        live.stdin.flush().await.ok();
         let mut line = String::new();
-        if let Err(e) = reader.read_line(&mut line).await {
-            return Err(anyhow::anyhow!("mcp read: {e}"));
+        loop {
+            line.clear();
+            let n = live
+                .stdout
+                .read_line(&mut line)
+                .await
+                .map_err(|e| anyhow::anyhow!("mcp read: {e}"))?;
+            if n == 0 {
+                anyhow::bail!("mcp server closed its output");
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue; // stray log line on stdout
+            };
+            if v.get("id").and_then(Value::as_u64) != Some(id) || v.get("method").is_some() {
+                continue; // notification, server request, or stale response
+            }
+            return decode_response_line(line.trim());
         }
-        if line.trim().is_empty() {
-            return Err(anyhow::anyhow!("mcp empty response"));
-        }
-        decode_response_line(&line)
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("mcp {method} timed out after {}s", timeout.as_secs()),
     }
-    .await;
-    let _ = child.kill().await;
-    tokio::time::timeout(MCP_RPC_TIMEOUT, child.wait())
-        .await
-        .map_err(|_| anyhow::anyhow!("mcp wait timed out"))?
-        .map_err(|e| anyhow::anyhow!("mcp wait: {e}"))?;
-    outcome
 }
 
 /// `initialize` params identifying this client.
 fn init_params() -> Value {
-    json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "zero-hermes", "version": "0.1.0"}})
+    json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "zero-hermes", "version": env!("CARGO_PKG_VERSION")}})
 }
 
-/// List a server's remote tools (sends `initialize`, then `tools/list`).
-pub async fn list_remote_tools(cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>> {
-    let _ = rpc_once(cfg, "initialize", init_params()).await;
-    let result = rpc_once(cfg, "tools/list", json!({})).await?;
+fn parse_tool_list(result: &Value) -> Result<Vec<McpToolInfo>> {
     let Some(arr) = result.get("tools").and_then(|v| v.as_array()) else {
         return Err(anyhow::anyhow!("mcp tools/list missing tools[]"));
     };
@@ -147,10 +278,7 @@ pub async fn list_remote_tools(cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>
     Ok(out)
 }
 
-/// Call a remote tool (sends `initialize`, then `tools/call`).
-pub async fn call_remote_tool(cfg: &McpServerConfig, tool: &str, args: Value) -> Result<String> {
-    let _ = rpc_once(cfg, "initialize", init_params()).await;
-    let result = rpc_once(cfg, "tools/call", json!({"name": tool, "arguments": args})).await?;
+fn flatten_call_result(result: &Value) -> String {
     let texts: Vec<String> = result
         .get("content")
         .and_then(|v| v.as_array())
@@ -161,10 +289,20 @@ pub async fn call_remote_tool(cfg: &McpServerConfig, tool: &str, args: Value) ->
         })
         .unwrap_or_default();
     if texts.is_empty() {
-        Ok(result.to_string())
+        result.to_string()
     } else {
-        Ok(texts.join("\n"))
+        texts.join("\n")
     }
+}
+
+/// One-shot: list a server's tools on a throwaway session.
+pub async fn list_remote_tools(cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>> {
+    McpSession::new(cfg.clone()).list_tools().await
+}
+
+/// One-shot: call a tool on a throwaway session.
+pub async fn call_remote_tool(cfg: &McpServerConfig, tool: &str, args: Value) -> Result<String> {
+    McpSession::new(cfg.clone()).call_tool(tool, args).await
 }
 
 /// Local [`Tool`] wrapper around one remote MCP tool.
@@ -172,19 +310,28 @@ pub struct McpTool {
     server: String,
     local_name: String,
     info: McpToolInfo,
-    server_cfg: McpServerConfig,
+    session: std::sync::Arc<McpSession>,
 }
 
 impl McpTool {
-    /// Wrap a remote tool for local dispatch.
+    /// Wrap a remote tool, giving it a private session.
     pub fn new(server: impl Into<String>, info: McpToolInfo, server_cfg: McpServerConfig) -> Self {
+        Self::with_session(server, info, McpSession::new(server_cfg))
+    }
+
+    /// Wrap a remote tool on a session shared with the server's other tools.
+    pub fn with_session(
+        server: impl Into<String>,
+        info: McpToolInfo,
+        session: std::sync::Arc<McpSession>,
+    ) -> Self {
         let server: String = server.into();
         let local_name = mcp_tool_name(&server, &info.name);
         Self {
             server,
             local_name,
             info,
-            server_cfg,
+            session,
         }
     }
 
@@ -206,7 +353,7 @@ impl Tool for McpTool {
         self.info.input_schema.clone()
     }
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        match call_remote_tool(&self.server_cfg, &self.info.name, input).await {
+        match self.session.call_tool(&self.info.name, input).await {
             Ok(text) => Ok(ToolOutput::ok(format!("[{}] {text}", self.server))),
             Err(e) => Ok(ToolOutput::err(format!(
                 "mcp {} failed: {e}",
@@ -216,16 +363,17 @@ impl Tool for McpTool {
     }
 }
 
-/// Turn a `tools/list` result into local tools (wired into bootstrap via
-/// `bootstrap::build_tool_registry_async`).
+/// Turn a `tools/list` result into local tools that share one live session
+/// (wired into bootstrap via `bootstrap::build_tool_registry_async`).
 pub fn build_mcp_tools_from_list(
     server: &str,
     cfg: &McpServerConfig,
     tools: Vec<McpToolInfo>,
 ) -> Vec<McpTool> {
+    let session = McpSession::new(cfg.clone());
     tools
         .into_iter()
-        .map(|info| McpTool::new(server, info, cfg.clone()))
+        .map(|info| McpTool::with_session(server, info, session.clone()))
         .collect()
 }
 
@@ -249,9 +397,13 @@ pub async fn build_mcp_tools(cfg: &McpConfig) -> Vec<McpTool> {
     names.sort();
     let mut out = Vec::new();
     for name in names {
-        let server_cfg = &cfg.servers[name];
-        match list_remote_tools(server_cfg).await {
-            Ok(infos) => out.extend(build_mcp_tools_from_list(name, server_cfg, infos)),
+        let session = McpSession::new(cfg.servers[name].clone());
+        match session.list_tools().await {
+            Ok(infos) => out.extend(
+                infos
+                    .into_iter()
+                    .map(|info| McpTool::with_session(name, info, session.clone())),
+            ),
             Err(e) => tracing::warn!(server = %name, error = %e, "mcp discovery failed; skipping"),
         }
     }
@@ -302,7 +454,10 @@ mod tests {
     #[tokio::test]
     async fn empty_command_errors_without_spawn() {
         let cfg = McpServerConfig::default();
-        assert!(rpc_once(&cfg, "tools/list", json!({})).await.is_err());
+        assert!(McpSession::new(cfg)
+            .request("tools/list", json!({}))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

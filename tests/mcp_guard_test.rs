@@ -11,24 +11,40 @@ use zero_hermes::agent::tool::ToolContext;
 use zero_hermes::bootstrap::{build_tool_registry, build_tool_registry_async};
 use zero_hermes::config::{Config, McpServerConfig};
 
-/// One request line in, one canned response line out, per process.
+/// A persistent line-oriented MCP server. Replies carry the request id; the
+/// `tools/call` result carries this process's pid so tests can tell whether
+/// the session was reused or respawned. If `$MARKER` exists the server removes
+/// it and exits without replying, simulating a server that died while idle.
 const FAKE_SERVER: &str = r#"
-read line
-case "$line" in
-  *'"tools/list"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo-it","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}' ;;
-  *'"tools/call"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"pong"}]}}' ;;
-  *) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
-esac
+while read line; do
+  case "$line" in *'"id":'*) ;; *) continue ;; esac
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  if [ -n "$MARKER" ] && [ -e "$MARKER" ]; then rm -f "$MARKER"; exit 0; fi
+  echo 'log noise that is not json'
+  case "$line" in
+    *'"tools/list"'*) echo '{"jsonrpc":"2.0","id":'$id',"result":{"tools":[{"name":"echo-it","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}' ;;
+    *'"tools/call"'*) echo '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'; echo '{"jsonrpc":"2.0","id":'$id',"result":{"content":[{"type":"text","text":"pid='$$'"}]}}' ;;
+    *) echo '{"jsonrpc":"2.0","id":'$id',"result":{}}' ;;
+  esac
+done
 "#;
 
 fn cfg_with_fake_server() -> Config {
+    cfg_with_marker(None)
+}
+
+fn cfg_with_marker(marker: Option<&std::path::Path>) -> Config {
     let mut cfg = Config::default();
+    let mut env = HashMap::new();
+    if let Some(m) = marker {
+        env.insert("MARKER".to_string(), m.display().to_string());
+    }
     cfg.mcp.servers.insert(
         "fake".to_string(),
         McpServerConfig {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), FAKE_SERVER.to_string()],
-            env: HashMap::new(),
+            env,
         },
     );
     // A broken server must not take the registry down.
@@ -62,7 +78,36 @@ async fn async_registry_discovers_and_calls_mcp_tools() {
         .await
         .unwrap();
     assert!(!out.is_error, "{}", out.content);
-    assert!(out.content.contains("pong"), "{}", out.content);
+    assert!(out.content.contains("pid="), "{}", out.content);
+}
+
+fn pid_of(out: &zero_hermes::agent::tool::ToolOutput) -> String {
+    out.content
+        .split("pid=")
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn session_is_reused_across_calls_and_respawns_after_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("die");
+    let reg = build_tool_registry_async(&cfg_with_marker(Some(&marker)), provider()).await;
+    let ctx = ToolContext::default();
+    let call = || reg.call("mcp_fake_echo_it", json!({}), &ctx);
+
+    let first = call().await.unwrap();
+    let second = call().await.unwrap();
+    assert!(!first.is_error && !second.is_error, "{first:?} {second:?}");
+    assert_eq!(pid_of(&first), pid_of(&second), "process must be reused");
+
+    // The server dies while idle: the next call heals on a fresh process.
+    std::fs::write(&marker, "x").unwrap();
+    let third = call().await.unwrap();
+    assert!(!third.is_error, "{}", third.content);
+    assert_ne!(pid_of(&third), pid_of(&first), "process must be respawned");
 }
 
 #[tokio::test]

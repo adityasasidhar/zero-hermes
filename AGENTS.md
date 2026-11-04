@@ -219,7 +219,8 @@ src/
                        sub-agent snapshot; the sync build_tool_registry (used
                        by `tools` and tests) never spawns servers. A server
                        that fails discovery is skipped with a warning.
-                       Stateless: one process spawn per call.
+                       One persistent McpSession per server (handshake once,
+                       log noise/notifications skipped, respawn on death).
   agent/
     mod.rs             the loop: agent::run + agent::run_stream + dispatch_tool
                        + RunLimits (max_iterations + context_window)
