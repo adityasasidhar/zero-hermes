@@ -241,6 +241,39 @@ pub fn repair_history_after_failure(history: &mut Vec<Message>) -> bool {
     true
 }
 
+/// Remove the most recent user turn and everything after it (the assistant
+/// reply, any tool traffic), returning that turn's text.
+///
+/// This is the engine behind the chat `/undo` and `/retry` commands. It cuts
+/// only at a plain user message — never at a `tool_result` carrier — so the
+/// remaining transcript keeps every `tool_use` paired with its result.
+pub fn pop_last_turn(history: &mut Vec<Message>) -> Option<String> {
+    let idx = history.iter().rposition(|m| {
+        m.role == "user"
+            && !m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    })?;
+    let text = history[idx].text();
+    history.truncate(idx);
+    Some(text)
+}
+
+/// Summarize older history now (the chat `/compress` command), targeting half
+/// of the current size. Returns `(tokens_before, tokens_after)` when history
+/// shrank, `None` when there was nothing safe to compact.
+pub fn compress_history(history: &mut Vec<Message>) -> Option<(usize, usize)> {
+    let before = context::estimate_tokens(history);
+    if before < 64 {
+        return None;
+    }
+    if !context::compact_history_to_tokens(history, before / 2) {
+        return None;
+    }
+    Some((before, context::estimate_tokens(history)))
+}
+
 /// Default number of messages retained before compaction kicks in.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 50;
 /// Default approximate token budget retained before history is summarized.
@@ -570,6 +603,44 @@ pub fn make_context_with_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pop_last_turn_cuts_at_the_last_plain_user_message() {
+        let mut h = vec![
+            Message::user("first"),
+            Message::assistant_text("a1"),
+            Message::user("second"),
+            Message::assistant(vec![ContentBlock::ToolUse(ToolCall {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            })]),
+            Message::tool_results(vec![ToolResult::ok("t1", "out")]),
+            Message::assistant_text("a2"),
+        ];
+        assert_eq!(pop_last_turn(&mut h).as_deref(), Some("second"));
+        assert_eq!(h.len(), 2, "tool traffic of the turn goes with it");
+        assert_eq!(pop_last_turn(&mut h).as_deref(), Some("first"));
+        assert!(h.is_empty());
+        assert_eq!(pop_last_turn(&mut h), None);
+    }
+
+    #[test]
+    fn compress_history_shrinks_big_transcripts_and_declines_tiny_ones() {
+        let mut tiny = vec![Message::user("hi")];
+        assert!(compress_history(&mut tiny).is_none());
+        let mut big = Vec::new();
+        for i in 0..20 {
+            big.push(Message::user(format!("question {i} {}", "x".repeat(400))));
+            big.push(Message::assistant_text(format!(
+                "answer {i} {}",
+                "y".repeat(400)
+            )));
+        }
+        let (before, after) = compress_history(&mut big).expect("should compress");
+        assert!(after < before, "{after} !< {before}");
+        assert_eq!(big[0].role, "user", "history still starts with a user turn");
+    }
 
     #[test]
     fn strips_complete_think_blocks() {

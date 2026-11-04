@@ -74,7 +74,8 @@ Subcommands (see the `Command` enum in `src/main.rs`):
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `gateway`        | Telegram long-poll + agent loop + cron scheduler                                                                             |
 | `run "msg"`      | one agent turn against the configured provider, then exit                                                                    |
-| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/exit`) |
+| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/retry`, `/undo`, `/compress`, `/exit`) |
+| `doctor`         | static health checks (config, memory, skills, MCP, Telegram, guard); exits non-zero on FAIL |
 | `curate`         | one skill-curator agent turn (`skills::curator_prompt`): merge overlaps, fix stale skills, `skill archive` redundant ones |
 | `cron list`      | print configured jobs and next firing time                                                                                   |
 | `cron check E`   | parse a 5-field cron expr and print next firing                                                                              |

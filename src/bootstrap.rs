@@ -475,6 +475,125 @@ pub fn skills_dir(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("skills"))
 }
 
+/// Severity of one [`doctor_report`] line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorLevel {
+    /// Working as configured.
+    Ok,
+    /// Works, but probably not what the operator wants.
+    Warn,
+    /// Will not work until fixed.
+    Fail,
+}
+
+/// Static health checks behind `zero-hermes doctor` (the analogue of
+/// `hermes doctor`). No network I/O: it inspects configuration, the local
+/// filesystem and the memory database, and says what is missing.
+pub fn doctor_report(cfg: &Config, mock: bool) -> Vec<(DoctorLevel, String)> {
+    use DoctorLevel::{Fail, Ok, Warn};
+    let mut out: Vec<(DoctorLevel, String)> = Vec::new();
+
+    if mock {
+        out.push((Ok, "provider: mock (no network)".into()));
+    } else if cfg.provider.api_key.trim().is_empty() {
+        out.push((
+            Fail,
+            "provider: api_key is empty (set [provider].api_key or ${ENV_VAR})".into(),
+        ));
+    } else {
+        out.push((
+            Ok,
+            format!(
+                "provider: {:?} model {} at {}",
+                cfg.provider.kind, cfg.provider.model, cfg.provider.base_url
+            ),
+        ));
+    }
+    if !cfg.provider.fallbacks.is_empty() {
+        out.push((
+            Ok,
+            format!("provider fallbacks: {}", cfg.provider.fallbacks.len()),
+        ));
+    }
+
+    match crate::memory::Memory::open(cfg.memory.path.as_deref()) {
+        std::result::Result::Ok(_) => out.push((
+            Ok,
+            match &cfg.memory.path {
+                Some(p) => format!("memory: sqlite opens at {}", p.display()),
+                None => "memory: in-memory only (nothing survives a restart)".into(),
+            },
+        )),
+        Err(e) => out.push((Fail, format!("memory: cannot open database: {e}"))),
+    }
+
+    let root = skills_dir(cfg);
+    match SkillRegistry::load_dir(&root) {
+        std::result::Result::Ok(reg) if reg.names().is_empty() => {
+            out.push((Warn, format!("skills: none found under {}", root.display())))
+        }
+        std::result::Result::Ok(reg) => out.push((
+            Ok,
+            format!("skills: {} under {}", reg.names().len(), root.display()),
+        )),
+        Err(e) => out.push((Fail, format!("skills: {} unreadable: {e}", root.display()))),
+    }
+
+    let sh = std::path::Path::new("/bin/sh");
+    out.push(if sh.exists() {
+        (Ok, "shell: /bin/sh present".into())
+    } else {
+        (
+            Fail,
+            "shell: /bin/sh missing (bash/execute_* tools cannot run)".into(),
+        )
+    });
+    out.push(if cfg.agent.command_guard {
+        (Ok, "command guard: on".into())
+    } else {
+        (
+            Warn,
+            "command guard: OFF ([agent].command_guard = false)".into(),
+        )
+    });
+
+    for name in cfg.mcp.server_names() {
+        let srv = &cfg.mcp.servers[&name];
+        out.push(match (&srv.url, srv.command.trim().is_empty()) {
+            (Some(u), _) => (Ok, format!("mcp {name}: http {u}")),
+            (None, false) => (Ok, format!("mcp {name}: stdio `{}`", srv.command)),
+            (None, true) => (Fail, format!("mcp {name}: neither `url` nor `command` set")),
+        });
+    }
+
+    if !cfg.telegram.token.trim().is_empty() {
+        out.push(
+            if cfg.telegram.allowed_chats.is_empty() && !cfg.telegram.allow_all_chats {
+                (
+                    Fail,
+                    "telegram: token set but allowed_chats is empty (gateway will refuse to start)"
+                        .into(),
+                )
+            } else if cfg.telegram.allow_all_chats {
+                (
+                    Warn,
+                    "telegram: allow_all_chats = true — anyone who finds the bot gets a shell"
+                        .into(),
+                )
+            } else {
+                (
+                    Ok,
+                    format!(
+                        "telegram: {} allowed chat(s)",
+                        cfg.telegram.allowed_chats.len()
+                    ),
+                )
+            },
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

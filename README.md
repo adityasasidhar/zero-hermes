@@ -274,7 +274,9 @@ Cron jobs are configured in TOML and run in the gateway process:
 | Local web UI | `zero-hermes web --bind 127.0.0.1:8088` | Browser chat with SSE streaming |
 | Cron tools | `zero-hermes cron list` | Inspect configured automation |
 
-Terminal chat supports `/help`, `/status`, `/tools`, `/clear`, and `/exit`.
+Terminal chat supports `/help`, `/status`, `/tools`, `/clear`, `/retry`,
+`/undo`, `/compress`, and `/exit`. `zero-hermes doctor` checks your setup. See
+[PARITY.md](PARITY.md) for how this compares with Hermes Agent.
 `repl` remains an alias for `chat`.
 
 ## Security

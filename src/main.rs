@@ -135,6 +135,8 @@ enum Command {
         #[arg(long)]
         no_banner: bool,
     },
+    /// Check configuration, memory, skills and safety settings (no network).
+    Doctor,
     /// Run one skill-curator turn: review the skill library, merge overlaps,
     /// fix stale entries and archive redundant skills (reversible).
     Curate,
@@ -205,6 +207,25 @@ async fn main() -> Result<()> {
             CronAction::List => cron_list(&cfg),
             CronAction::Check { expr } => cron_check(&expr),
         },
+        Command::Doctor => {
+            use zero_hermes::bootstrap::DoctorLevel;
+            let mut failed = false;
+            for (level, line) in zero_hermes::bootstrap::doctor_report(&cfg, cli.mock) {
+                let tag = match level {
+                    DoctorLevel::Ok => "ok  ",
+                    DoctorLevel::Warn => "warn",
+                    DoctorLevel::Fail => {
+                        failed = true;
+                        "FAIL"
+                    }
+                };
+                println!("[{tag}] {line}");
+            }
+            if failed {
+                anyhow::bail!("doctor found problems");
+            }
+            Ok(())
+        }
         Command::Curate => {
             let skills = load_skills(&cfg);
             let root = zero_hermes::bootstrap::skills_dir(&cfg);
@@ -325,21 +346,57 @@ async fn run_chat(cfg: Config, mock: bool, no_banner: bool) -> Result<()> {
     if interactive && !no_banner {
         print_chat_banner(&cfg, mock, registry.names().len());
     }
+    // A `/retry` re-submits the popped turn without waiting on stdin.
+    let mut pending: Option<String> = None;
     loop {
-        print!("you › ");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        buf.clear();
-        let n = stdin.read_line(&mut buf)?;
-        if n == 0 {
-            println!();
-            break;
+        let retried = pending.take();
+        if let Some(text) = &retried {
+            println!("you › {text}");
+        } else {
+            print!("you › ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            buf.clear();
+            let n = stdin.read_line(&mut buf)?;
+            if n == 0 {
+                println!();
+                break;
+            }
         }
-        let line = buf.trim();
+        let line = retried.as_deref().unwrap_or_else(|| buf.trim());
         if line.is_empty() {
             continue;
         }
         match line {
+            "/undo" | "/retry" => {
+                let retry = line == "/retry";
+                match zero_hermes::agent::pop_last_turn(&mut history) {
+                    Some(text) => {
+                        if let Err(e) = memory.save_history(session_id, &history) {
+                            tracing::warn!(error = %e, "saving history after undo failed");
+                        }
+                        if retry {
+                            pending = Some(text);
+                        } else {
+                            println!("  removed the last turn");
+                        }
+                    }
+                    None => println!("  nothing to {}", &line[1..]),
+                }
+                continue;
+            }
+            "/compress" => {
+                match zero_hermes::agent::compress_history(&mut history) {
+                    Some((before, after)) => {
+                        if let Err(e) = memory.save_history(session_id, &history) {
+                            tracing::warn!(error = %e, "saving compressed history failed");
+                        }
+                        println!("  compressed history: ~{before} -> ~{after} tokens");
+                    }
+                    None => println!("  nothing to compress yet"),
+                }
+                continue;
+            }
             "/exit" | "/quit" | "/q" => {
                 if interactive {
                     println!("\nbye");
@@ -478,6 +535,9 @@ fn print_chat_help() {
     println!("  /status     show model, tool, and session details");
     println!("  /tools      list available tools");
     println!("  /clear      reset this chat's conversation history");
+    println!("  /retry      re-run your last message");
+    println!("  /undo       remove your last message and the reply");
+    println!("  /compress   summarize older history to free context");
     println!("  /exit       leave chat (aliases: /quit, /q)");
 }
 

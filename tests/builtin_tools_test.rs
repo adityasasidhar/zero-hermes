@@ -558,8 +558,16 @@ async fn fetch_blocks_host_encoding_evasions_of_loopback() {
     // Positive control: the test seam reaches the server through every one of
     // these spellings, so the addresses really are loopback and the negative
     // assertions below are not vacuous.
+    //
+    // The IPv6 spellings can only be reached on a host with IPv6 loopback
+    // (some containers have none); there the control is skipped, but the
+    // refusal assertions below still run for every spelling.
+    let has_ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
     let permissive = zero_hermes::tools::builtin::FetchTool::with_private_allowed();
     for template in EVASIONS {
+        if template.contains('[') && !has_ipv6 {
+            continue;
+        }
         let url = template.replace("{p}", &port);
         let out = call(&permissive, json!({"url": url}), &ToolContext::default()).await;
         assert!(

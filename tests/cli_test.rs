@@ -760,3 +760,59 @@ async fn web_ui_serves_health_and_enforces_csrf_over_a_real_socket() {
 
     guard.kill();
 }
+
+/// `/undo` and `/retry` must work against the real binary: `/retry` re-submits
+/// the previous message (the echo mock proves it ran twice) and `/undo` drops
+/// the turn from the durable transcript.
+#[test]
+fn chat_retry_and_undo_commands() {
+    use std::io::Write;
+
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["chat", "--mock", "--no-banner"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chat");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"hello there\n/retry\n/undo\n/undo\n/compress\n/exit\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.matches("you › hello there").count(),
+        1,
+        "retry echoes the resubmitted message: {text}"
+    );
+    assert_eq!(
+        text.matches("(mock) ok").count(),
+        2,
+        "original + retried turn each get a reply: {text}"
+    );
+    assert!(text.contains("removed the last turn"), "{text}");
+    assert!(text.contains("nothing to undo"), "{text}");
+    assert!(text.contains("nothing to compress yet"), "{text}");
+}
+
+/// `doctor` exits 0 with `--mock`, and fails (non-zero, naming the problem)
+/// when a real provider is selected without an API key.
+#[test]
+fn doctor_reports_missing_api_key_and_passes_in_mock_mode() {
+    let sb = Sandbox::new();
+    let ok = sb.run(&["doctor", "--mock"]);
+    assert!(ok.status.success(), "{ok:?}");
+    let text = String::from_utf8_lossy(&ok.stdout);
+    assert!(text.contains("[ok  ] provider: mock"), "{text}");
+    assert!(text.contains("command guard: on"), "{text}");
+
+    let bad = sb.run(&["doctor"]);
+    assert!(!bad.status.success());
+    let text = String::from_utf8_lossy(&bad.stdout);
+    assert!(text.contains("[FAIL] provider: api_key is empty"), "{text}");
+}
