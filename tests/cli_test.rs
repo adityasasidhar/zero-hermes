@@ -868,3 +868,26 @@ fn gateway_refuses_an_open_matrix_bot() {
     assert_ne!(code(&doc), 0);
     assert!(stdout(&doc).contains("[FAIL] matrix:"), "{}", stdout(&doc));
 }
+
+/// `tools | head` must exit quietly (killed by SIGPIPE like any Unix tool),
+/// not panic with a backtrace on the closed pipe.
+#[cfg(unix)]
+#[test]
+fn print_commands_do_not_panic_on_a_closed_pipe() {
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["tools", "--mock"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tools");
+    // Close the read end before the child prints anything.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("panicked"),
+        "closed pipe must not panic: {err}"
+    );
+    assert!(!err.contains("Broken pipe"), "{err}");
+}

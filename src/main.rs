@@ -200,6 +200,23 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("zero_hermes.toml"));
     let cfg = zero_hermes::config::load(&cfg_path).context("loading config")?;
 
+    // Short-lived "print something" commands should die quietly on a closed
+    // pipe (`zero-hermes tools | head`) like any Unix tool. Rust ignores
+    // SIGPIPE by default, which turns that into a `println!` panic — and a
+    // panic aborts under our release profile. Daemons keep the default
+    // (ignored) disposition: a write to a dead socket must be an error, not
+    // a process kill.
+    if matches!(
+        cli.command,
+        Command::Tools
+            | Command::ShowConfig
+            | Command::Doctor
+            | Command::Cron { .. }
+            | Command::InitConfig { .. }
+    ) {
+        restore_default_sigpipe();
+    }
+
     match cli.command {
         Command::Gateway => run_gateway(cfg, cli.mock).await,
         Command::Run { message } => run_once(cfg, &message, cli.mock, cli.stream).await,
@@ -252,6 +269,19 @@ fn init_tracing() {
         .with_target(false)
         .try_init();
 }
+
+/// Restore the default SIGPIPE action (terminate quietly) on Unix.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` with `SIG_DFL` only changes this process's disposition
+    // for SIGPIPE; no handler or shared state is involved.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 async fn run_once(cfg: Config, message: &str, mock: bool, stream: bool) -> Result<()> {
     let skills = load_skills(&cfg);
