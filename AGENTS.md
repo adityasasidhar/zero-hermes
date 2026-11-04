@@ -371,10 +371,13 @@ parent registry, they automatically become available to sub-agents.
   local server — without that seam the HTML path is untestable, since every
   local server is blocked. Redirects are disabled outright
   (`redirect::Policy::none()`), so a 302 to `169.254.169.254` cannot slip
-  past the initial-URL check. **What is still not covered:** no DNS
-  resolution happens, so a *name* that resolves to a private address gets
-  through — closing that needs resolving and re-checking the result, or
-  pinning the connection to the checked address.
+  past the initial-URL check. **DNS:** name hosts are resolved by `resolve_pinned_client`; the
+  request is refused if *any* answer is blocked (`ip_is_blocked`: private,
+  loopback, link-local, CGNAT, ULA, mapped IPv6) and the connection is pinned
+  to the vetted answers (`resolve_to_addrs`), so a rebinding second lookup
+  cannot differ. **What is still not covered:** behind an HTTP proxy
+  (`HTTPS_PROXY` etc.) the proxy resolves names, so a failed local lookup is
+  allowed through; the proxy's own policy is then the only guard.
 - Don't add heavy deps (no `axum`-style web stack beyond what's there,
   no `sqlx`, `bson`, `prost`). The brief is explicit about this.
 - `.hermes/environment.json` is for the Lemma recipe system; leave it

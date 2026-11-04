@@ -22,7 +22,7 @@ for platform sprawl (see *Out of scope*). It is not a drop-in replacement.
 | Context compression | **yes** | pair-safe compaction + token-budget summary; `/compress` on demand (extractive, not LLM-written) |
 | Skills (agentskills-style `SKILL.md`) | **yes** | recursive loader, create/patch/archive, hub sync, `curate` command |
 | Self-improving skills | partial | model can write/patch skills; `curate` reviews the library on demand or via cron |
-| Command approval / security | partial | no interactive approval (headless daemon). Instead: command guard refuses catastrophic commands, SSRF guard on fetch, CSRF on web, Telegram allow-list required, tools allow-list |
+| Command approval / security | partial | no interactive approval (headless daemon). Instead: command guard refuses catastrophic commands, SSRF guard on fetch (spelling checks + DNS resolution vetting with connection pinning), CSRF on web, Telegram allow-list required, tools allow-list |
 | Cron with delivery | **yes** | 5-field cron, timezone, delivery to Telegram chats |
 | Subagents | **yes** | up to 4 concurrent, isolated, cannot recurse |
 | Messaging gateway | partial | Telegram only (Hermes: Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant) |
@@ -45,4 +45,3 @@ matters at multi-user scale.
 1. LLM-written compression and recall summaries (needs a background provider call).
 2. Runtime `/model` switching.
 3. A second gateway (Discord or Slack) behind the existing `Channel` trait.
-4. DNS-resolving SSRF guard (a hostname that resolves to a private address still passes).
