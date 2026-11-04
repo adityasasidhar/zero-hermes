@@ -45,6 +45,7 @@ fn cfg_with_marker(marker: Option<&std::path::Path>) -> Config {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), FAKE_SERVER.to_string()],
             env,
+            ..Default::default()
         },
     );
     // A broken server must not take the registry down.
@@ -54,6 +55,7 @@ fn cfg_with_marker(marker: Option<&std::path::Path>) -> Config {
             command: "/nonexistent/binary".to_string(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     cfg

@@ -175,12 +175,25 @@ impl Default for ProviderConfig {
 /// [mcp.servers.filesystem]
 /// command = "npx"
 /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+///
+/// [mcp.servers.remote]
+/// url = "https://mcp.example.com/mcp"
+/// headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Binary to spawn (resolved via `PATH` when relative).
+    /// Binary to spawn (resolved via `PATH` when relative). Ignored when
+    /// `url` is set.
     #[serde(default)]
     pub command: String,
+    /// Streamable-HTTP endpoint of a remote MCP server. When set, the server
+    /// is reached over HTTP(S) instead of a spawned process.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra request headers for `url` servers (e.g. `Authorization`).
+    /// `$VAR` / `${VAR}` are expanded from the environment.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
     /// Arguments passed to `command`.
     #[serde(default)]
     pub args: Vec<String>,
@@ -463,6 +476,14 @@ impl Config {
         self.telegram.token = expand_env_vars(&self.telegram.token);
         if let Some(url) = &self.skills_hub_url {
             self.skills_hub_url = Some(expand_env_vars(url));
+        }
+        for server in self.mcp.servers.values_mut() {
+            if let Some(url) = &server.url {
+                server.url = Some(expand_env_vars(url));
+            }
+            for value in server.headers.values_mut().chain(server.env.values_mut()) {
+                *value = expand_env_vars(value);
+            }
         }
     }
 }

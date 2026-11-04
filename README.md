@@ -56,7 +56,10 @@ Telegram / terminal / browser
   summaries.
 
 MCP stdio servers configured under `[mcp.servers.<name>]` are discovered at
-startup and exposed as `mcp_<server>_<tool>` tools (also to subagents).
+startup and exposed as `mcp_<server>_<tool>` tools (also to subagents). A
+server is either a local process (`command`/`args`/`env`, kept alive and
+respawned on failure) or a remote streamable-HTTP endpoint (`url` plus optional
+`headers` such as `Authorization = "Bearer ${MCP_TOKEN}"`).
 
 The built-in tools are `bash`, `read`, `write`, `fetch`, `memory`, `skill`,
 and `subagent`. An empty `enabled_tools` list enables them all.

@@ -221,6 +221,8 @@ src/
                        that fails discovery is skipped with a warning.
                        One persistent McpSession per server (handshake once,
                        log noise/notifications skipped, respawn on death).
+                       `url` servers use streamable HTTP (JSON or SSE replies,
+                       Mcp-Session-Id, re-handshake on failure).
   agent/
     mod.rs             the loop: agent::run + agent::run_stream + dispatch_tool
                        + RunLimits (max_iterations + context_window)

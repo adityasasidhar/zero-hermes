@@ -76,7 +76,15 @@ struct Live {
     stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
 }
 
-/// A persistent stdio session with one MCP server.
+/// Connection state for a streamable-HTTP server.
+#[derive(Default)]
+struct HttpState {
+    client: Option<reqwest::Client>,
+    session_id: Option<String>,
+    ready: bool,
+}
+
+/// A persistent session with one MCP server, over stdio or streamable HTTP.
 ///
 /// The process is spawned lazily, handshaken once (`initialize` +
 /// `notifications/initialized`) and reused for every later request, so a slow
@@ -86,6 +94,7 @@ struct Live {
 pub struct McpSession {
     cfg: McpServerConfig,
     live: tokio::sync::Mutex<Option<Live>>,
+    http: tokio::sync::Mutex<HttpState>,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -95,6 +104,7 @@ impl McpSession {
         std::sync::Arc::new(Self {
             cfg,
             live: tokio::sync::Mutex::new(None),
+            http: tokio::sync::Mutex::new(HttpState::default()),
             next_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -153,6 +163,9 @@ impl McpSession {
     /// needed. A request that fails on a *reused* process is retried once on
     /// a fresh one, since the likeliest cause is a server that died idle.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if self.cfg.url.is_some() {
+            return self.request_http(method, params).await;
+        }
         let timeout = if method == "tools/call" {
             MCP_CALL_TIMEOUT
         } else {
@@ -184,6 +197,67 @@ impl McpSession {
         anyhow::bail!("mcp request failed")
     }
 
+    /// Streamable-HTTP flavour of [`Self::request`]: POST JSON-RPC, accept a
+    /// JSON body or an SSE-framed one, carry `Mcp-Session-Id`, and redo the
+    /// handshake if the server forgot the session.
+    async fn request_http(&self, method: &str, params: Value) -> Result<Value> {
+        let timeout = if method == "tools/call" {
+            MCP_CALL_TIMEOUT
+        } else {
+            MCP_INIT_TIMEOUT
+        };
+        let mut st = self.http.lock().await;
+        for attempt in 0..2 {
+            let was_ready = st.ready;
+            if !st.ready {
+                let init = self.fresh_id();
+                http_send(
+                    &self.cfg,
+                    &mut st,
+                    Some(init),
+                    "initialize",
+                    init_params(),
+                    MCP_INIT_TIMEOUT,
+                )
+                .await?;
+                http_send(
+                    &self.cfg,
+                    &mut st,
+                    None,
+                    "notifications/initialized",
+                    json!({}),
+                    MCP_INIT_TIMEOUT,
+                )
+                .await?;
+                st.ready = true;
+            }
+            let id = self.fresh_id();
+            match http_send(
+                &self.cfg,
+                &mut st,
+                Some(id),
+                method,
+                params.clone(),
+                timeout,
+            )
+            .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let protocol_error = e.to_string().starts_with("mcp error:");
+                    if !protocol_error {
+                        st.ready = false;
+                        st.session_id = None;
+                    }
+                    if protocol_error || !was_ready || attempt == 1 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("mcp request failed")
+    }
+
     /// `tools/list`.
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
         let result = self.request("tools/list", json!({})).await?;
@@ -201,6 +275,123 @@ impl McpSession {
         }
         Ok(text)
     }
+}
+
+/// One streamable-HTTP POST. `id: None` sends a notification (no reply read).
+async fn http_send(
+    cfg: &McpServerConfig,
+    st: &mut HttpState,
+    id: Option<u64>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let Some(url) = cfg.url.as_deref() else {
+        anyhow::bail!("mcp server has no url");
+    };
+    if st.client.is_none() {
+        st.client = Some(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|e| anyhow::anyhow!("mcp http client: {e}"))?,
+        );
+    }
+    let Some(client) = st.client.clone() else {
+        anyhow::bail!("mcp http client unavailable");
+    };
+    let body = match id {
+        Some(id) => json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        None => json!({"jsonrpc": "2.0", "method": method, "params": params}),
+    };
+    let mut req = client
+        .post(url)
+        .header("accept", "application/json, text/event-stream")
+        .json(&body);
+    for (k, v) in &cfg.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(sid) = &st.session_id {
+        req = req.header("mcp-session-id", sid.as_str());
+    }
+    let exchange = async {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp http request: {e}"))?;
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            st.session_id = Some(sid.to_string());
+        }
+        let status = resp.status();
+        let is_sse = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains("text/event-stream"));
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp http body: {e}"))?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "mcp http {status}: {}",
+                crate::util::truncate_bytes(&text, 256)
+            );
+        }
+        let Some(id) = id else {
+            return Ok(Value::Null);
+        };
+        let candidates: Vec<String> = if is_sse {
+            sse_data_events(&text)
+        } else {
+            vec![text]
+        };
+        for c in candidates {
+            let Ok(v) = serde_json::from_str::<Value>(c.trim()) else {
+                continue;
+            };
+            let items = match v {
+                Value::Array(a) => a,
+                other => vec![other],
+            };
+            for item in items {
+                if item.get("id").and_then(Value::as_u64) == Some(id)
+                    && item.get("method").is_none()
+                {
+                    return decode_response_line(&item.to_string());
+                }
+            }
+        }
+        anyhow::bail!("mcp http response had no reply for request {id}")
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("mcp {method} timed out after {}s", timeout.as_secs()),
+    }
+}
+
+/// Join the `data:` lines of each blank-line-delimited SSE event.
+fn sse_data_events(body: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                events.push(cur.join("\n"));
+                cur.clear();
+            }
+        } else if let Some(d) = line.strip_prefix("data:") {
+            cur.push(d.strip_prefix(' ').unwrap_or(d));
+        }
+    }
+    if !cur.is_empty() {
+        events.push(cur.join("\n"));
+    }
+    events
 }
 
 /// Write one request and read lines until the response with the same id,
@@ -449,6 +640,23 @@ mod tests {
         assert_eq!(mcp_tool_names(&cfg.mcp), vec!["filesystem".to_string()]);
         assert!(!McpConfig::default().is_configured());
         assert!(mcp_tool_names(&McpConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn http_server_config_parses_and_expands_env() {
+        std::env::set_var("ZH_MCP_TEST_TOKEN", "tok");
+        let raw = "[mcp.servers.r]\nurl = \"https://h/mcp\"\nheaders = { Authorization = \"Bearer ${ZH_MCP_TEST_TOKEN}\" }\n";
+        let mut cfg: crate::config::Config = toml::from_str(raw).unwrap();
+        cfg.expand_env();
+        let srv = &cfg.mcp.servers["r"];
+        assert_eq!(srv.url.as_deref(), Some("https://h/mcp"));
+        assert_eq!(srv.headers["Authorization"], "Bearer tok");
+    }
+
+    #[test]
+    fn sse_events_join_data_lines() {
+        let body = "event: message\ndata: {\"a\":\ndata: 1}\n\ndata: {\"b\":2}\n\n";
+        assert_eq!(sse_data_events(body), vec!["{\"a\":\n1}", "{\"b\":2}"]);
     }
 
     #[tokio::test]
