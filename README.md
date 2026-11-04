@@ -174,6 +174,8 @@ context_window = 50
 context_tokens = 24000
 # Empty means every built-in tool. Restrict this for a narrower agent.
 enabled_tools = []
+command_guard = true
+blocked_commands = []
 
 [telegram]
 token = "${TELEGRAM_BOT_TOKEN}"
@@ -267,6 +269,11 @@ Treat zero-hermes as an agent with shell access. A message that reaches its
   unless `allow_all_chats = true` is explicitly set.
 - The web UI uses a per-process CSRF token. Keep it bound to loopback unless
   you put it behind your own authenticated reverse proxy.
+- A command guard (`[agent].command_guard`, on by default) refuses catastrophic
+  shell commands — `rm -rf /`, `mkfs`, `dd of=/dev/…`, `curl | sh`, shutdown,
+  fork bombs — in `bash`, `execute_command` and `execute_code`, and tells the
+  model why. Add your own with `[agent].blocked_commands = ["drop table"]`.
+  It is a seatbelt, not a sandbox.
 - Restrict `[agent].enabled_tools` when you do not need shell or write access.
 - Run it as a dedicated unprivileged Linux user. Do not give that user sudo,
   SSH keys, or access to files you would not want an agent to read.

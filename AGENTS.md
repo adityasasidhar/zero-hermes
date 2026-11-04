@@ -206,6 +206,11 @@ src/
                        lives in the lib so integration tests can reach it
   util.rs              truncate_bytes, expand_tilde, chunk_text, random_hex,
                        load_dotenv, expand_env_vars
+  guard.rs             CommandGuard + GuardedTool decorator: refuses catastrophic
+                       shell commands (rm -rf /, mkfs, dd of=/dev, curl|sh, power
+                       commands, fork bombs). bootstrap wraps bash /
+                       execute_command / execute_code; [agent].command_guard
+                       (default true) and [agent].blocked_commands configure it
   mcp.rs               MCP stdio client (JSON-RPC 2.0 initialize / tools/list /
                        tools/call). McpTool wraps a remote tool as
                        mcp_<server>_<tool>. Discovery is async, so

@@ -191,6 +191,22 @@ pub async fn build_tool_registry_async(
     build_registry_with_extra(cfg, provider, extra)
 }
 
+/// Wrap a shell-running tool in the [`crate::guard::CommandGuard`] unless the
+/// operator turned it off.
+fn guard_shell(
+    agent: &crate::config::AgentConfig,
+    tool: Arc<dyn crate::agent::tool::Tool>,
+) -> Arc<dyn crate::agent::tool::Tool> {
+    if agent.command_guard {
+        Arc::new(crate::guard::GuardedTool::new(
+            tool,
+            crate::guard::CommandGuard::new(&agent.blocked_commands),
+        ))
+    } else {
+        tool
+    }
+}
+
 fn build_registry_with_extra(
     cfg: &Config,
     provider: Arc<dyn LlmProvider>,
@@ -198,7 +214,10 @@ fn build_registry_with_extra(
 ) -> Arc<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     let skills_root = skills_dir(cfg);
-    reg.insert(Arc::new(BashTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(BashTool)),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert(Arc::new(ReadTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WriteTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(EditTool), &cfg.agent.enabled_tools);
@@ -214,8 +233,14 @@ fn build_registry_with_extra(
     reg.insert(Arc::new(TodoTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(AskTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(MessageTool), &cfg.agent.enabled_tools);
-    reg.insert(Arc::new(ExecuteCommandTool), &cfg.agent.enabled_tools);
-    reg.insert(Arc::new(ExecuteCodeTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(ExecuteCommandTool)),
+        &cfg.agent.enabled_tools,
+    );
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(ExecuteCodeTool)),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert(Arc::new(ReadFileTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WriteFileTool), &cfg.agent.enabled_tools);
     reg.insert(

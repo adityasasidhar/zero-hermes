@@ -70,3 +70,35 @@ async fn sync_registry_does_not_spawn_servers() {
     let reg = build_tool_registry(&cfg_with_fake_server(), provider());
     assert!(!reg.names().iter().any(|n| n.starts_with("mcp_")));
 }
+
+#[tokio::test]
+async fn shell_tools_refuse_catastrophic_commands_unless_guard_is_off() {
+    let ctx = ToolContext::default();
+    let guarded = build_tool_registry(&Config::default(), provider());
+    for tool in ["bash", "execute_command", "execute_code"] {
+        let out = guarded
+            .call(tool, json!({"command": "rm -rf /"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "{tool}: {}", out.content);
+        assert!(out.content.contains("command guard"), "{}", out.content);
+    }
+    let ok = guarded
+        .call("bash", json!({"command": "echo fine"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        !ok.is_error && ok.content.contains("fine"),
+        "{}",
+        ok.content
+    );
+
+    let mut cfg = Config::default();
+    cfg.agent.command_guard = false;
+    let open = build_tool_registry(&cfg, provider());
+    let out = open
+        .call("bash", json!({"command": "echo shutdown -h"}), &ctx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+}

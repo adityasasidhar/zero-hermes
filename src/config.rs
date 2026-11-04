@@ -308,6 +308,18 @@ pub struct AgentConfig {
     /// Allow-list of tool names; empty = all registered tools.
     #[serde(default)]
     pub enabled_tools: Vec<String>,
+    /// Refuse catastrophic shell commands (`rm -rf /`, `mkfs`, `dd of=/dev/…`,
+    /// `curl | sh`, shutdown, fork bombs…) in `bash` / `execute_command` /
+    /// `execute_code`. On by default; see `crate::guard`.
+    #[serde(default = "default_true")]
+    pub command_guard: bool,
+    /// Extra case-insensitive substrings the command guard must refuse.
+    #[serde(default)]
+    pub blocked_commands: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_iterations() -> usize {
@@ -329,6 +341,8 @@ impl Default for AgentConfig {
             context_window: default_context_window(),
             context_tokens: default_context_tokens(),
             enabled_tools: Vec::new(),
+            command_guard: true,
+            blocked_commands: Vec::new(),
         }
     }
 }
