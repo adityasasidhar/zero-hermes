@@ -17,7 +17,7 @@ read it before touching anything beyond a one-line change.
 ## Layout (top level)
 
 `src/` agent loop, providers, tools, channels, web; `tests/` integration
-tests; `skills/` vendored Hermes skill pack (loaded recursively); `web/`
+tests; `skills/` default skills root, shipped empty (loaded recursively); `web/`
 single-file UI embedded via `include_str!`; `assets/` logos; `bench/`
 size/cold-start/RSS script; `.github/workflows/` CI. Full map under
 [Architecture map](#architecture-map).
@@ -267,8 +267,8 @@ src/
                        /send requires the per-process CSRF token injected
                        into the page — a form POST needs no preflight, so
                        without it any site could drive the bash tool
-skills/                the vendored Hermes-compatible skill pack
-                       (~130 SKILL.md files); loaded recursively
+skills/                default skills root; ships empty (.gitkeep).
+                       Drop a Hermes skill pack in; loaded recursively
 web/index.html         single-file UI; embedded into the binary via include_str!
 assets/                zero_hermes_logo.png is the full-colour master (README
                        hero only); hermes-mark.png (192px) and
@@ -334,11 +334,13 @@ parent registry, they automatically become available to sub-agents.
 ## Constraints (worth preserving)
 
 - **No git push.** Local repo only; the user pushes manually.
-- `skills/` vendors the nested Hermes skill pack and is loaded recursively
-  (`tests/skills_test.rs` asserts every `SKILL.md` registers). Keep the
-  layout flat-or-nested as Hermes ships it, and prefer adding a skill
-  directory over changing the loader. The stub directories from v0.1
-  (`stub-1`, `stub-2`) were removed once the real pack landed.
+- `skills/` ships empty (only `.gitkeep`); the vendored Hermes pack was
+  removed in `b92058e`. Install skills by copying a pack in (upstream
+  `skills/` and `optional-skills/` from NousResearch/hermes-agent load
+  unmodified) or with `skill` `sync`. The loader is recursive and
+  `tests/skills_test.rs` asserts every `SKILL.md` in a nested tree registers.
+  Keep accepting the layout flat-or-nested as Hermes ships it, and prefer
+  adding a skill directory over changing the loader.
 - The Dockerfile's dep-cache stage must stub **every** target Cargo.toml
   declares (`src/main.rs`, `src/lib.rs`) plus every file pulled in by
   `include_str!`/`include_bytes!` — currently `web/index.html`,

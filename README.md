@@ -333,7 +333,7 @@ src/
   cron.rs      scheduler
   web.rs       small Axum + SSE local UI
   main.rs      CLI and runtime wiring
-skills/        local Hermes-compatible skill pack
+skills/        skills root (ships empty; drop a Hermes pack in)
 assets/        project branding
 ```
 
