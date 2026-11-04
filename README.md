@@ -55,6 +55,12 @@ Telegram / terminal / browser
 - Keep long conversations bounded with pair-safe trimming and token-budget
   summaries.
 
+MCP stdio servers configured under `[mcp.servers.<name>]` are discovered at
+startup and exposed as `mcp_<server>_<tool>` tools (also to subagents). A
+server is either a local process (`command`/`args`/`env`, kept alive and
+respawned on failure) or a remote streamable-HTTP endpoint (`url` plus optional
+`headers` such as `Authorization = "Bearer ${MCP_TOKEN}"`).
+
 The built-in tools are `bash`, `read`, `write`, `fetch`, `memory`, `skill`,
 and `subagent`. An empty `enabled_tools` list enables them all.
 
@@ -171,6 +177,11 @@ context_window = 50
 context_tokens = 24000
 # Empty means every built-in tool. Restrict this for a narrower agent.
 enabled_tools = []
+command_guard = true
+blocked_commands = []
+# Have the model write the summary when history exceeds context_tokens
+# (one extra provider call). Off by default.
+llm_compaction = false
 
 [telegram]
 token = "${TELEGRAM_BOT_TOKEN}"
@@ -228,6 +239,39 @@ an index of available skills and can use its `skill` tool to read one or save
 a new reusable procedure. This makes learned behavior inspectable and easy to
 edit or remove—there is no hidden training state.
 
+### Skill curator
+
+`zero-hermes curate` runs one agent turn that reviews the skill library, merges
+overlapping skills, repairs stale or vague ones and retires redundant skills
+with `skill` `archive`, which moves them to `<skills>/.archive/` rather than
+deleting them. Run it by hand or schedule it:
+
+```toml
+[[cron.jobs]]
+name = "curate-skills"
+schedule = "0 4 * * 0"
+prompt = "Run the skill curator: review every skill, merge near-duplicates, archive (never delete) redundant ones, and report what changed."
+```
+
+### Matrix gateway
+
+Besides Telegram, `zero-hermes gateway` can serve a Matrix account over plain
+HTTPS long-poll (no WebSocket stack, no new dependency). Like Telegram it must
+be told who to trust, because the agent has a shell:
+
+```toml
+[matrix]
+homeserver = "https://matrix.example.org"
+access_token = "${MATRIX_TOKEN}"
+allowed_rooms = ["!abc:example.org"]   # and/or allowed_users = ["@me:example.org"]
+```
+
+The bot auto-joins invites from an allowed user, ignores its own messages and
+the history it sees at startup, and `/new`, `/clear` and `/help` work as on
+Telegram. With no allow-list (and no `allow_all = true`) the gateway refuses to
+start. Cron results are delivered to the single allowed Telegram chat or, failing
+that, the single allowed Matrix room.
+
 ## Subagents and scheduled work
 
 The `subagent` tool runs a focused child agent with its own fresh history and
@@ -252,7 +296,9 @@ Cron jobs are configured in TOML and run in the gateway process:
 | Local web UI | `zero-hermes web --bind 127.0.0.1:8088` | Browser chat with SSE streaming |
 | Cron tools | `zero-hermes cron list` | Inspect configured automation |
 
-Terminal chat supports `/help`, `/status`, `/tools`, `/clear`, and `/exit`.
+Terminal chat supports `/help`, `/status`, `/tools`, `/clear`, `/retry`,
+`/undo`, `/compress` (model-written summary), `/model [name]`, and `/exit`. `zero-hermes doctor` checks your setup. See
+[PARITY.md](PARITY.md) for how this compares with Hermes Agent.
 `repl` remains an alias for `chat`.
 
 ## Security
@@ -264,6 +310,11 @@ Treat zero-hermes as an agent with shell access. A message that reaches its
   unless `allow_all_chats = true` is explicitly set.
 - The web UI uses a per-process CSRF token. Keep it bound to loopback unless
   you put it behind your own authenticated reverse proxy.
+- A command guard (`[agent].command_guard`, on by default) refuses catastrophic
+  shell commands — `rm -rf /`, `mkfs`, `dd of=/dev/…`, `curl | sh`, shutdown,
+  fork bombs — in `bash`, `execute_command` and `execute_code`, and tells the
+  model why. Add your own with `[agent].blocked_commands = ["drop table"]`.
+  It is a seatbelt, not a sandbox.
 - Restrict `[agent].enabled_tools` when you do not need shell or write access.
 - Run it as a dedicated unprivileged Linux user. Do not give that user sudo,
   SSH keys, or access to files you would not want an agent to read.
@@ -309,7 +360,7 @@ Useful smoke checks:
 ## Scope
 
 zero-hermes deliberately does not attempt to be the full Hermes Agent product:
-there is no desktop application, MCP client, multi-platform messaging layer,
+there is no desktop application, multi-platform messaging layer,
 voice stack, remote execution backend, approval UI, or semantic memory model.
 Those are worthwhile systems; this project optimizes for a compact agent you
 can understand, operate, and afford to leave on a Raspberry Pi.

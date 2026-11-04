@@ -163,9 +163,61 @@ pub fn append_recall_context(base: &str, recalled: &str) -> String {
 /// are registered the same way so vendored Hermes skills find the names
 /// they reference.
 pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<ToolRegistry> {
+    build_registry_with_extra(cfg, provider, Vec::new())
+}
+
+/// Like [`build_tool_registry`], but first discovers tools on every configured
+/// MCP stdio server and registers them as `mcp_<server>_<tool>`.
+///
+/// Discovery spawns one process per server and is async, so only async entry
+/// points (chat, run, web, gateway) call this; the sync builder stays for
+/// `tools`-style diagnostics and tests. A server that fails discovery is
+/// skipped with a warning. MCP tools are registered unconditionally (an
+/// explicit `[mcp.servers.*]` entry is the opt-in) and, being inserted before
+/// the sub-agent snapshot, are available to sub-agents too.
+pub async fn build_tool_registry_async(
+    cfg: &Config,
+    provider: Arc<dyn LlmProvider>,
+) -> Arc<ToolRegistry> {
+    let extra: Vec<Arc<dyn crate::agent::tool::Tool>> = if cfg.mcp.is_configured() {
+        crate::mcp::build_mcp_tools(&cfg.mcp)
+            .await
+            .into_iter()
+            .map(|t| Arc::new(t) as Arc<dyn crate::agent::tool::Tool>)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    build_registry_with_extra(cfg, provider, extra)
+}
+
+/// Wrap a shell-running tool in the [`crate::guard::CommandGuard`] unless the
+/// operator turned it off.
+fn guard_shell(
+    agent: &crate::config::AgentConfig,
+    tool: Arc<dyn crate::agent::tool::Tool>,
+) -> Arc<dyn crate::agent::tool::Tool> {
+    if agent.command_guard {
+        Arc::new(crate::guard::GuardedTool::new(
+            tool,
+            crate::guard::CommandGuard::new(&agent.blocked_commands),
+        ))
+    } else {
+        tool
+    }
+}
+
+fn build_registry_with_extra(
+    cfg: &Config,
+    provider: Arc<dyn LlmProvider>,
+    extra: Vec<Arc<dyn crate::agent::tool::Tool>>,
+) -> Arc<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     let skills_root = skills_dir(cfg);
-    reg.insert(Arc::new(BashTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(BashTool)),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert(Arc::new(ReadTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WriteTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(EditTool), &cfg.agent.enabled_tools);
@@ -181,8 +233,14 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     reg.insert(Arc::new(TodoTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(AskTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(MessageTool), &cfg.agent.enabled_tools);
-    reg.insert(Arc::new(ExecuteCommandTool), &cfg.agent.enabled_tools);
-    reg.insert(Arc::new(ExecuteCodeTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(ExecuteCommandTool)),
+        &cfg.agent.enabled_tools,
+    );
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(ExecuteCodeTool)),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert(Arc::new(ReadFileTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WriteFileTool), &cfg.agent.enabled_tools);
     reg.insert(
@@ -203,20 +261,15 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     // borrow problem and means sub-agents see the parent's tools without
     // being able to recurse (we strip `subagent` itself in the tool).
     //
-    // MCP: `mcp::build_mcp_tools` discovery is async (spawns stdio servers)
-    // and this constructor is sync, so no `mcp_*` tools are registered here
-    // and none are advertised in `tools list` until async wiring lands.
-    // `McpConfig::is_configured()` + `mcp::mcp_tool_names(&cfg.mcp)` report
-    // configured server names for prompt diagnostics only. See `src/mcp.rs`.
-    // TODO(wave-e): wire MCP tools here via `mcp::list_remote_tools` +
-    // `mcp::build_mcp_tools_from_list` + `insert_always`. Left out
-    // deliberately: discovery is async (spawns stdio servers) and the
-    // registry shape is Wave D territory — merging a sync constructor
-    // now would conflict. See `src/mcp.rs`.
-    if cfg.mcp.is_configured() {
-        tracing::warn!(
+    // MCP tools (discovered by `build_tool_registry_async`) go in before the
+    // sibling snapshot so sub-agents inherit them.
+    for t in extra {
+        reg.insert_always(t);
+    }
+    if cfg.mcp.is_configured() && !reg.names().iter().any(|n| n.starts_with("mcp_")) {
+        tracing::debug!(
             servers = ?crate::mcp::mcp_tool_names(&cfg.mcp),
-            "mcp servers configured but not wired into the sync tool registry; no mcp_* tools advertised"
+            "mcp servers configured but no mcp_* tools registered (sync builder or discovery failed)"
         );
     }
     let sibling = Arc::new(reg.clone());
@@ -420,6 +473,148 @@ pub fn skills_dir(cfg: &Config) -> PathBuf {
                 .filter(|path| path.exists())
         })
         .unwrap_or_else(|| PathBuf::from("skills"))
+}
+
+/// Severity of one [`doctor_report`] line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorLevel {
+    /// Working as configured.
+    Ok,
+    /// Works, but probably not what the operator wants.
+    Warn,
+    /// Will not work until fixed.
+    Fail,
+}
+
+/// Static health checks behind `zero-hermes doctor` (the analogue of
+/// `hermes doctor`). No network I/O: it inspects configuration, the local
+/// filesystem and the memory database, and says what is missing.
+pub fn doctor_report(cfg: &Config, mock: bool) -> Vec<(DoctorLevel, String)> {
+    use DoctorLevel::{Fail, Ok, Warn};
+    let mut out: Vec<(DoctorLevel, String)> = Vec::new();
+
+    if mock {
+        out.push((Ok, "provider: mock (no network)".into()));
+    } else if cfg.provider.api_key.trim().is_empty() {
+        out.push((
+            Fail,
+            "provider: api_key is empty (set [provider].api_key or ${ENV_VAR})".into(),
+        ));
+    } else {
+        out.push((
+            Ok,
+            format!(
+                "provider: {:?} model {} at {}",
+                cfg.provider.kind, cfg.provider.model, cfg.provider.base_url
+            ),
+        ));
+    }
+    if !cfg.provider.fallbacks.is_empty() {
+        out.push((
+            Ok,
+            format!("provider fallbacks: {}", cfg.provider.fallbacks.len()),
+        ));
+    }
+
+    match crate::memory::Memory::open(cfg.memory.path.as_deref()) {
+        std::result::Result::Ok(_) => out.push((
+            Ok,
+            match &cfg.memory.path {
+                Some(p) => format!("memory: sqlite opens at {}", p.display()),
+                None => "memory: in-memory only (nothing survives a restart)".into(),
+            },
+        )),
+        Err(e) => out.push((Fail, format!("memory: cannot open database: {e}"))),
+    }
+
+    let root = skills_dir(cfg);
+    match SkillRegistry::load_dir(&root) {
+        std::result::Result::Ok(reg) if reg.names().is_empty() => {
+            out.push((Warn, format!("skills: none found under {}", root.display())))
+        }
+        std::result::Result::Ok(reg) => out.push((
+            Ok,
+            format!("skills: {} under {}", reg.names().len(), root.display()),
+        )),
+        Err(e) => out.push((Fail, format!("skills: {} unreadable: {e}", root.display()))),
+    }
+
+    let sh = std::path::Path::new("/bin/sh");
+    out.push(if sh.exists() {
+        (Ok, "shell: /bin/sh present".into())
+    } else {
+        (
+            Fail,
+            "shell: /bin/sh missing (bash/execute_* tools cannot run)".into(),
+        )
+    });
+    out.push(if cfg.agent.command_guard {
+        (Ok, "command guard: on".into())
+    } else {
+        (
+            Warn,
+            "command guard: OFF ([agent].command_guard = false)".into(),
+        )
+    });
+
+    for name in cfg.mcp.server_names() {
+        let srv = &cfg.mcp.servers[&name];
+        out.push(match (&srv.url, srv.command.trim().is_empty()) {
+            (Some(u), _) => (Ok, format!("mcp {name}: http {u}")),
+            (None, false) => (Ok, format!("mcp {name}: stdio `{}`", srv.command)),
+            (None, true) => (Fail, format!("mcp {name}: neither `url` nor `command` set")),
+        });
+    }
+
+    if !cfg.telegram.token.trim().is_empty() {
+        out.push(
+            if cfg.telegram.allowed_chats.is_empty() && !cfg.telegram.allow_all_chats {
+                (
+                    Fail,
+                    "telegram: token set but allowed_chats is empty (gateway will refuse to start)"
+                        .into(),
+                )
+            } else if cfg.telegram.allow_all_chats {
+                (
+                    Warn,
+                    "telegram: allow_all_chats = true — anyone who finds the bot gets a shell"
+                        .into(),
+                )
+            } else {
+                (
+                    Ok,
+                    format!(
+                        "telegram: {} allowed chat(s)",
+                        cfg.telegram.allowed_chats.len()
+                    ),
+                )
+            },
+        );
+    }
+    if cfg.matrix.is_enabled() {
+        out.push(if !cfg.matrix.has_allow_list() {
+            (
+                Fail,
+                "matrix: no allowed_rooms/allowed_users/allow_all (gateway will refuse to start)"
+                    .into(),
+            )
+        } else if cfg.matrix.allow_all {
+            (
+                Warn,
+                "matrix: allow_all = true — anyone who can message the bot gets a shell".into(),
+            )
+        } else {
+            (
+                Ok,
+                format!(
+                    "matrix: {} allowed room(s), {} allowed user(s)",
+                    cfg.matrix.allowed_rooms.len(),
+                    cfg.matrix.allowed_users.len()
+                ),
+            )
+        });
+    }
+    out
 }
 
 #[cfg(test)]

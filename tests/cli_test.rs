@@ -760,3 +760,134 @@ async fn web_ui_serves_health_and_enforces_csrf_over_a_real_socket() {
 
     guard.kill();
 }
+
+/// `/undo` and `/retry` must work against the real binary: `/retry` re-submits
+/// the previous message (the echo mock proves it ran twice) and `/undo` drops
+/// the turn from the durable transcript.
+#[test]
+fn chat_retry_and_undo_commands() {
+    use std::io::Write;
+
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["chat", "--mock", "--no-banner"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chat");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"hello there\n/retry\n/undo\n/undo\n/compress\n/model\n/model other\n/exit\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.matches("you › hello there").count(),
+        1,
+        "retry echoes the resubmitted message: {text}"
+    );
+    assert_eq!(
+        text.matches("(mock) ok").count(),
+        2,
+        "original + retried turn each get a reply: {text}"
+    );
+    assert!(text.contains("removed the last turn"), "{text}");
+    assert!(text.contains("nothing to undo"), "{text}");
+    assert!(text.contains("nothing to compress yet"), "{text}");
+    assert!(text.contains("model: "), "{text}");
+    assert!(text.contains("model switching is a no-op"), "{text}");
+}
+
+/// `doctor` exits 0 with `--mock`, and fails (non-zero, naming the problem)
+/// when a real provider is selected without an API key.
+#[test]
+fn doctor_reports_missing_api_key_and_passes_in_mock_mode() {
+    let sb = Sandbox::new();
+    let ok = sb.run(&["doctor", "--mock"]);
+    assert!(ok.status.success(), "{ok:?}");
+    let text = String::from_utf8_lossy(&ok.stdout);
+    assert!(text.contains("[ok  ] provider: mock"), "{text}");
+    assert!(text.contains("command guard: on"), "{text}");
+
+    let bad = sb.run(&["doctor"]);
+    assert!(!bad.status.success());
+    let text = String::from_utf8_lossy(&bad.stdout);
+    assert!(text.contains("[FAIL] provider: api_key is empty"), "{text}");
+}
+
+/// `/model NAME` rebuilds the provider and `/status` reflects it. No network
+/// is touched: providers connect lazily, on the first turn.
+#[test]
+fn chat_model_command_switches_the_model() {
+    use std::io::Write;
+
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["chat", "--no-banner"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chat");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"/model my-test-model\n/status\n/exit\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("model -> my-test-model"), "{text}");
+    assert!(text.contains("model: my-test-model"), "{text}");
+}
+
+/// Matrix is a shell-access surface too: with no room/user allow-list the
+/// gateway must refuse to start, exactly like an open Telegram bot.
+#[test]
+fn gateway_refuses_an_open_matrix_bot() {
+    let sb = Sandbox::new();
+    let cfg = sb.write(
+        "matrix.toml",
+        "[matrix]\nhomeserver = \"https://hs.example\"\naccess_token = \"tok\"\n",
+    );
+    let out = sb.run(&["--config", cfg.to_str().unwrap(), "gateway"]);
+    assert_ne!(code(&out), 0);
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        text.contains("[matrix]") && text.contains("allow_all"),
+        "{text}"
+    );
+
+    // `doctor` flags the same misconfiguration.
+    let doc = sb.run(&["--config", cfg.to_str().unwrap(), "doctor", "--mock"]);
+    assert_ne!(code(&doc), 0);
+    assert!(stdout(&doc).contains("[FAIL] matrix:"), "{}", stdout(&doc));
+}
+
+/// `tools | head` must exit quietly (killed by SIGPIPE like any Unix tool),
+/// not panic with a backtrace on the closed pipe.
+#[cfg(unix)]
+#[test]
+fn print_commands_do_not_panic_on_a_closed_pipe() {
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["tools", "--mock"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tools");
+    // Close the read end before the child prints anything.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("panicked"),
+        "closed pipe must not panic: {err}"
+    );
+    assert!(!err.contains("Broken pipe"), "{err}");
+}

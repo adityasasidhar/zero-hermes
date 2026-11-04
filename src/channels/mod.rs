@@ -1,5 +1,6 @@
 //! Channel trait — abstract gateway for input/output.
 
+pub mod matrix;
 pub mod telegram;
 
 use async_trait::async_trait;

@@ -147,6 +147,10 @@ impl SkillRegistry {
         for entry in entries {
             let path = entry.path();
             if entry.file_type()?.is_dir() {
+                // Dot-directories (e.g. `.archive`, `.git`) are never skills.
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
                 Self::load_dir_recursive(&path, reg)?;
             } else if path
                 .file_name()
@@ -366,16 +370,55 @@ pub fn validate_hub_manifest(manifest: &HubManifest) -> Result<()> {
     Ok(())
 }
 
+/// Directory under the skills root where archived skills are parked. Dot-named
+/// so [`SkillRegistry::load_dir`] skips it.
+pub const ARCHIVE_DIR: &str = ".archive";
+
+/// Prompt for one curator turn: review the skill library, merge overlaps, fix
+/// stale or broken entries and archive (never delete) what is redundant.
+///
+/// The curator is an ordinary agent turn (`zero-hermes curate`, or a `[cron]`
+/// job with this prompt), so it needs no new machinery: it reads skills with
+/// `skill`/`skill_view`, edits with `skill` write/patch and retires skills
+/// with `skill` archive, which moves them to [`ARCHIVE_DIR`] so every step is
+/// reversible by hand.
+pub fn curator_prompt(registry: &SkillRegistry, root: &Path) -> String {
+    let mut listing = String::new();
+    for s in registry.iter() {
+        let rel = s.path.strip_prefix(root).unwrap_or(&s.path);
+        listing.push_str(&format!(
+            "- {} ({} bytes, {}): {}\n",
+            s.name,
+            s.body.len(),
+            rel.display(),
+            s.description
+        ));
+    }
+    if listing.is_empty() {
+        listing.push_str("(no skills yet)\n");
+    }
+    format!(
+        "You are the skill curator. Review the skill library below and tidy it.\n\
+         \n\
+         Do:\n\
+         - Read (skill_view) any skills that look overlapping, stale or too thin to be useful.\n\
+         - Merge near-duplicates into the better one (skill write/patch), then retire the \
+           redundant one with skill action=archive. Archiving is reversible; never delete.\n\
+         - Fix vague descriptions and broken frontmatter with skill patch.\n\
+         - Leave well-formed, distinct skills alone. Doing nothing is a fine outcome.\n\
+         \n\
+         Do not invent new skills, do not touch skills you have not read, and finish with a \
+         short report of what you changed and why.\n\
+         \n\
+         Skills ({}):\n{listing}",
+        registry.names().len()
+    )
+}
+
 /// Download every hub skill missing from `root`.
 ///
 /// Each missing entry is fetched from its `url` and written to
 /// `<root>/<name>/SKILL.md`. Returns the names that were added.
-///
-/// TODO(curator): run this as a background cron custom job (Wave D owns
-/// the scheduler) that periodically diffs the vendored pack against the
-/// hub manifest and files an update note instead of syncing inline, so
-/// upstream drift (29 changed / 32 neither per bug 17) is surfaced
-/// without blocking agent turns.
 pub async fn sync_missing_skills(root: &Path, manifest_url: &str) -> Result<Vec<String>> {
     let manifest = fetch_hub_manifest(manifest_url).await?;
     let existing = SkillRegistry::load_dir(root).unwrap_or_default();

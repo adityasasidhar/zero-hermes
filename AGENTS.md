@@ -74,7 +74,9 @@ Subcommands (see the `Command` enum in `src/main.rs`):
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `gateway`        | Telegram long-poll + agent loop + cron scheduler                                                                             |
 | `run "msg"`      | one agent turn against the configured provider, then exit                                                                    |
-| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/exit`) |
+| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/retry`, `/undo`, `/compress`, `/model`, `/exit`) |
+| `doctor`         | static health checks (config, memory, skills, MCP, Telegram, guard); exits non-zero on FAIL |
+| `curate`         | one skill-curator agent turn (`skills::curator_prompt`): merge overlaps, fix stale skills, `skill archive` redundant ones |
 | `cron list`      | print configured jobs and next firing time                                                                                   |
 | `cron check E`   | parse a 5-field cron expr and print next firing                                                                              |
 | `tools`          | list registered tool names (honours the loaded config)                                                                       |
@@ -206,17 +208,32 @@ src/
                        lives in the lib so integration tests can reach it
   util.rs              truncate_bytes, expand_tilde, chunk_text, random_hex,
                        load_dotenv, expand_env_vars
+  guard.rs             CommandGuard + GuardedTool decorator: refuses catastrophic
+                       shell commands (rm -rf /, mkfs, dd of=/dev, curl|sh, power
+                       commands, fork bombs). bootstrap wraps bash /
+                       execute_command / execute_code; [agent].command_guard
+                       (default true) and [agent].blocked_commands configure it
   mcp.rs               MCP stdio client (JSON-RPC 2.0 initialize / tools/list /
                        tools/call). McpTool wraps a remote tool as
-                       mcp_<server>_<tool>; discovery is async and NOT yet wired
-                       into the sync registry — see the TODO in bootstrap.rs
+                       mcp_<server>_<tool>. Discovery is async, so
+                       bootstrap::build_tool_registry_async (used by run /
+                       chat / web / gateway) registers the tools before the
+                       sub-agent snapshot; the sync build_tool_registry (used
+                       by `tools` and tests) never spawns servers. A server
+                       that fails discovery is skipped with a warning.
+                       One persistent McpSession per server (handshake once,
+                       log noise/notifications skipped, respawn on death).
+                       `url` servers use streamable HTTP (JSON or SSE replies,
+                       Mcp-Session-Id, re-handshake on failure).
   agent/
     mod.rs             the loop: agent::run + agent::run_stream + dispatch_tool
                        + RunLimits (max_iterations + context_window)
     provider.rs        LlmProvider trait, AnthropicMessages, OpenAiCompat, parse_response
     stream.rs          Anthropic + OpenAI SSE parsers, StreamEvent enum
     tool.rs            Tool / ToolCall / ToolResult / ToolOutput / Message / ContentBlock
-    context.rs         compact_history: pair-safe oldest-drop compaction
+    context.rs         compact_history: pair-safe oldest-drop compaction;
+                       splice_summary + find_cut_keeping_tail back the
+                       model-written `agent::compress_history_llm`
     mock.rs            MockProvider (text_only / echo) for --mock and tests
   tools/
     mod.rs             ToolRegistry (insert respects [agent].enabled_tools allowlist;
@@ -231,13 +248,19 @@ src/
   memory.rs            rusqlite (bundled): durable session transcripts, notes,
                        and an FTS5 `message_search` index for cross-session
                        recall; `Memory::in_memory()` for tests
-  skills.rs            SKILL.md frontmatter parser + SkillRegistry
+  skills.rs            SKILL.md frontmatter parser + SkillRegistry (dot-dirs such
+                       as `.archive` are skipped) + curator_prompt; the `skill`
+                       tool's `archive` action moves a skill to <root>/.archive/
   cron.rs              cron crate (6-field) with normalize_cron() for 5-field input;
                        Scheduler emits CronEvent on a tokio mpsc. Fires *every*
                        job due at an instant, and honours [cron].timezone
   channels/
     mod.rs             Channel trait, InboundMessage, parse_command, strip_bot_mention
     telegram.rs        getUpdates long-poll + sendMessage
+    matrix.rs          /sync long-poll + PUT send; parse_sync applies the
+                       allow-list; auto-joins trusted invites; first sync's
+                       backlog is never dispatched. run_gateway runs both
+                       channels and routes replies by msg.channel
   web.rs               axum router: /, /events (SSE), /send, /health and one
                        static route per entry in ASSETS; serves web/index.html
                        (vanilla JS, EventSource).
@@ -354,10 +377,13 @@ parent registry, they automatically become available to sub-agents.
   local server — without that seam the HTML path is untestable, since every
   local server is blocked. Redirects are disabled outright
   (`redirect::Policy::none()`), so a 302 to `169.254.169.254` cannot slip
-  past the initial-URL check. **What is still not covered:** no DNS
-  resolution happens, so a *name* that resolves to a private address gets
-  through — closing that needs resolving and re-checking the result, or
-  pinning the connection to the checked address.
+  past the initial-URL check. **DNS:** name hosts are resolved by `resolve_pinned_client`; the
+  request is refused if *any* answer is blocked (`ip_is_blocked`: private,
+  loopback, link-local, CGNAT, ULA, mapped IPv6) and the connection is pinned
+  to the vetted answers (`resolve_to_addrs`), so a rebinding second lookup
+  cannot differ. **What is still not covered:** behind an HTTP proxy
+  (`HTTPS_PROXY` etc.) the proxy resolves names, so a failed local lookup is
+  allowed through; the proxy's own policy is then the only guard.
 - Don't add heavy deps (no `axum`-style web stack beyond what's there,
   no `sqlx`, `bson`, `prost`). The brief is explicit about this.
 - `.hermes/environment.json` is for the Lemma recipe system; leave it

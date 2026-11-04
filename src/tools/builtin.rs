@@ -960,8 +960,20 @@ impl Tool for FetchTool {
                 truncate_bytes(&args.url, 200)
             )));
         }
-        let resp = self
-            .client
+        let client = if self.allow_private {
+            self.client.clone()
+        } else {
+            match resolve_pinned_client(&self.client, &args.url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(ToolOutput::err(format!(
+                        "fetch blocked: refusing to fetch {:?} ({e})",
+                        truncate_bytes(&args.url, 200)
+                    )))
+                }
+            }
+        };
+        let resp = client
             .get(&args.url)
             .send()
             .await
@@ -1046,6 +1058,14 @@ async fn fetch_body_capped(client: &reqwest::Client, url: &str) -> Result<String
 fn fetch_blocked_err(url: &str) -> ToolOutput {
     ToolOutput::err(format!(
         "blocked private/local URL: refusing to fetch {:?} (private/local host or non-http(s) scheme)",
+        truncate_bytes(url, 200)
+    ))
+}
+
+/// Like [`fetch_blocked_err`], with the reason a resolved name was refused.
+fn fetch_blocked_err_with(url: &str, reason: &str) -> ToolOutput {
+    ToolOutput::err(format!(
+        "blocked private/local URL: refusing to fetch {:?} ({reason})",
         truncate_bytes(url, 200)
     ))
 }
@@ -1185,7 +1205,15 @@ impl Tool for WebExtractTool {
         if !self.allow_private && is_fetch_blocked(args.url.trim()) {
             return Ok(fetch_blocked_err(args.url.trim()));
         }
-        match fetch_body_capped(&self.client, &args.url).await {
+        let client = if self.allow_private {
+            self.client.clone()
+        } else {
+            match resolve_pinned_client(&self.client, args.url.trim()).await {
+                Ok(c) => c,
+                Err(e) => return Ok(fetch_blocked_err_with(args.url.trim(), &e)),
+            }
+        };
+        match fetch_body_capped(&client, &args.url).await {
             Ok(body) => {
                 let text = strip_html(body.split_once('\n').map(|(_, b)| b).unwrap_or(""));
                 if text.trim().is_empty() {
@@ -1201,10 +1229,123 @@ impl Tool for WebExtractTool {
     }
 }
 
+/// Is this resolved address one a model-supplied URL must never reach?
+///
+/// Wider than the literal-host checks: also unique-local and link-local IPv6,
+/// carrier-grade NAT (100.64/10) and IPv4-mapped IPv6, because the point is to
+/// judge what a *name resolved to*, not how a URL was spelled.
+fn ip_is_blocked(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || v.is_broadcast()
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return ip_is_blocked(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v.segments()[0];
+            v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link local
+        }
+    }
+}
+
+/// Port a URL connects to (explicit, else the scheme default).
+fn fetch_port(url: &str) -> u16 {
+    let lower = url.trim_start().to_ascii_lowercase();
+    let default = if lower.starts_with("https://") {
+        443
+    } else {
+        80
+    };
+    let Some(after) = lower.split_once("://").map(|p| p.1) else {
+        return default;
+    };
+    let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let tail = match hostport.rsplit_once(']') {
+        Some((_, t)) => t,
+        None => hostport.rsplit_once(':').map(|p| p.1).map_or("", |p| p),
+    };
+    tail.trim_start_matches(':').parse().unwrap_or(default)
+}
+
+/// Whether outbound HTTP is configured to go through a proxy (reqwest honours
+/// these variables), in which case the proxy, not this host, resolves names.
+fn via_proxy() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// DNS-rebinding-safe client for one outbound URL.
+///
+/// [`is_fetch_blocked`] only inspects the *spelling* of the host, so a public
+/// name whose A record points at `127.0.0.1` or `169.254.169.254` would get
+/// through. For name hosts this resolves them, refuses if **any** answer is a
+/// blocked address, and pins the connection to the vetted answers so a second
+/// lookup cannot return something different (TOCTOU). IP-literal hosts need no
+/// resolution and reuse `base`.
+async fn resolve_pinned_client(
+    base: &reqwest::Client,
+    url: &str,
+) -> std::result::Result<reqwest::Client, String> {
+    let Some(host) = fetch_host(url) else {
+        return Err("cannot determine host".into());
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(base.clone());
+    }
+    let port = fetch_port(url);
+    let lookup = tokio::net::lookup_host((host.as_str(), port));
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+            Ok(Ok(it)) => it.collect(),
+            // Behind an HTTP proxy the proxy resolves names, and this host may
+            // not be able to at all; vet what we can but do not break fetch.
+            Ok(Err(_)) | Err(_) if via_proxy() => return Ok(base.clone()),
+            Ok(Err(e)) => return Err(format!("cannot resolve {host}: {e}")),
+            Err(_) => return Err(format!("resolving {host} timed out")),
+        };
+    if addrs.is_empty() {
+        return Err(format!("{host} resolved to no addresses"));
+    }
+    if let Some(bad) = addrs.iter().find(|a| ip_is_blocked(a.ip())) {
+        return Err(format!(
+            "{host} resolves to a private/local address ({})",
+            bad.ip()
+        ));
+    }
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))
+}
+
 /// Return `true` when `url` must not be fetched (SSRF guard).
 ///
 /// Blocks anything that is not `http(s)` plus loopback/private/link-local
-/// hosts (no DNS resolution): `localhost`, `127.*`, `10.*`, `192.168.*`,
+/// hosts (spelling only — names are resolved and vetted separately by
+/// [`resolve_pinned_client`]): `localhost`, `127.*`, `10.*`, `192.168.*`,
 /// `172.16-31.*`, `169.254.*`, `0.*`, `::1`, `0.0.0.0`, and `.local` /
 /// `.internal` / `.localhost` suffixes. Obscured numeric forms are also
 /// blocked: `0x`-hex parts (`0x7f.0.0.1`, `0x7f000001`), single decimal
@@ -1721,6 +1862,44 @@ fn validate_skill_content(content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move a skill's directory into `<root>/.archive/` (reversible retirement).
+///
+/// The skill must live in its own directory strictly inside `root`; a
+/// `SKILL.md` sitting directly in the root is refused so archiving can never
+/// sweep up the whole library.
+async fn archive_skill(root: &Path, name: &str) -> Result<ToolOutput> {
+    let Some(path) = resolve_skill_path(root, name) else {
+        return Ok(ToolOutput::err(format!("unknown skill: {name}")));
+    };
+    let (Ok(root_c), Some(dir)) = (root.canonicalize(), path.parent()) else {
+        return Ok(ToolOutput::err("cannot resolve skills root"));
+    };
+    let Ok(dir_c) = dir.canonicalize() else {
+        return Ok(ToolOutput::err("cannot resolve skill directory"));
+    };
+    if dir_c == root_c || !dir_c.starts_with(&root_c) {
+        return Ok(ToolOutput::err(format!(
+            "refusing to archive {name}: its directory is not a dedicated folder inside the skills root"
+        )));
+    }
+    let archive = root_c.join(crate::skills::ARCHIVE_DIR);
+    tokio::fs::create_dir_all(&archive)
+        .await
+        .map_err(|e| anyhow::anyhow!("create archive dir failed: {e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = archive.join(format!("{name}-{stamp}"));
+    tokio::fs::rename(&dir_c, &dest)
+        .await
+        .map_err(|e| anyhow::anyhow!("archive move failed: {e}"))?;
+    Ok(ToolOutput::ok(format!(
+        "archived skill {name} to {}",
+        dest.strip_prefix(&root_c).unwrap_or(&dest).display()
+    )))
+}
+
 /// Read a skill's `SKILL.md` body by registry name.
 async fn read_skill_by_name(root: &Path, name: &str) -> Result<ToolOutput> {
     let Some(path) = resolve_skill_path(root, name) else {
@@ -1935,12 +2114,12 @@ impl Tool for SkillTool {
         "skill"
     }
     fn description(&self) -> &str {
-        "List, read, create, patch, or sync reusable SKILL.md procedures."
+        "List, read, create, patch, archive, or sync reusable SKILL.md procedures."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object", "properties": {
-                "action": {"type": "string", "enum": ["list", "read", "write", "patch", "sync"]},
+                "action": {"type": "string", "enum": ["list", "read", "write", "patch", "archive", "sync"]},
                 "name": {"type": "string", "description": "skill name (letters, digits, _, -)"},
                 "content": {"type": "string", "description": "full SKILL.md content for write (must include --- frontmatter with name: and description:)"},
                 "old_str": {"type": "string", "description": "exact string to replace for patch (must occur once)"},
@@ -2022,6 +2201,10 @@ impl Tool for SkillTool {
                     }
                     Err(e) => Ok(ToolOutput::err(e)),
                 }
+            }
+            "archive" => {
+                let name = safe_skill_name(args.name.as_deref())?;
+                archive_skill(&self.root, &name).await
             }
             "sync" => {
                 let url = self
@@ -2472,6 +2655,60 @@ fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> std::path::PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_address_blocklist_covers_private_ranges() {
+        use std::net::IpAddr;
+        for blocked in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.9",
+            "172.16.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(ip_is_blocked(ip), "should block {blocked}");
+        }
+        for open in ["93.184.216.34", "8.8.8.8", "100.128.0.1", "2606:4700::1111"] {
+            let ip: IpAddr = open.parse().unwrap();
+            assert!(!ip_is_blocked(ip), "should allow {open}");
+        }
+    }
+
+    #[test]
+    fn fetch_port_defaults_and_overrides() {
+        assert_eq!(fetch_port("http://h/x"), 80);
+        assert_eq!(fetch_port("https://h/x"), 443);
+        assert_eq!(fetch_port("http://h:8080/x"), 8080);
+        assert_eq!(fetch_port("https://u:p@h:9443/x?a=b:c"), 9443);
+        assert_eq!(fetch_port("http://[::1]:3000/"), 3000);
+        assert_eq!(fetch_port("http://[::1]/"), 80);
+    }
+
+    #[tokio::test]
+    async fn names_that_resolve_to_loopback_are_refused() {
+        // `localhost` is caught by spelling; this checks the *resolution*
+        // layer on its own, which is what stops a public name whose A record
+        // points inward.
+        let base = reqwest::Client::new();
+        let err = resolve_pinned_client(&base, "http://localhost:9/")
+            .await
+            .unwrap_err();
+        assert!(err.contains("private/local"), "{err}");
+        // IP literals are the spelling check's job and pass through here.
+        assert!(resolve_pinned_client(&base, "http://93.184.216.34/")
+            .await
+            .is_ok());
+    }
 
     #[test]
     fn bash_schema_has_command() {
