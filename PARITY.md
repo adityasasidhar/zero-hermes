@@ -15,12 +15,12 @@ for platform sprawl (see *Out of scope*). It is not a drop-in replacement.
 | Hermes capability | zero-hermes | Notes |
 | --- | --- | --- |
 | Tool-calling loop, streaming | **yes** | Anthropic + OpenAI-compat wire formats, SSE streaming, retry on transient errors, provider fallback chain |
-| 40+ tools / toolsets | partial | ~20 builtins (shell, files, fetch, search, memory, cron, todo, subagent…). `[agent].enabled_tools` is the toolset switch. More tools arrive via MCP |
+| 40+ tools / toolsets | partial | ~30 builtins incl. upstream-named aliases (`terminal`, `patch`, `clarify`, `delegate_task`, `todo_list`, `skills_list`, `skill_manage`, `session_search`, `cronjob_manage`) so unmodified upstream skills resolve; no browser/vision/image/TTS/kanban. `[agent].enabled_tools` is the toolset switch. More tools arrive via MCP |
 | MCP servers | **yes** | stdio (persistent session, respawn) and streamable HTTP (JSON/SSE, session id, headers) |
-| Agent-curated memory | **yes** | SQLite notes + `MEMORY.md`/`USER.md` sidecars, per-turn recall injected into the prompt |
+| Agent-curated memory | **yes** | upstream `add`/`patch`/`remove` + `target` shape on `MEMORY.md` (2200)/`USER.md` (1375), plus SQLite notes and per-turn recall injected into the prompt |
 | Cross-session search | partial | FTS5 recall; no LLM summarisation of hits |
 | Context compression | **yes** | pair-safe compaction + token-budget summary (extractive; opt-in `[agent].llm_compaction` makes the model write it automatically); `/compress` asks the model for a summary and keeps the recent third verbatim, falling back to extractive on failure |
-| Skills (agentskills-style `SKILL.md`) | **yes** | recursive loader, create/patch/archive, hub sync, `curate` command |
+| Skills (agentskills-style `SKILL.md`) | **yes** | no skills bundled (drop upstream's `skills/` in; all 44 core + 142 optional load); recursive loader, create/patch/archive, hub sync, `curate` command |
 | Self-improving skills | partial | model can write/patch skills; `curate` reviews the library on demand or via cron |
 | Command approval / security | partial | no interactive approval (headless daemon). Instead: command guard refuses catastrophic commands, SSRF guard on fetch (spelling checks + DNS resolution vetting with connection pinning), CSRF on web, Telegram allow-list required, tools allow-list |
 | Cron with delivery | **yes** | 5-field cron, timezone, delivery to Telegram chats |

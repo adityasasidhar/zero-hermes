@@ -3391,7 +3391,7 @@ impl Tool for SessionSearchTool {
                 "session_search requires a non-empty `query`",
             ));
         }
-        MemoryTool
+        MemoryTool::default()
             .execute(map_session_search_args(&input), ctx)
             .await
     }
