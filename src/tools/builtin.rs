@@ -7,6 +7,14 @@
 //! exist because vendored Hermes skills reference those names; they share
 //! the same implementations as the canonical tools so behaviour cannot drift.
 //!
+//! Upstream-Hermes aliases cover the names current NousResearch/hermes-agent
+//! skills use: `terminal` (`bash`), `patch` (`edit`), `clarify` (`ask`),
+//! `delegate_task` (`subagent`), `todo_list` (`todo`), `skills_list` /
+//! `skill_manage` (`skill`), `session_search` (`memory` action=search) and
+//! `cronjob_manage` (`cron`). They are thin wrappers that map upstream
+//! argument and action names (`old_string`, `choices`, `goal`, `create`, ...)
+//! onto the canonical tool's and then delegate to it.
+//!
 //! Deferred (not implemented): `background_task` (no job supervisor in this
 //! binary), `browser_navigate` (no headless browser; use `fetch` /
 //! `web_extract`), and the `hermes` CLI itself. Delegation is covered by the
@@ -1710,8 +1718,308 @@ fn collapse_text(s: &str) -> String {
 
 // MemoryTool
 
-/// Read/write notes in the agent's persistent memory.
-pub struct MemoryTool;
+/// Separator between entries in `MEMORY.md` / `USER.md` (upstream Hermes'
+/// `ENTRY_DELIMITER`), so files stay interchangeable with Hermes Agent.
+pub const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
+
+/// Serialises read-modify-write cycles on the Markdown sidecars across every
+/// `MemoryTool` instance (gateway sessions and sub-agents share the files).
+static MARKDOWN_MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Durable memory, in two shapes.
+///
+/// * zero-hermes shape — `action: read|write|list|delete|search` over the
+///   SQLite notes store and the cross-session transcript index.
+/// * upstream Hermes shape — `action: add|patch|remove` (or a batch
+///   `operations` list) with `target: memory|user`, editing the curated
+///   Markdown sidecars `MEMORY.md` / `USER.md` that bootstrap injects into
+///   the system prompt. Entries are separated by [`MEMORY_ENTRY_DELIMITER`]
+///   and capped at [`crate::bootstrap::MEMORY_MD_CHARS`] /
+///   [`crate::bootstrap::USER_MD_CHARS`] characters per file.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryTool {
+    memory_md: Option<PathBuf>,
+    user_md: Option<PathBuf>,
+}
+
+impl MemoryTool {
+    /// Build the tool with the `MEMORY.md` (`target=memory`) and `USER.md`
+    /// (`target=user`) paths. `None` makes that target's Hermes-shape calls
+    /// return a "not configured" tool error; the SQLite actions still work.
+    pub fn new(memory_md: Option<PathBuf>, user_md: Option<PathBuf>) -> Self {
+        Self { memory_md, user_md }
+    }
+
+    /// Run a Hermes-shape call (`add` / `patch` / `remove` / `operations`).
+    fn execute_markdown(
+        &self,
+        action: Option<&str>,
+        target: Option<&str>,
+        single: MarkdownOp,
+        operations: Option<Vec<Value>>,
+    ) -> ToolOutput {
+        let target = target.unwrap_or("memory");
+        let (path, limit, label, setting) = match target {
+            "memory" => (
+                self.memory_md.as_deref(),
+                crate::bootstrap::MEMORY_MD_CHARS,
+                "MEMORY.md",
+                "memory.markdown_path",
+            ),
+            "user" => (
+                self.user_md.as_deref(),
+                crate::bootstrap::USER_MD_CHARS,
+                "USER.md",
+                "memory.user_path",
+            ),
+            other => {
+                return ToolOutput::err(format!(
+                    "invalid memory target '{other}'; use 'memory' or 'user'"
+                ))
+            }
+        };
+        let Some(path) = path else {
+            return ToolOutput::err(format!(
+                "{label} is not configured (set `{setting}` in zero_hermes.toml); \
+                 nothing was written"
+            ));
+        };
+        let ops = match operations {
+            Some(list) => {
+                let mut ops = Vec::with_capacity(list.len());
+                for (i, raw) in list.into_iter().enumerate() {
+                    match serde_json::from_value::<MarkdownOp>(raw) {
+                        Ok(op) => ops.push(op),
+                        Err(e) => {
+                            return ToolOutput::err(format!(
+                                "operation {}: expected {{action, content?, old_text?}}: {e}",
+                                i + 1
+                            ))
+                        }
+                    }
+                }
+                if ops.is_empty() {
+                    return ToolOutput::err("`operations` is empty; nothing was written");
+                }
+                ops
+            }
+            None => vec![MarkdownOp {
+                action: action.map(str::to_string),
+                ..single
+            }],
+        };
+
+        let _guard = MARKDOWN_MEMORY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return ToolOutput::err(format!("could not read {label}: {e}")),
+        };
+        let before = parse_memory_entries(&original);
+        let mut entries = before.clone();
+        let mut messages = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            match apply_markdown_op(&mut entries, op) {
+                Ok(msg) => messages.push(msg),
+                Err(e) if ops.len() > 1 => {
+                    return ToolOutput::err(format!(
+                        "operation {}: {e} Nothing was written.",
+                        i + 1
+                    ))
+                }
+                Err(e) => return ToolOutput::err(format!("{e} Nothing was written.")),
+            }
+        }
+        let old_total = memory_chars(&before);
+        let new_total = memory_chars(&entries);
+        // Over budget is refused, except for a write that shrinks a file that
+        // was already over (hand edits): pruning is the way back under.
+        if new_total > limit && new_total > old_total {
+            return ToolOutput::err(format!(
+                "{label} would be {new_total}/{limit} chars (over by {}). Consolidate: \
+                 'remove' or 'patch' stale entries to make room, ideally in ONE \
+                 `operations` batch that also adds the new entry (the limit is checked on \
+                 the final result). Nothing was written. Current entries:\n{}",
+                new_total - limit,
+                render_memory_entries(&before)
+            ));
+        }
+        if entries != before {
+            if let Err(e) = write_atomic(path, &serialize_memory_entries(&entries)) {
+                return ToolOutput::err(format!("could not write {label}: {e}"));
+            }
+        }
+        ToolOutput::ok(format!(
+            "{} {label}: {new_total}/{limit} chars, {} entr{}.",
+            messages.join(" "),
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
+        ))
+    }
+}
+
+/// One Hermes-shape edit: `add` uses `content`; `patch` replaces the unique
+/// `old_text` span with `content` (or its alias `new_text`); `remove` drops
+/// the entry containing `old_text`.
+#[derive(Debug, Default, Deserialize)]
+struct MarkdownOp {
+    action: Option<String>,
+    content: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+}
+
+/// Split a sidecar into trimmed, non-empty entries.
+fn parse_memory_entries(raw: &str) -> Vec<String> {
+    raw.trim()
+        .split(MEMORY_ENTRY_DELIMITER.trim_matches('\n'))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// File body for `entries` (empty file when there are none).
+fn serialize_memory_entries(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", entries.join(MEMORY_ENTRY_DELIMITER))
+}
+
+/// Character count of the injected text, i.e. what the prompt cap measures.
+fn memory_chars(entries: &[String]) -> usize {
+    entries.join(MEMORY_ENTRY_DELIMITER).chars().count()
+}
+
+/// Bullet list of entries for error messages.
+fn render_memory_entries(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return "(none)".to_string();
+    }
+    entries
+        .iter()
+        .map(|e| format!("- {e}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Index of the single entry `old_text` selects. A whole-entry exact match
+/// wins; otherwise the substring must occur in exactly one distinct entry.
+fn locate_memory_entry(entries: &[String], old_text: &str) -> std::result::Result<usize, String> {
+    if let Some(i) = entries.iter().position(|e| e == old_text) {
+        return Ok(i);
+    }
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.contains(old_text))
+        .map(|(i, _)| i)
+        .collect();
+    let distinct: std::collections::HashSet<&str> =
+        matches.iter().map(|&i| entries[i].as_str()).collect();
+    match (matches.first(), distinct.len()) {
+        (None, _) => Err(format!(
+            "No entry matched '{old_text}'. Copy old_text verbatim from one entry. \
+             Current entries:\n{}",
+            render_memory_entries(entries)
+        )),
+        (Some(&i), 1) => Ok(i),
+        _ => Err(format!(
+            "Multiple entries matched '{old_text}'. Be more specific: old_text must \
+             select exactly one entry."
+        )),
+    }
+}
+
+/// `Some(s)` only when the field is present and not blank.
+fn nonempty(s: &Option<String>) -> Option<&str> {
+    s.as_deref().filter(|s| !s.trim().is_empty())
+}
+
+/// Apply one op to `entries` in place; returns a short status line, or a
+/// model-facing error. The char limit is checked by the caller.
+fn apply_markdown_op(
+    entries: &mut Vec<String>,
+    op: &MarkdownOp,
+) -> std::result::Result<&'static str, String> {
+    let old_text = || {
+        nonempty(&op.old_text)
+            .map(str::trim)
+            .ok_or("this action needs `old_text`: a unique substring of one entry.")
+    };
+    match op.action.as_deref().unwrap_or("") {
+        "add" => {
+            let content = nonempty(&op.content)
+                .or(nonempty(&op.new_text))
+                .ok_or("'add' needs non-empty `content`.")?
+                .trim();
+            if content.contains('§') {
+                return Err("`content` must not contain '§' (the entry separator); \
+                            add one entry per op."
+                    .to_string());
+            }
+            if entries.iter().any(|e| e == content) {
+                return Ok("Entry already exists (no duplicate added).");
+            }
+            entries.push(content.to_string());
+            Ok("Entry added.")
+        }
+        "patch" => {
+            let old = old_text()?;
+            let new = nonempty(&op.content)
+                .or(nonempty(&op.new_text))
+                .ok_or("'patch' needs `new_text` (or `content`): the replacement for old_text. Use 'remove' to delete an entry.")?;
+            let idx = locate_memory_entry(entries, old)?;
+            let entry = &entries[idx];
+            if entry.matches(old).count() > 1 {
+                return Err(format!(
+                    "'{old}' occurs more than once in the matched entry; include more \
+                     surrounding text so the span is unique."
+                ));
+            }
+            let patched = entry.replacen(old, new, 1).trim().to_string();
+            if patched.contains('§') {
+                return Err("the patched entry must not contain '§'.".to_string());
+            }
+            entries[idx] = patched;
+            Ok("Entry patched.")
+        }
+        "remove" => {
+            let idx = locate_memory_entry(entries, old_text()?)?;
+            entries.remove(idx);
+            Ok("Entry removed.")
+        }
+        "" => Err("each operation needs an `action`: add, patch or remove.".to_string()),
+        other => Err(format!(
+            "unknown action '{other}'; use add, patch or remove."
+        )),
+    }
+}
+
+/// Write `contents` to `path` via a sibling temp file + rename, creating
+/// parent directories, so a crash never leaves a half-written sidecar.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "memory".to_string());
+    let tmp = parent.join(format!(".{name}.tmp-{}", crate::util::random_hex(6)));
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
 
 #[async_trait]
 impl Tool for MemoryTool {
@@ -1719,21 +2027,54 @@ impl Tool for MemoryTool {
         "memory"
     }
     fn description(&self) -> &str {
-        "Durable memory: read, write, list, delete, or search notes and past conversation. \
-         Proactively write compact declarative facts the user states (stable preferences, \
-         environment details, project conventions) without being asked; never store secrets \
-         or ephemeral task state. action='read'|'write'|'list'|'delete'|'search'."
+        "Durable memory, two shapes. (1) Curated Markdown injected into every future \
+         session (Hermes shape): action='add'|'patch'|'remove' with target='memory' \
+         (MEMORY.md: your notes on environment, conventions, lessons; 2200 chars) or \
+         target='user' (USER.md: who the user is, preferences; 1375 chars). 'add' takes \
+         `content`; 'patch' replaces the unique `old_text` span with `new_text`; 'remove' \
+         deletes the entry containing `old_text`. Several changes to one target can go in \
+         one `operations` list [{action, content?, old_text?, new_text?}], checked against \
+         the limit only on the final result; when full, remove/shorten stale entries in \
+         the same batch. (2) Notes and recall: action='read'|'write'|'list'|'delete' \
+         (`key`/`value`) over a notes store, 'search' (`query`) over past conversations. \
+         Proactively save compact declarative facts the user states (stable preferences, \
+         environment details, project conventions); never store secrets or ephemeral \
+         task state."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read", "write", "list", "delete", "search"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "patch", "remove", "read", "write", "list", "delete", "search"]
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": "add/patch/remove only: 'memory' = MEMORY.md (your notes, default), 'user' = USER.md (user profile)"
+                },
+                "content": {"type": "string", "description": "add: the new entry"},
+                "old_text": {"type": "string", "description": "patch/remove: text from exactly one entry; patch replaces this span (must occur once), remove deletes the whole entry"},
+                "new_text": {"type": "string", "description": "patch: replacement text for old_text (the rest of the entry is kept)"},
+                "operations": {
+                    "type": "array",
+                    "description": "Optional batch of add/patch/remove changes to one target, applied atomically",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["add", "patch", "remove"]},
+                            "content": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"}
+                        },
+                        "required": ["action"]
+                    }
+                },
                 "key": {"type": "string", "description": "Note key (read/write/delete); fallback query for search"},
                 "value": {"type": "string", "description": "Note value (write only)"},
                 "query": {"type": "string", "description": "Search query (search only; falls back to `key`)"}
-            },
-            "required": ["action"]
+            }
         })
     }
     /// Conservative: `read`/`list`/`search` are side-effect free, but
@@ -1745,12 +2086,37 @@ impl Tool for MemoryTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
-            action: String,
+            action: Option<String>,
             key: Option<String>,
             value: Option<String>,
             query: Option<String>,
+            target: Option<String>,
+            content: Option<String>,
+            old_text: Option<String>,
+            new_text: Option<String>,
+            operations: Option<Vec<Value>>,
         }
         let args: Args = serde_json::from_value(input)?;
+        let action = args.action.as_deref().unwrap_or("");
+        if args.operations.is_some() || matches!(action, "add" | "patch" | "remove") {
+            return Ok(self.execute_markdown(
+                args.action.as_deref(),
+                args.target.as_deref(),
+                MarkdownOp {
+                    action: None,
+                    content: args.content,
+                    old_text: args.old_text,
+                    new_text: args.new_text,
+                },
+                args.operations,
+            ));
+        }
+        if action.is_empty() {
+            return Ok(ToolOutput::err(
+                "missing `action`: add|patch|remove (MEMORY.md/USER.md) or \
+                 read|write|list|delete|search (notes)",
+            ));
+        }
         let Some(memory) = &ctx.memory else {
             return Ok(ToolOutput::err(
                 "memory backend not configured in this session",
@@ -1761,7 +2127,7 @@ impl Tool for MemoryTool {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("missing `key`"))
         };
-        match args.action.as_str() {
+        match action {
             "read" => Ok(ToolOutput::ok(cap_model_output(
                 memory
                     .read_note(key()?)?
@@ -2626,7 +2992,9 @@ impl Tool for SubAgentTool {
         let timeout = Duration::from_secs(args.timeout.unwrap_or(120).min(600));
         let futures = children.into_iter().map(|child_args| async move {
             let mut child = (*self.parent_registry).clone();
-            child.remove("subagent");
+            for name in SUBAGENT_TOOL_NAMES {
+                child.remove(name);
+            }
             let child = Arc::new(child);
             let system = format!("You are a sub-agent with role: {}. Complete the task, use tools when needed, and return concise evidence-backed results. You have no prior conversation history.", child_args.name);
             let mut history = Vec::new();
@@ -2636,6 +3004,475 @@ impl Tool for SubAgentTool {
         });
         let results = futures::future::join_all(futures).await;
         Ok(ToolOutput::ok(cap_model_output(results.join("\n\n"))))
+    }
+}
+
+// Upstream Hermes Agent aliases
+//
+// Skills written for current upstream Hermes Agent (NousResearch/hermes-agent)
+// name its tools — `terminal`, `patch`, `clarify`, `delegate_task`, ... —
+// rather than the older names above. Each wrapper below delegates to the
+// canonical tool and only renames upstream argument names into ours, so the
+// behaviour (and every safety check) cannot drift from the canonical tool.
+
+/// Every name under which the sub-agent tool is registered. A child registry
+/// strips all of them, so a sub-agent cannot recurse through an alias.
+pub const SUBAGENT_TOOL_NAMES: &[&str] = &["subagent", "delegate_task"];
+
+/// Move `input[from]` to `input[to]` when `to` is absent. Non-objects pass
+/// through unchanged; an explicit canonical key always wins.
+fn rename_arg(input: &mut Value, from: &str, to: &str) {
+    if let Some(obj) = input.as_object_mut() {
+        if !obj.contains_key(to) {
+            if let Some(v) = obj.remove(from) {
+                obj.insert(to.to_string(), v);
+            }
+        }
+    }
+}
+
+/// Rewrite `input["action"]` through `map` (unlisted actions pass through).
+fn map_action(input: &mut Value, map: &[(&str, &str)]) {
+    let Some(action) = input.get("action").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some((_, to)) = map.iter().find(|(from, _)| *from == action) {
+        input["action"] = Value::String((*to).to_string());
+    }
+}
+
+/// Map upstream `patch` args (`old_string` / `new_string`) onto `edit`'s
+/// `old_str` / `new_str`. `path` and `replace_all` are shared.
+pub fn map_patch_args(mut input: Value) -> Value {
+    rename_arg(&mut input, "old_string", "old_str");
+    rename_arg(&mut input, "new_string", "new_str");
+    input
+}
+
+/// Map upstream `clarify` args (`choices`) onto `ask`'s `options`.
+pub fn map_clarify_args(mut input: Value) -> Value {
+    rename_arg(&mut input, "choices", "options");
+    input
+}
+
+/// Map upstream `delegate_task` args onto `subagent`'s.
+///
+/// Upstream sends `goal` (+ optional `context`) for one task, or `tasks`
+/// as `[{goal, context}]`; ours takes `name` + `task`, or `tasks` as
+/// `[{name, task}]`. `context` is appended to the task text; a missing role
+/// name defaults to `delegate` (`delegate-N` in a batch). Already-native
+/// `name`/`task` pairs pass through.
+pub fn map_delegate_args(mut input: Value) -> Value {
+    fn task_text(entry: &Value) -> Option<String> {
+        let base = entry
+            .get("task")
+            .or_else(|| entry.get("goal"))
+            .and_then(Value::as_str)?;
+        Some(match entry.get("context").and_then(Value::as_str) {
+            Some(c) if !c.trim().is_empty() => format!("{base}\n\nContext:\n{c}"),
+            _ => base.to_string(),
+        })
+    }
+    let single = task_text(&input);
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    if let Some(Value::Array(tasks)) = obj.get("tasks") {
+        let mapped: Vec<Value> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let name = t
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("delegate-{}", i + 1));
+                json!({"name": name, "task": task_text(t).unwrap_or_default()})
+            })
+            .collect();
+        obj.insert("tasks".into(), Value::Array(mapped));
+    } else if let Some(task) = single {
+        obj.insert("task".into(), Value::String(task));
+        if !obj.contains_key("name") {
+            obj.insert("name".into(), Value::String("delegate".into()));
+        }
+    }
+    obj.remove("goal");
+    obj.remove("context");
+    input
+}
+
+/// Map upstream `skill_manage` args onto `skill`'s.
+///
+/// Actions: `create` / `edit` -> `write`, `delete` -> `archive` (reversible:
+/// the skill moves to `<root>/.archive/`); `patch`, `archive`, `list`,
+/// `read`, `sync` pass through, and anything else reaches `skill` unchanged
+/// so it reports the unknown action itself. `old_string` / `new_string` map
+/// to `old_str` / `new_str`.
+pub fn map_skill_manage_args(mut input: Value) -> Value {
+    map_action(
+        &mut input,
+        &[
+            ("create", "write"),
+            ("edit", "write"),
+            ("delete", "archive"),
+        ],
+    );
+    rename_arg(&mut input, "old_string", "old_str");
+    rename_arg(&mut input, "new_string", "new_str");
+    input
+}
+
+/// Map upstream `cronjob_manage` args onto `cron`'s.
+///
+/// Actions: `create` -> `add`, `delete` -> `remove`; others pass through.
+/// Upstream's `job_id` stands in for `name` when `name` is absent.
+pub fn map_cronjob_args(mut input: Value) -> Value {
+    map_action(&mut input, &[("create", "add"), ("delete", "remove")]);
+    rename_arg(&mut input, "job_id", "name");
+    input
+}
+
+/// Map upstream `session_search` args onto `memory` action=search. Only
+/// `query` is forwarded, so `memory`'s other actions are unreachable here.
+pub fn map_session_search_args(input: &Value) -> Value {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({"action": "search", "query": query})
+}
+
+/// Upstream-Hermes alias for [`BashTool`] under the `terminal` name.
+///
+/// Accepts `command` + `timeout` like `bash`, plus upstream's `workdir`
+/// (resolved against the session cwd). `background: true` is refused: there
+/// is no job supervisor, and a foreground run would block until timeout.
+/// Registered behind the command guard exactly like `bash`.
+pub struct TerminalTool;
+
+#[async_trait]
+impl Tool for TerminalTool {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+    fn description(&self) -> &str {
+        "Run a shell command and return combined stdout+stderr. (Alias of `bash` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run"},
+                "timeout": {"type": "integer", "description": "Timeout seconds (default 180, max 600)"},
+                "workdir": {"type": "string", "description": "Working directory (absolute or cwd-relative)"}
+            },
+            "required": ["command"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            command: String,
+            timeout: Option<u64>,
+            workdir: Option<String>,
+            background: Option<bool>,
+        }
+        let args: Args = serde_json::from_value(input)?;
+        if args.background == Some(true) {
+            return Ok(ToolOutput::err(
+                "terminal: background execution is not supported; run the command in the foreground (with a timeout)",
+            ));
+        }
+        match args.workdir.as_deref().filter(|w| !w.trim().is_empty()) {
+            Some(dir) => {
+                let mut sub = ctx.clone();
+                sub.cwd = Some(resolve_path(dir, ctx.cwd.as_deref()));
+                run_shell(&args.command, args.timeout, &sub).await
+            }
+            None => run_shell(&args.command, args.timeout, ctx).await,
+        }
+    }
+}
+
+/// Upstream-Hermes alias for [`EditTool`] under the `patch` name.
+///
+/// Upstream's `old_string` / `new_string` map to `old_str` / `new_str`
+/// ([`map_patch_args`]). Only upstream's default `mode: "replace"` is
+/// supported; V4A multi-file diffs (`mode: "patch"`) are refused.
+pub struct PatchTool;
+
+#[async_trait]
+impl Tool for PatchTool {
+    fn name(&self) -> &str {
+        "patch"
+    }
+    fn description(&self) -> &str {
+        "Replace an exact string in a file. Fails when old_string is missing or matches more than once (unless replace_all is true). (Alias of `edit` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or cwd-relative path"},
+                "old_string": {"type": "string", "description": "Exact string to replace (must occur once)"},
+                "new_string": {"type": "string", "description": "Replacement string"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        if let Some(mode) = input.get("mode").and_then(Value::as_str) {
+            if mode != "replace" {
+                return Ok(ToolOutput::err(format!(
+                    "patch: mode `{mode}` is not supported; use mode=replace with path, old_string and new_string"
+                )));
+            }
+        }
+        EditTool.execute(map_patch_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`AskTool`] under the `clarify` name
+/// (`choices` maps to `options`, see [`map_clarify_args`]).
+pub struct ClarifyTool;
+
+#[async_trait]
+impl Tool for ClarifyTool {
+    fn name(&self) -> &str {
+        "clarify"
+    }
+    fn description(&self) -> &str {
+        "Pose a question with choices. UI-mediated: present the choices in chat text and proceed with a reasonable default. (Alias of `ask` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to put to the user"},
+                "choices": {"type": "array", "items": {"type": "string"}, "description": "Candidate answers"}
+            },
+            "required": ["question"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        AskTool.execute(map_clarify_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`TodoTool`] under the `todo_list` name.
+pub struct TodoListTool;
+
+#[async_trait]
+impl Tool for TodoListTool {
+    fn name(&self) -> &str {
+        "todo_list"
+    }
+    fn description(&self) -> &str {
+        "Track tasks: list, add, done, clear. Stored in the memory `todos` note. (Alias of `todo` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        TodoTool.schema()
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        TodoTool.execute(input, ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SkillTool`] action=list under the
+/// `skills_list` name. Upstream's optional `category` filter is ignored.
+pub struct SkillsListTool {
+    inner: SkillTool,
+}
+
+impl SkillsListTool {
+    /// Create a skills-list tool rooted at `root`.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            inner: SkillTool::new(root),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillsListTool {
+    fn name(&self) -> &str {
+        "skills_list"
+    }
+    fn description(&self) -> &str {
+        "List available SKILL.md procedures. (Alias of `skill` action=list for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(json!({"action": "list"}), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SkillTool`] under the `skill_manage` name
+/// (action and argument mapping in [`map_skill_manage_args`]).
+pub struct SkillManageTool {
+    inner: SkillTool,
+}
+
+impl SkillManageTool {
+    /// Wrap a configured [`SkillTool`] (same root and hub URL as `skill`).
+    pub fn new(inner: SkillTool) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillManageTool {
+    fn name(&self) -> &str {
+        "skill_manage"
+    }
+    fn description(&self) -> &str {
+        "Create, edit, patch, or delete (archive) reusable SKILL.md procedures. (Alias of `skill` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object", "properties": {
+                "action": {"type": "string", "enum": ["create", "edit", "patch", "delete", "list", "read", "archive", "sync"], "description": "create/edit write the whole SKILL.md; delete archives it to .archive/"},
+                "name": {"type": "string", "description": "skill name (letters, digits, _, -)"},
+                "content": {"type": "string", "description": "full SKILL.md content for create/edit (must include --- frontmatter with name: and description:)"},
+                "old_string": {"type": "string", "description": "exact string to replace for patch (must occur once)"},
+                "new_string": {"type": "string", "description": "replacement string for patch"}
+            }, "required": ["action"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(map_skill_manage_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`MemoryTool`] action=search under the
+/// `session_search` name: cross-session recall over past conversation.
+pub struct SessionSearchTool;
+
+#[async_trait]
+impl Tool for SessionSearchTool {
+    fn name(&self) -> &str {
+        "session_search"
+    }
+    fn description(&self) -> &str {
+        "Search past conversation across sessions. (Alias of `memory` action=search for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Full-text search query"}
+            },
+            "required": ["query"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        let has_query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(|q| !q.trim().is_empty());
+        if !has_query {
+            return Ok(ToolOutput::err(
+                "session_search requires a non-empty `query`",
+            ));
+        }
+        MemoryTool::default()
+            .execute(map_session_search_args(&input), ctx)
+            .await
+    }
+}
+
+/// Upstream-Hermes alias for [`CronTool`] under the `cronjob_manage` name
+/// (action and argument mapping in [`map_cronjob_args`]).
+pub struct CronjobManageTool;
+
+#[async_trait]
+impl Tool for CronjobManageTool {
+    fn name(&self) -> &str {
+        "cronjob_manage"
+    }
+    fn description(&self) -> &str {
+        "List, create, or delete custom cron jobs (persisted in memory; loaded at gateway boot). (Alias of `cron` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "create", "delete", "add", "remove"]},
+                "name": {"type": "string", "description": "Job name (create/delete); `job_id` is accepted too"},
+                "schedule": {"type": "string", "description": "5-field cron expression (create only)"},
+                "prompt": {"type": "string", "description": "Agent prompt (create only)"}
+            },
+            "required": ["action"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        CronTool.execute(map_cronjob_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SubAgentTool`] under the `delegate_task`
+/// name (argument mapping in [`map_delegate_args`]).
+///
+/// It wraps its own `SubAgentTool` over the same parent snapshot, and the
+/// child registry strips every name in [`SUBAGENT_TOOL_NAMES`], so a
+/// delegated child can no more recurse than a `subagent` child can.
+pub struct DelegateTaskTool {
+    inner: SubAgentTool,
+}
+
+impl DelegateTaskTool {
+    /// Build a delegate tool over the parent's provider and tool snapshot.
+    pub fn new(
+        provider: Arc<dyn crate::agent::LlmProvider>,
+        parent_registry: Arc<crate::tools::ToolRegistry>,
+        limits: crate::agent::RunLimits,
+    ) -> Self {
+        Self {
+            inner: SubAgentTool::new(provider, parent_registry, limits),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateTaskTool {
+    fn name(&self) -> &str {
+        "delegate_task"
+    }
+    fn description(&self) -> &str {
+        "Delegate a goal to a fresh isolated sub-agent and return its final answer. Cannot nest. (Alias of `subagent` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "One self-contained goal for the sub-agent."},
+                "context": {"type": "string", "description": "Background the sub-agent needs (it sees no prior history)."},
+                "tasks": {"type": "array", "items": {"type": "object", "properties": {"goal": {"type": "string"}, "context": {"type": "string"}}, "required": ["goal"]}, "description": "Up to four independent goals, run concurrently."},
+                "timeout": {"type": "integer", "description": "Per-child timeout seconds (default 120, max 600)."}
+            }
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(map_delegate_args(input), ctx).await
     }
 }
 
@@ -2804,7 +3641,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let tool = MemoryTool;
+            let tool = MemoryTool::default();
             let out = tool
                 .execute(json!({"action": "list"}), &ToolContext::default())
                 .await
@@ -2820,7 +3657,7 @@ mod tests {
             memory: Some(mem),
             ..Default::default()
         };
-        let tool = MemoryTool;
+        let tool = MemoryTool::default();
         // `search` with the explicit `query` field (no `key`).
         let out = tool
             .execute(json!({"action": "search", "query": "nothing-here"}), &ctx)
@@ -2837,7 +3674,7 @@ mod tests {
 
     #[test]
     fn memory_schema_lists_all_five_actions() {
-        let s = MemoryTool.schema();
+        let s = MemoryTool::default().schema();
         let actions = s["properties"]["action"]["enum"]
             .as_array()
             .unwrap()
@@ -2848,7 +3685,206 @@ mod tests {
             assert!(actions.contains(&a), "schema missing action {a}");
         }
         assert!(s["properties"]["query"].is_object());
-        assert!(MemoryTool.description().contains("search"));
+        assert!(MemoryTool::default().description().contains("search"));
+    }
+
+    /// Tool with both sidecars under a fresh nested dir (parents not created).
+    fn markdown_memory_tool() -> (tempfile::TempDir, MemoryTool, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("nested/dir/MEMORY.md");
+        let user = tmp.path().join("other/USER.md");
+        let tool = MemoryTool::new(Some(mem.clone()), Some(user.clone()));
+        (tmp, tool, mem, user)
+    }
+
+    async fn run(tool: &MemoryTool, input: Value) -> ToolOutput {
+        tool.execute(input, &ToolContext::default()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_add_patch_remove_on_both_targets() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        for (target, path) in [("memory", &mem), ("user", &user)] {
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "likes green tea"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "runs a Raspberry Pi 5"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "likes green tea\n§\nruns a Raspberry Pi 5\n"
+            );
+            // Duplicate add is a no-op success.
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "likes green tea"}),
+            )
+            .await;
+            assert!(!out.is_error && out.content.contains("already exists"));
+
+            let out = run(
+                &tool,
+                json!({"action": "patch", "target": target, "old_text": "green", "new_text": "oolong"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert!(std::fs::read_to_string(path)
+                .unwrap()
+                .starts_with("likes oolong tea\n§\n"));
+
+            let out = run(
+                &tool,
+                json!({"action": "remove", "target": target, "old_text": "Raspberry"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "likes oolong tea\n");
+        }
+        // No temp files left behind by the atomic writes.
+        let leftovers = std::fs::read_dir(mem.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_target_defaults_to_memory() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        let out = run(&tool, json!({"action": "add", "content": "fact"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&mem).unwrap(), "fact\n");
+        assert!(!user.exists());
+        let out = run(
+            &tool,
+            json!({"action": "add", "target": "nope", "content": "x"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("invalid memory target"));
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_refuses_over_char_limit() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        let big = "u".repeat(crate::bootstrap::USER_MD_CHARS + 1);
+        let out = run(
+            &tool,
+            json!({"action": "add", "target": "user", "content": big}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Consolidate"), "{}", out.content);
+        assert!(!user.exists(), "refused write must not touch the file");
+
+        // Fill MEMORY.md near the cap, then a batch that frees room succeeds
+        // where a lone add would not.
+        let filler = "m".repeat(crate::bootstrap::MEMORY_MD_CHARS - 10);
+        assert!(
+            !run(&tool, json!({"action": "add", "content": filler}))
+                .await
+                .is_error
+        );
+        let out = run(&tool, json!({"action": "add", "content": "one more fact"})).await;
+        assert!(out.is_error && out.content.contains("Consolidate"));
+        let out = run(
+            &tool,
+            json!({"target": "memory", "operations": [
+                {"action": "remove", "old_text": "mmmm"},
+                {"action": "add", "content": "one more fact"}
+            ]}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&mem).unwrap(), "one more fact\n");
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_refuses_ambiguous_patch() {
+        let (_tmp, tool, mem, _user) = markdown_memory_tool();
+        for c in ["uses tea at work", "uses tea at home"] {
+            assert!(
+                !run(&tool, json!({"action": "add", "content": c}))
+                    .await
+                    .is_error
+            );
+        }
+        let before = std::fs::read_to_string(&mem).unwrap();
+        let out = run(
+            &tool,
+            json!({"action": "patch", "old_text": "uses tea", "new_text": "uses coffee"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("Multiple entries matched"));
+        // Span repeated inside one entry is also refused.
+        assert!(
+            !run(&tool, json!({"action": "add", "content": "a-b a-b"}))
+                .await
+                .is_error
+        );
+        let out = run(
+            &tool,
+            json!({"action": "patch", "old_text": "a-b", "new_text": "c"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("more than once"));
+        // No match is an error too, and nothing changed on disk.
+        let out = run(&tool, json!({"action": "remove", "old_text": "absent"})).await;
+        assert!(out.is_error && out.content.contains("No entry matched"));
+        assert!(std::fs::read_to_string(&mem).unwrap().starts_with(&before));
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_missing_path_is_tool_error() {
+        let tool = MemoryTool::default();
+        for target in ["memory", "user"] {
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "x"}),
+            )
+            .await;
+            assert!(out.is_error);
+            assert!(out.content.contains("not configured"), "{}", out.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_legacy_actions_still_work_with_paths_configured() {
+        let (_tmp, tool, mem, _user) = markdown_memory_tool();
+        let ctx = ToolContext {
+            memory: Some(Arc::new(crate::memory::Memory::in_memory().unwrap())),
+            ..Default::default()
+        };
+        let out = tool
+            .execute(json!({"action": "write", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "ok");
+        let out = tool
+            .execute(json!({"action": "read", "key": "k"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "v");
+        let out = tool.execute(json!({"action": "list"}), &ctx).await.unwrap();
+        assert!(out.content.contains("k: v"));
+        let out = tool
+            .execute(json!({"action": "search", "query": "anything"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let out = tool
+            .execute(json!({"action": "delete", "key": "k"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "ok");
+        assert!(!mem.exists(), "legacy actions must not touch MEMORY.md");
+        let schema = tool.schema();
+        for field in ["target", "content", "old_text", "new_text", "operations"] {
+            assert!(schema["properties"][field].is_object(), "missing {field}");
+        }
     }
 
     fn write_skill_tree(root: &Path, rel: &str, raw: &str) {
@@ -3177,6 +4213,267 @@ mod tests {
             assert!(!tool.description().is_empty());
             assert_eq!(tool.schema()["type"], "object");
         }
+    }
+
+    #[test]
+    fn upstream_aliases_have_distinct_names() {
+        let provider: Arc<dyn crate::agent::LlmProvider> =
+            Arc::new(crate::agent::mock::MockProvider::text_only(""));
+        let delegate = DelegateTaskTool::new(
+            provider,
+            Arc::new(crate::tools::ToolRegistry::new()),
+            crate::agent::RunLimits::default(),
+        );
+        for (tool, name, canonical) in [
+            (&TerminalTool as &dyn Tool, "terminal", "bash"),
+            (&PatchTool as &dyn Tool, "patch", "edit"),
+            (&ClarifyTool as &dyn Tool, "clarify", "ask"),
+            (&TodoListTool as &dyn Tool, "todo_list", "todo"),
+            (
+                &SkillsListTool::new(PathBuf::from("/x")) as &dyn Tool,
+                "skills_list",
+                "skill",
+            ),
+            (
+                &SkillManageTool::new(SkillTool::new(PathBuf::from("/x"))) as &dyn Tool,
+                "skill_manage",
+                "skill",
+            ),
+            (&SessionSearchTool as &dyn Tool, "session_search", "memory"),
+            (&CronjobManageTool as &dyn Tool, "cronjob_manage", "cron"),
+            (&delegate as &dyn Tool, "delegate_task", "subagent"),
+        ] {
+            assert_eq!(tool.name(), name);
+            assert!(
+                tool.description()
+                    .contains(&format!("(Alias of `{canonical}`")),
+                "{name}: {}",
+                tool.description()
+            );
+            assert_eq!(tool.schema()["type"], "object");
+        }
+    }
+
+    #[test]
+    fn patch_args_map_upstream_names() {
+        let mapped = map_patch_args(json!({
+            "path": "a.txt", "old_string": "x", "new_string": "y", "replace_all": true
+        }));
+        assert_eq!(
+            mapped,
+            json!({"path": "a.txt", "old_str": "x", "new_str": "y", "replace_all": true})
+        );
+        // Native names pass through and win over upstream ones.
+        let native = map_patch_args(json!({"path": "a", "old_str": "n", "old_string": "u"}));
+        assert_eq!(native["old_str"], "n");
+    }
+
+    #[tokio::test]
+    async fn patch_edits_with_upstream_args_and_refuses_v4a_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolContext {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("f.txt"), "hello world").unwrap();
+        let out = PatchTool
+            .execute(
+                json!({"path": "f.txt", "old_string": "world", "new_string": "hermes"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "hello hermes"
+        );
+        let out = PatchTool
+            .execute(json!({"mode": "patch", "patch": "*** Begin Patch"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn clarify_maps_choices_to_options() {
+        assert_eq!(
+            map_clarify_args(json!({"question": "q", "choices": ["a", "b"]})),
+            json!({"question": "q", "options": ["a", "b"]})
+        );
+        let out = ClarifyTool
+            .execute(
+                json!({"question": "Which?", "choices": ["red", "blue"]}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("Which?"));
+        assert!(out.content.contains("1. red"));
+        assert!(out.content.contains("2. blue"));
+    }
+
+    #[test]
+    fn delegate_args_map_goal_context_and_tasks() {
+        assert_eq!(
+            map_delegate_args(json!({"goal": "find x", "context": "in repo y"})),
+            json!({"name": "delegate", "task": "find x\n\nContext:\nin repo y"})
+        );
+        assert_eq!(
+            map_delegate_args(json!({"goal": "g", "timeout": 30})),
+            json!({"name": "delegate", "task": "g", "timeout": 30})
+        );
+        assert_eq!(
+            map_delegate_args(json!({"tasks": [{"goal": "a"}, {"goal": "b", "context": "c"}]})),
+            json!({"tasks": [
+                {"name": "delegate-1", "task": "a"},
+                {"name": "delegate-2", "task": "b\n\nContext:\nc"}
+            ]})
+        );
+        // Native subagent args pass through unchanged.
+        let native = json!({"name": "researcher", "task": "t"});
+        assert_eq!(map_delegate_args(native.clone()), native);
+    }
+
+    #[test]
+    fn skill_manage_args_map_actions_and_names() {
+        for (upstream, ours) in [
+            ("create", "write"),
+            ("edit", "write"),
+            ("delete", "archive"),
+            ("patch", "patch"),
+            ("list", "list"),
+            ("write_file", "write_file"),
+        ] {
+            let mapped = map_skill_manage_args(json!({"action": upstream, "name": "s"}));
+            assert_eq!(mapped["action"], ours, "{upstream}");
+        }
+        let mapped = map_skill_manage_args(
+            json!({"action": "patch", "name": "s", "old_string": "a", "new_string": "b"}),
+        );
+        assert_eq!(
+            mapped,
+            json!({"action": "patch", "name": "s", "old_str": "a", "new_str": "b"})
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_manage_create_patch_delete_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = SkillManageTool::new(SkillTool::new(tmp.path().to_path_buf()));
+        let ctx = ToolContext::default();
+        let content = "---\nname: demo\ndescription: a demo\n---\nstep one\n";
+        let out = tool
+            .execute(
+                json!({"action": "create", "name": "demo", "content": content}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let out = tool
+            .execute(
+                json!({"action": "patch", "name": "demo", "old_string": "step one", "new_string": "step two"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let listed = SkillsListTool::new(tmp.path().to_path_buf())
+            .execute(json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(listed.content.contains("demo"), "{}", listed.content);
+        let out = tool
+            .execute(json!({"action": "delete", "name": "demo"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("archived"));
+        assert!(!tmp.path().join("demo").exists());
+    }
+
+    #[test]
+    fn cronjob_args_map_actions_and_job_id() {
+        assert_eq!(
+            map_cronjob_args(
+                json!({"action": "create", "name": "n", "schedule": "* * * * *", "prompt": "p"})
+            ),
+            json!({"action": "add", "name": "n", "schedule": "* * * * *", "prompt": "p"})
+        );
+        assert_eq!(
+            map_cronjob_args(json!({"action": "delete", "job_id": "n"})),
+            json!({"action": "remove", "name": "n"})
+        );
+        assert_eq!(
+            map_cronjob_args(json!({"action": "list"})),
+            json!({"action": "list"})
+        );
+    }
+
+    #[test]
+    fn session_search_args_forward_only_query() {
+        assert_eq!(
+            map_session_search_args(&json!({"query": "rust", "limit": 3, "role_filter": "user"})),
+            json!({"action": "search", "query": "rust"})
+        );
+    }
+
+    #[tokio::test]
+    async fn session_search_requires_query() {
+        let out = SessionSearchTool
+            .execute(json!({"query": "  "}), &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn terminal_honours_workdir_and_refuses_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = TerminalTool
+            .execute(
+                json!({"command": "pwd", "workdir": tmp.path().to_str().unwrap()}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            out.content.contains(canon.to_str().unwrap())
+                || out.content.contains(tmp.path().to_str().unwrap()),
+            "{}",
+            out.content
+        );
+        let out = TerminalTool
+            .execute(
+                json!({"command": "sleep 100", "background": true}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("background"));
+    }
+
+    #[tokio::test]
+    async fn todo_list_delegates_to_todo() {
+        let ctx = ToolContext {
+            memory: Some(Arc::new(crate::memory::Memory::in_memory().unwrap())),
+            ..Default::default()
+        };
+        let out = TodoListTool
+            .execute(json!({"action": "add", "text": "ship aliases"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let out = TodoTool
+            .execute(json!({"action": "list"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("ship aliases"));
     }
 
     #[test]

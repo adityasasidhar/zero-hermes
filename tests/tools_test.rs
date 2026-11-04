@@ -122,7 +122,7 @@ async fn memory_tool_round_trip() {
         memory: Some(mem.clone()),
         ..Default::default()
     };
-    let tool = MemoryTool;
+    let tool = MemoryTool::default();
     tool.execute(json!({"action": "write", "key": "k", "value": "v"}), &ctx)
         .await
         .unwrap();

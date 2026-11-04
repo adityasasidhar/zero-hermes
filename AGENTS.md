@@ -17,7 +17,7 @@ read it before touching anything beyond a one-line change.
 ## Layout (top level)
 
 `src/` agent loop, providers, tools, channels, web; `tests/` integration
-tests; `skills/` vendored Hermes skill pack (loaded recursively); `web/`
+tests; `skills/` default skills root, shipped empty (loaded recursively); `web/`
 single-file UI embedded via `include_str!`; `assets/` logos; `bench/`
 size/cold-start/RSS script; `.github/workflows/` CI. Full map under
 [Architecture map](#architecture-map).
@@ -160,6 +160,13 @@ Ollama example is `http://127.0.0.1:11434/v1`, so without the strip that config
 would request `/v1/v1/chat/completions`. A bare `base_url = "/v1"` is left
 alone so the mistake stays visible.
 
+**Memory tool shapes.** `memory` accepts two call shapes. The legacy one
+(`read|write|list|delete|search`) works on SQLite. The upstream Hermes one
+(`add|patch|remove` with `target: memory|user`, or a batch `operations` list)
+edits `MEMORY.md` (2200 chars) / `USER.md` (1375 chars) with entries separated
+by `\n§\n`, atomically, and never needs SQLite. `MemoryTool::new` takes the two
+paths from config; `MemoryTool::default()` has none and is fine for search.
+
 **Wire-format gotcha.** `Message::tool_results` stores results in a
 *user*-role message (the Anthropic shape). `OpenAiCompat::build_body` has
 to translate those into separate `role:"tool"` messages — handling only a
@@ -244,7 +251,14 @@ src/
                        write_file, skill, skill_view, subagent. Hermes-compat
                        aliases (execute_command/execute_code/read_file/
                        write_file/search_files/skill_view/web_search/
-                       web_extract) are registered so vendored skills resolve
+                       web_extract) are registered so vendored skills resolve,
+                       as are the *current upstream* names: terminal (bash,
+                       command-guarded), patch (edit), clarify (ask),
+                       delegate_task (subagent), todo_list, skills_list,
+                       skill_manage, session_search (memory search) and
+                       cronjob_manage, each mapping upstream's argument names
+                       onto ours. They go through `insert`, so
+                       [agent].enabled_tools gates them
   memory.rs            rusqlite (bundled): durable session transcripts, notes,
                        and an FTS5 `message_search` index for cross-session
                        recall; `Memory::in_memory()` for tests
@@ -267,8 +281,8 @@ src/
                        /send requires the per-process CSRF token injected
                        into the page — a form POST needs no preflight, so
                        without it any site could drive the bash tool
-skills/                the vendored Hermes-compatible skill pack
-                       (~130 SKILL.md files); loaded recursively
+skills/                default skills root; ships empty (.gitkeep).
+                       Drop a Hermes skill pack in; loaded recursively
 web/index.html         single-file UI; embedded into the binary via include_str!
 assets/                zero_hermes_logo.png is the full-colour master (README
                        hero only); hermes-mark.png (192px) and
@@ -306,8 +320,9 @@ and wire it into `build_provider`. Both `complete` and `stream` are required;
 `LlmProvider::stream` has a default one-shot fallback you can use.
 
 **Sub-agent gotcha** — `SubAgentTool` (`src/tools/builtin.rs`) holds an
-`Arc<ToolRegistry>` of the parent's tools and clones them minus `subagent`
-itself at call time, so it cannot recurse. If you add new tools to the
+`Arc<ToolRegistry>` of the parent's tools and clones them minus every name in
+`SUBAGENT_TOOL_NAMES` (`subagent` and its alias `delegate_task`) at call time,
+so it cannot recurse. A new alias of `subagent` must be added to that list. If you add new tools to the
 parent registry, they automatically become available to sub-agents.
 
 ## Conventions
@@ -334,11 +349,13 @@ parent registry, they automatically become available to sub-agents.
 ## Constraints (worth preserving)
 
 - **No git push.** Local repo only; the user pushes manually.
-- `skills/` vendors the nested Hermes skill pack and is loaded recursively
-  (`tests/skills_test.rs` asserts every `SKILL.md` registers). Keep the
-  layout flat-or-nested as Hermes ships it, and prefer adding a skill
-  directory over changing the loader. The stub directories from v0.1
-  (`stub-1`, `stub-2`) were removed once the real pack landed.
+- `skills/` ships empty (only `.gitkeep`); the vendored Hermes pack was
+  removed in `b92058e`. Install skills by copying a pack in (upstream
+  `skills/` and `optional-skills/` from NousResearch/hermes-agent load
+  unmodified) or with `skill` `sync`. The loader is recursive and
+  `tests/skills_test.rs` asserts every `SKILL.md` in a nested tree registers.
+  Keep accepting the layout flat-or-nested as Hermes ships it, and prefer
+  adding a skill directory over changing the loader.
 - The Dockerfile's dep-cache stage must stub **every** target Cargo.toml
   declares (`src/main.rs`, `src/lib.rs`) plus every file pulled in by
   `include_str!`/`include_bytes!` — currently `web/index.html`,
