@@ -275,7 +275,7 @@ Cron jobs are configured in TOML and run in the gateway process:
 | Cron tools | `zero-hermes cron list` | Inspect configured automation |
 
 Terminal chat supports `/help`, `/status`, `/tools`, `/clear`, `/retry`,
-`/undo`, `/compress`, and `/exit`. `zero-hermes doctor` checks your setup. See
+`/undo`, `/compress` (model-written summary), `/model [name]`, and `/exit`. `zero-hermes doctor` checks your setup. See
 [PARITY.md](PARITY.md) for how this compares with Hermes Agent.
 `repl` remains an alias for `chat`.
 

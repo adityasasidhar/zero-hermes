@@ -323,13 +323,14 @@ async fn run_once(cfg: Config, message: &str, mock: bool, stream: bool) -> Resul
 async fn run_chat(cfg: Config, mock: bool, no_banner: bool) -> Result<()> {
     let skills = load_skills(&cfg);
     let memory = Arc::new(Memory::open(cfg.memory.path.as_deref())?);
-    let provider: Arc<dyn LlmProvider> = if mock {
+    let mut provider: Arc<dyn LlmProvider> = if mock {
         Arc::new(MockProvider::echo())
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
     let registry = build_tool_registry_async(&cfg, provider.clone()).await;
     let system = build_system_prompt_with_memory(&cfg, &skills, Some(&memory));
+    let mut cfg = cfg;
     let session_id = "cli-default";
     let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory.clone());
     ctx.session_id = Some(session_id.into());
@@ -385,8 +386,35 @@ async fn run_chat(cfg: Config, mock: bool, no_banner: bool) -> Result<()> {
                 }
                 continue;
             }
+            other if other == "/model" || other.starts_with("/model ") => {
+                let wanted = other["/model".len()..].trim();
+                if wanted.is_empty() {
+                    println!("  model: {}", cfg.provider.model);
+                } else if mock {
+                    println!("  (mock provider: model switching is a no-op)");
+                } else {
+                    let mut next = cfg.provider.clone();
+                    next.model = wanted.to_string();
+                    match build_provider(&next) {
+                        Ok(p) => {
+                            provider = Arc::from(p);
+                            cfg.provider = next;
+                            println!(
+                                "  model -> {wanted} (subagents keep the model chat started with)"
+                            );
+                        }
+                        Err(e) => println!("  cannot switch model: {e}"),
+                    }
+                }
+                continue;
+            }
             "/compress" => {
-                match zero_hermes::agent::compress_history(&mut history) {
+                let outcome = if mock {
+                    zero_hermes::agent::compress_history(&mut history)
+                } else {
+                    zero_hermes::agent::compress_history_llm(provider.as_ref(), &mut history).await
+                };
+                match outcome {
                     Some((before, after)) => {
                         if let Err(e) = memory.save_history(session_id, &history) {
                             tracing::warn!(error = %e, "saving compressed history failed");
@@ -537,7 +565,8 @@ fn print_chat_help() {
     println!("  /clear      reset this chat's conversation history");
     println!("  /retry      re-run your last message");
     println!("  /undo       remove your last message and the reply");
-    println!("  /compress   summarize older history to free context");
+    println!("  /compress   have the model summarize older history to free context");
+    println!("  /model [m]  show, or switch, the model for this chat");
     println!("  /exit       leave chat (aliases: /quit, /q)");
 }
 

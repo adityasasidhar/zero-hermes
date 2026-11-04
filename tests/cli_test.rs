@@ -780,7 +780,7 @@ fn chat_retry_and_undo_commands() {
         .stdin
         .take()
         .expect("stdin")
-        .write_all(b"hello there\n/retry\n/undo\n/undo\n/compress\n/exit\n")
+        .write_all(b"hello there\n/retry\n/undo\n/undo\n/compress\n/model\n/model other\n/exit\n")
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
     assert!(out.status.success());
@@ -798,6 +798,8 @@ fn chat_retry_and_undo_commands() {
     assert!(text.contains("removed the last turn"), "{text}");
     assert!(text.contains("nothing to undo"), "{text}");
     assert!(text.contains("nothing to compress yet"), "{text}");
+    assert!(text.contains("model: "), "{text}");
+    assert!(text.contains("model switching is a no-op"), "{text}");
 }
 
 /// `doctor` exits 0 with `--mock`, and fails (non-zero, naming the problem)
@@ -815,4 +817,31 @@ fn doctor_reports_missing_api_key_and_passes_in_mock_mode() {
     assert!(!bad.status.success());
     let text = String::from_utf8_lossy(&bad.stdout);
     assert!(text.contains("[FAIL] provider: api_key is empty"), "{text}");
+}
+
+/// `/model NAME` rebuilds the provider and `/status` reflects it. No network
+/// is touched: providers connect lazily, on the first turn.
+#[test]
+fn chat_model_command_switches_the_model() {
+    use std::io::Write;
+
+    let sb = Sandbox::new();
+    let mut child = sb
+        .command(&["chat", "--no-banner"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chat");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"/model my-test-model\n/status\n/exit\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("model -> my-test-model"), "{text}");
+    assert!(text.contains("model: my-test-model"), "{text}");
 }

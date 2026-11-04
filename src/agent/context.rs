@@ -74,6 +74,43 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// Prepend `summary` to the first message of `tail` (always a plain user turn
+/// by construction — see [`is_safe_head`]) and return the new tail.
+///
+/// The summary is merged into that message rather than pushed as a separate
+/// user message, which would produce `user,user` and break role alternation.
+pub fn splice_summary(tail: &[Message], summary: String) -> Vec<Message> {
+    let mut tail = tail.to_vec();
+    if let Some(head) = tail.first_mut() {
+        let merged = format!("{summary}\n\n---\n{}", head.text());
+        if let Some(block) = head.content.first_mut() {
+            match block {
+                ContentBlock::Text { text } => {
+                    *text = merged;
+                }
+                _ => {
+                    head.content.insert(0, ContentBlock::Text { text: merged });
+                }
+            }
+        } else {
+            head.content.push(ContentBlock::Text { text: merged });
+        }
+    } else {
+        // No tail: keep a single user summary so history never empties.
+        tail.push(Message::user(summary));
+    }
+    tail
+}
+
+/// Earliest safe cut that leaves a tail of at most `tail_tokens`, so as much
+/// recent conversation as fits stays verbatim. `None` when no safe boundary
+/// leaves a small enough tail.
+pub fn find_cut_keeping_tail(history: &[Message], tail_tokens: usize) -> Option<usize> {
+    (1..history.len())
+        .filter(|&i| is_safe_head(&history[i]))
+        .find(|&i| estimate_tokens(&history[i..]) <= tail_tokens)
+}
+
 /// Replace an old, complete prefix with a bounded textual summary when the
 /// transcript exceeds `max_tokens`. Tool traffic is deliberately omitted from
 /// the summary: it is implementation detail, can be huge, and may be unsafe
@@ -96,32 +133,8 @@ pub fn compact_history_to_tokens(history: &mut Vec<Message>, max_tokens: usize) 
             .saturating_mul(4)
             .saturating_sub(32);
         let summary = summarize_prefix(&history[..cut], summary_cap);
-        // Merge the summary into the tail head instead of pushing a
-        // separate user message: the tail head is always a plain user
-        // turn (`is_safe_head`), so a separate message would produce
-        // `user,user` and break role alternation. Prepending keeps one
-        // user message at the head.
         let mut compacted = Vec::with_capacity(history.len() - cut);
-        let mut tail = history[cut..].to_vec();
-        if let Some(head) = tail.first_mut() {
-            let merged = format!("{summary}\n\n---\n{}", head.text());
-            if let Some(block) = head.content.first_mut() {
-                match block {
-                    ContentBlock::Text { text } => {
-                        *text = merged;
-                    }
-                    _ => {
-                        head.content.insert(0, ContentBlock::Text { text: merged });
-                    }
-                }
-            } else {
-                head.content.push(ContentBlock::Text { text: merged });
-            }
-        } else {
-            // No tail (shouldn't happen — the cut range excludes an empty
-            // tail): keep a single user summary so history never empties.
-            tail.push(Message::user(summary));
-        }
+        let tail = splice_summary(&history[cut..], summary);
         compacted.extend_from_slice(&tail);
         if estimate_tokens(&compacted) <= max_tokens {
             *history = compacted;

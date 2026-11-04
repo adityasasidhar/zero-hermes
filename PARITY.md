@@ -19,7 +19,7 @@ for platform sprawl (see *Out of scope*). It is not a drop-in replacement.
 | MCP servers | **yes** | stdio (persistent session, respawn) and streamable HTTP (JSON/SSE, session id, headers) |
 | Agent-curated memory | **yes** | SQLite notes + `MEMORY.md`/`USER.md` sidecars, per-turn recall injected into the prompt |
 | Cross-session search | partial | FTS5 recall; no LLM summarisation of hits |
-| Context compression | **yes** | pair-safe compaction + token-budget summary; `/compress` on demand (extractive, not LLM-written) |
+| Context compression | **yes** | pair-safe compaction + token-budget summary (extractive); `/compress` asks the model for a summary and keeps the recent third verbatim, falling back to extractive on failure |
 | Skills (agentskills-style `SKILL.md`) | **yes** | recursive loader, create/patch/archive, hub sync, `curate` command |
 | Self-improving skills | partial | model can write/patch skills; `curate` reviews the library on demand or via cron |
 | Command approval / security | partial | no interactive approval (headless daemon). Instead: command guard refuses catastrophic commands, SSRF guard on fetch (spelling checks + DNS resolution vetting with connection pinning), CSRF on web, Telegram allow-list required, tools allow-list |
@@ -28,7 +28,7 @@ for platform sprawl (see *Out of scope*). It is not a drop-in replacement.
 | Messaging gateway | partial | Telegram only (Hermes: Telegram, Discord, Slack, WhatsApp, Signal, Email, Home Assistant) |
 | Session commands | **yes** | `/new`, `/clear`, `/retry`, `/undo`, `/compress`, `/status`, `/tools`, `/help` in chat |
 | `hermes doctor` | **yes** | `zero-hermes doctor` |
-| Provider switching | partial | config-driven (`[provider]`, fallbacks); no runtime `/model` switch |
+| Provider switching | **yes** (model) | config-driven (`[provider]`, fallbacks) plus `/model NAME` in chat; switching *provider kind* needs a config edit |
 | Web UI | **yes** | local axum + SSE UI, multi-session |
 | Terminal backends | local only | Hermes: Docker, SSH, Modal, Daytona, … |
 
@@ -42,6 +42,5 @@ matters at multi-user scale.
 
 ## Known gaps worth closing next
 
-1. LLM-written compression and recall summaries (needs a background provider call).
-2. Runtime `/model` switching.
-3. A second gateway (Discord or Slack) behind the existing `Channel` trait.
+1. LLM-written *recall* summaries and automatic (not just `/compress`) model-written compaction.
+2. A second gateway (Discord or Slack) behind the existing `Channel` trait.

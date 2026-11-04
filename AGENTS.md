@@ -74,7 +74,7 @@ Subcommands (see the `Command` enum in `src/main.rs`):
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `gateway`        | Telegram long-poll + agent loop + cron scheduler                                                                             |
 | `run "msg"`      | one agent turn against the configured provider, then exit                                                                    |
-| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/retry`, `/undo`, `/compress`, `/exit`) |
+| `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/retry`, `/undo`, `/compress`, `/model`, `/exit`) |
 | `doctor`         | static health checks (config, memory, skills, MCP, Telegram, guard); exits non-zero on FAIL |
 | `curate`         | one skill-curator agent turn (`skills::curator_prompt`): merge overlaps, fix stale skills, `skill archive` redundant ones |
 | `cron list`      | print configured jobs and next firing time                                                                                   |
@@ -231,7 +231,9 @@ src/
     provider.rs        LlmProvider trait, AnthropicMessages, OpenAiCompat, parse_response
     stream.rs          Anthropic + OpenAI SSE parsers, StreamEvent enum
     tool.rs            Tool / ToolCall / ToolResult / ToolOutput / Message / ContentBlock
-    context.rs         compact_history: pair-safe oldest-drop compaction
+    context.rs         compact_history: pair-safe oldest-drop compaction;
+                       splice_summary + find_cut_keeping_tail back the
+                       model-written `agent::compress_history_llm`
     mock.rs            MockProvider (text_only / echo) for --mock and tests
   tools/
     mod.rs             ToolRegistry (insert respects [agent].enabled_tools allowlist;
