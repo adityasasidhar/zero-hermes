@@ -1710,8 +1710,308 @@ fn collapse_text(s: &str) -> String {
 
 // MemoryTool
 
-/// Read/write notes in the agent's persistent memory.
-pub struct MemoryTool;
+/// Separator between entries in `MEMORY.md` / `USER.md` (upstream Hermes'
+/// `ENTRY_DELIMITER`), so files stay interchangeable with Hermes Agent.
+pub const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
+
+/// Serialises read-modify-write cycles on the Markdown sidecars across every
+/// `MemoryTool` instance (gateway sessions and sub-agents share the files).
+static MARKDOWN_MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Durable memory, in two shapes.
+///
+/// * zero-hermes shape — `action: read|write|list|delete|search` over the
+///   SQLite notes store and the cross-session transcript index.
+/// * upstream Hermes shape — `action: add|patch|remove` (or a batch
+///   `operations` list) with `target: memory|user`, editing the curated
+///   Markdown sidecars `MEMORY.md` / `USER.md` that bootstrap injects into
+///   the system prompt. Entries are separated by [`MEMORY_ENTRY_DELIMITER`]
+///   and capped at [`crate::bootstrap::MEMORY_MD_CHARS`] /
+///   [`crate::bootstrap::USER_MD_CHARS`] characters per file.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryTool {
+    memory_md: Option<PathBuf>,
+    user_md: Option<PathBuf>,
+}
+
+impl MemoryTool {
+    /// Build the tool with the `MEMORY.md` (`target=memory`) and `USER.md`
+    /// (`target=user`) paths. `None` makes that target's Hermes-shape calls
+    /// return a "not configured" tool error; the SQLite actions still work.
+    pub fn new(memory_md: Option<PathBuf>, user_md: Option<PathBuf>) -> Self {
+        Self { memory_md, user_md }
+    }
+
+    /// Run a Hermes-shape call (`add` / `patch` / `remove` / `operations`).
+    fn execute_markdown(
+        &self,
+        action: Option<&str>,
+        target: Option<&str>,
+        single: MarkdownOp,
+        operations: Option<Vec<Value>>,
+    ) -> ToolOutput {
+        let target = target.unwrap_or("memory");
+        let (path, limit, label, setting) = match target {
+            "memory" => (
+                self.memory_md.as_deref(),
+                crate::bootstrap::MEMORY_MD_CHARS,
+                "MEMORY.md",
+                "memory.markdown_path",
+            ),
+            "user" => (
+                self.user_md.as_deref(),
+                crate::bootstrap::USER_MD_CHARS,
+                "USER.md",
+                "memory.user_path",
+            ),
+            other => {
+                return ToolOutput::err(format!(
+                    "invalid memory target '{other}'; use 'memory' or 'user'"
+                ))
+            }
+        };
+        let Some(path) = path else {
+            return ToolOutput::err(format!(
+                "{label} is not configured (set `{setting}` in zero_hermes.toml); \
+                 nothing was written"
+            ));
+        };
+        let ops = match operations {
+            Some(list) => {
+                let mut ops = Vec::with_capacity(list.len());
+                for (i, raw) in list.into_iter().enumerate() {
+                    match serde_json::from_value::<MarkdownOp>(raw) {
+                        Ok(op) => ops.push(op),
+                        Err(e) => {
+                            return ToolOutput::err(format!(
+                                "operation {}: expected {{action, content?, old_text?}}: {e}",
+                                i + 1
+                            ))
+                        }
+                    }
+                }
+                if ops.is_empty() {
+                    return ToolOutput::err("`operations` is empty; nothing was written");
+                }
+                ops
+            }
+            None => vec![MarkdownOp {
+                action: action.map(str::to_string),
+                ..single
+            }],
+        };
+
+        let _guard = MARKDOWN_MEMORY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return ToolOutput::err(format!("could not read {label}: {e}")),
+        };
+        let before = parse_memory_entries(&original);
+        let mut entries = before.clone();
+        let mut messages = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            match apply_markdown_op(&mut entries, op) {
+                Ok(msg) => messages.push(msg),
+                Err(e) if ops.len() > 1 => {
+                    return ToolOutput::err(format!(
+                        "operation {}: {e} Nothing was written.",
+                        i + 1
+                    ))
+                }
+                Err(e) => return ToolOutput::err(format!("{e} Nothing was written.")),
+            }
+        }
+        let old_total = memory_chars(&before);
+        let new_total = memory_chars(&entries);
+        // Over budget is refused, except for a write that shrinks a file that
+        // was already over (hand edits): pruning is the way back under.
+        if new_total > limit && new_total > old_total {
+            return ToolOutput::err(format!(
+                "{label} would be {new_total}/{limit} chars (over by {}). Consolidate: \
+                 'remove' or 'patch' stale entries to make room, ideally in ONE \
+                 `operations` batch that also adds the new entry (the limit is checked on \
+                 the final result). Nothing was written. Current entries:\n{}",
+                new_total - limit,
+                render_memory_entries(&before)
+            ));
+        }
+        if entries != before {
+            if let Err(e) = write_atomic(path, &serialize_memory_entries(&entries)) {
+                return ToolOutput::err(format!("could not write {label}: {e}"));
+            }
+        }
+        ToolOutput::ok(format!(
+            "{} {label}: {new_total}/{limit} chars, {} entr{}.",
+            messages.join(" "),
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
+        ))
+    }
+}
+
+/// One Hermes-shape edit: `add` uses `content`; `patch` replaces the unique
+/// `old_text` span with `content` (or its alias `new_text`); `remove` drops
+/// the entry containing `old_text`.
+#[derive(Debug, Default, Deserialize)]
+struct MarkdownOp {
+    action: Option<String>,
+    content: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+}
+
+/// Split a sidecar into trimmed, non-empty entries.
+fn parse_memory_entries(raw: &str) -> Vec<String> {
+    raw.trim()
+        .split(MEMORY_ENTRY_DELIMITER.trim_matches('\n'))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// File body for `entries` (empty file when there are none).
+fn serialize_memory_entries(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", entries.join(MEMORY_ENTRY_DELIMITER))
+}
+
+/// Character count of the injected text, i.e. what the prompt cap measures.
+fn memory_chars(entries: &[String]) -> usize {
+    entries.join(MEMORY_ENTRY_DELIMITER).chars().count()
+}
+
+/// Bullet list of entries for error messages.
+fn render_memory_entries(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return "(none)".to_string();
+    }
+    entries
+        .iter()
+        .map(|e| format!("- {e}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Index of the single entry `old_text` selects. A whole-entry exact match
+/// wins; otherwise the substring must occur in exactly one distinct entry.
+fn locate_memory_entry(entries: &[String], old_text: &str) -> std::result::Result<usize, String> {
+    if let Some(i) = entries.iter().position(|e| e == old_text) {
+        return Ok(i);
+    }
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.contains(old_text))
+        .map(|(i, _)| i)
+        .collect();
+    let distinct: std::collections::HashSet<&str> =
+        matches.iter().map(|&i| entries[i].as_str()).collect();
+    match (matches.first(), distinct.len()) {
+        (None, _) => Err(format!(
+            "No entry matched '{old_text}'. Copy old_text verbatim from one entry. \
+             Current entries:\n{}",
+            render_memory_entries(entries)
+        )),
+        (Some(&i), 1) => Ok(i),
+        _ => Err(format!(
+            "Multiple entries matched '{old_text}'. Be more specific: old_text must \
+             select exactly one entry."
+        )),
+    }
+}
+
+/// `Some(s)` only when the field is present and not blank.
+fn nonempty(s: &Option<String>) -> Option<&str> {
+    s.as_deref().filter(|s| !s.trim().is_empty())
+}
+
+/// Apply one op to `entries` in place; returns a short status line, or a
+/// model-facing error. The char limit is checked by the caller.
+fn apply_markdown_op(
+    entries: &mut Vec<String>,
+    op: &MarkdownOp,
+) -> std::result::Result<&'static str, String> {
+    let old_text = || {
+        nonempty(&op.old_text)
+            .map(str::trim)
+            .ok_or("this action needs `old_text`: a unique substring of one entry.")
+    };
+    match op.action.as_deref().unwrap_or("") {
+        "add" => {
+            let content = nonempty(&op.content)
+                .or(nonempty(&op.new_text))
+                .ok_or("'add' needs non-empty `content`.")?
+                .trim();
+            if content.contains('§') {
+                return Err("`content` must not contain '§' (the entry separator); \
+                            add one entry per op."
+                    .to_string());
+            }
+            if entries.iter().any(|e| e == content) {
+                return Ok("Entry already exists (no duplicate added).");
+            }
+            entries.push(content.to_string());
+            Ok("Entry added.")
+        }
+        "patch" => {
+            let old = old_text()?;
+            let new = nonempty(&op.content)
+                .or(nonempty(&op.new_text))
+                .ok_or("'patch' needs `new_text` (or `content`): the replacement for old_text. Use 'remove' to delete an entry.")?;
+            let idx = locate_memory_entry(entries, old)?;
+            let entry = &entries[idx];
+            if entry.matches(old).count() > 1 {
+                return Err(format!(
+                    "'{old}' occurs more than once in the matched entry; include more \
+                     surrounding text so the span is unique."
+                ));
+            }
+            let patched = entry.replacen(old, new, 1).trim().to_string();
+            if patched.contains('§') {
+                return Err("the patched entry must not contain '§'.".to_string());
+            }
+            entries[idx] = patched;
+            Ok("Entry patched.")
+        }
+        "remove" => {
+            let idx = locate_memory_entry(entries, old_text()?)?;
+            entries.remove(idx);
+            Ok("Entry removed.")
+        }
+        "" => Err("each operation needs an `action`: add, patch or remove.".to_string()),
+        other => Err(format!(
+            "unknown action '{other}'; use add, patch or remove."
+        )),
+    }
+}
+
+/// Write `contents` to `path` via a sibling temp file + rename, creating
+/// parent directories, so a crash never leaves a half-written sidecar.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "memory".to_string());
+    let tmp = parent.join(format!(".{name}.tmp-{}", crate::util::random_hex(6)));
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
 
 #[async_trait]
 impl Tool for MemoryTool {
@@ -1719,21 +2019,54 @@ impl Tool for MemoryTool {
         "memory"
     }
     fn description(&self) -> &str {
-        "Durable memory: read, write, list, delete, or search notes and past conversation. \
-         Proactively write compact declarative facts the user states (stable preferences, \
-         environment details, project conventions) without being asked; never store secrets \
-         or ephemeral task state. action='read'|'write'|'list'|'delete'|'search'."
+        "Durable memory, two shapes. (1) Curated Markdown injected into every future \
+         session (Hermes shape): action='add'|'patch'|'remove' with target='memory' \
+         (MEMORY.md: your notes on environment, conventions, lessons; 2200 chars) or \
+         target='user' (USER.md: who the user is, preferences; 1375 chars). 'add' takes \
+         `content`; 'patch' replaces the unique `old_text` span with `new_text`; 'remove' \
+         deletes the entry containing `old_text`. Several changes to one target can go in \
+         one `operations` list [{action, content?, old_text?, new_text?}], checked against \
+         the limit only on the final result; when full, remove/shorten stale entries in \
+         the same batch. (2) Notes and recall: action='read'|'write'|'list'|'delete' \
+         (`key`/`value`) over a notes store, 'search' (`query`) over past conversations. \
+         Proactively save compact declarative facts the user states (stable preferences, \
+         environment details, project conventions); never store secrets or ephemeral \
+         task state."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read", "write", "list", "delete", "search"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "patch", "remove", "read", "write", "list", "delete", "search"]
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": "add/patch/remove only: 'memory' = MEMORY.md (your notes, default), 'user' = USER.md (user profile)"
+                },
+                "content": {"type": "string", "description": "add: the new entry"},
+                "old_text": {"type": "string", "description": "patch/remove: text from exactly one entry; patch replaces this span (must occur once), remove deletes the whole entry"},
+                "new_text": {"type": "string", "description": "patch: replacement text for old_text (the rest of the entry is kept)"},
+                "operations": {
+                    "type": "array",
+                    "description": "Optional batch of add/patch/remove changes to one target, applied atomically",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["add", "patch", "remove"]},
+                            "content": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"}
+                        },
+                        "required": ["action"]
+                    }
+                },
                 "key": {"type": "string", "description": "Note key (read/write/delete); fallback query for search"},
                 "value": {"type": "string", "description": "Note value (write only)"},
                 "query": {"type": "string", "description": "Search query (search only; falls back to `key`)"}
-            },
-            "required": ["action"]
+            }
         })
     }
     /// Conservative: `read`/`list`/`search` are side-effect free, but
@@ -1745,12 +2078,37 @@ impl Tool for MemoryTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
-            action: String,
+            action: Option<String>,
             key: Option<String>,
             value: Option<String>,
             query: Option<String>,
+            target: Option<String>,
+            content: Option<String>,
+            old_text: Option<String>,
+            new_text: Option<String>,
+            operations: Option<Vec<Value>>,
         }
         let args: Args = serde_json::from_value(input)?;
+        let action = args.action.as_deref().unwrap_or("");
+        if args.operations.is_some() || matches!(action, "add" | "patch" | "remove") {
+            return Ok(self.execute_markdown(
+                args.action.as_deref(),
+                args.target.as_deref(),
+                MarkdownOp {
+                    action: None,
+                    content: args.content,
+                    old_text: args.old_text,
+                    new_text: args.new_text,
+                },
+                args.operations,
+            ));
+        }
+        if action.is_empty() {
+            return Ok(ToolOutput::err(
+                "missing `action`: add|patch|remove (MEMORY.md/USER.md) or \
+                 read|write|list|delete|search (notes)",
+            ));
+        }
         let Some(memory) = &ctx.memory else {
             return Ok(ToolOutput::err(
                 "memory backend not configured in this session",
@@ -1761,7 +2119,7 @@ impl Tool for MemoryTool {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("missing `key`"))
         };
-        match args.action.as_str() {
+        match action {
             "read" => Ok(ToolOutput::ok(cap_model_output(
                 memory
                     .read_note(key()?)?
@@ -2804,7 +3162,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let tool = MemoryTool;
+            let tool = MemoryTool::default();
             let out = tool
                 .execute(json!({"action": "list"}), &ToolContext::default())
                 .await
@@ -2820,7 +3178,7 @@ mod tests {
             memory: Some(mem),
             ..Default::default()
         };
-        let tool = MemoryTool;
+        let tool = MemoryTool::default();
         // `search` with the explicit `query` field (no `key`).
         let out = tool
             .execute(json!({"action": "search", "query": "nothing-here"}), &ctx)
@@ -2837,7 +3195,7 @@ mod tests {
 
     #[test]
     fn memory_schema_lists_all_five_actions() {
-        let s = MemoryTool.schema();
+        let s = MemoryTool::default().schema();
         let actions = s["properties"]["action"]["enum"]
             .as_array()
             .unwrap()
@@ -2848,7 +3206,206 @@ mod tests {
             assert!(actions.contains(&a), "schema missing action {a}");
         }
         assert!(s["properties"]["query"].is_object());
-        assert!(MemoryTool.description().contains("search"));
+        assert!(MemoryTool::default().description().contains("search"));
+    }
+
+    /// Tool with both sidecars under a fresh nested dir (parents not created).
+    fn markdown_memory_tool() -> (tempfile::TempDir, MemoryTool, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("nested/dir/MEMORY.md");
+        let user = tmp.path().join("other/USER.md");
+        let tool = MemoryTool::new(Some(mem.clone()), Some(user.clone()));
+        (tmp, tool, mem, user)
+    }
+
+    async fn run(tool: &MemoryTool, input: Value) -> ToolOutput {
+        tool.execute(input, &ToolContext::default()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_add_patch_remove_on_both_targets() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        for (target, path) in [("memory", &mem), ("user", &user)] {
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "likes green tea"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "runs a Raspberry Pi 5"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "likes green tea\n§\nruns a Raspberry Pi 5\n"
+            );
+            // Duplicate add is a no-op success.
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "likes green tea"}),
+            )
+            .await;
+            assert!(!out.is_error && out.content.contains("already exists"));
+
+            let out = run(
+                &tool,
+                json!({"action": "patch", "target": target, "old_text": "green", "new_text": "oolong"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert!(std::fs::read_to_string(path)
+                .unwrap()
+                .starts_with("likes oolong tea\n§\n"));
+
+            let out = run(
+                &tool,
+                json!({"action": "remove", "target": target, "old_text": "Raspberry"}),
+            )
+            .await;
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "likes oolong tea\n");
+        }
+        // No temp files left behind by the atomic writes.
+        let leftovers = std::fs::read_dir(mem.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_target_defaults_to_memory() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        let out = run(&tool, json!({"action": "add", "content": "fact"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&mem).unwrap(), "fact\n");
+        assert!(!user.exists());
+        let out = run(
+            &tool,
+            json!({"action": "add", "target": "nope", "content": "x"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("invalid memory target"));
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_refuses_over_char_limit() {
+        let (_tmp, tool, mem, user) = markdown_memory_tool();
+        let big = "u".repeat(crate::bootstrap::USER_MD_CHARS + 1);
+        let out = run(
+            &tool,
+            json!({"action": "add", "target": "user", "content": big}),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Consolidate"), "{}", out.content);
+        assert!(!user.exists(), "refused write must not touch the file");
+
+        // Fill MEMORY.md near the cap, then a batch that frees room succeeds
+        // where a lone add would not.
+        let filler = "m".repeat(crate::bootstrap::MEMORY_MD_CHARS - 10);
+        assert!(
+            !run(&tool, json!({"action": "add", "content": filler}))
+                .await
+                .is_error
+        );
+        let out = run(&tool, json!({"action": "add", "content": "one more fact"})).await;
+        assert!(out.is_error && out.content.contains("Consolidate"));
+        let out = run(
+            &tool,
+            json!({"target": "memory", "operations": [
+                {"action": "remove", "old_text": "mmmm"},
+                {"action": "add", "content": "one more fact"}
+            ]}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&mem).unwrap(), "one more fact\n");
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_refuses_ambiguous_patch() {
+        let (_tmp, tool, mem, _user) = markdown_memory_tool();
+        for c in ["uses tea at work", "uses tea at home"] {
+            assert!(
+                !run(&tool, json!({"action": "add", "content": c}))
+                    .await
+                    .is_error
+            );
+        }
+        let before = std::fs::read_to_string(&mem).unwrap();
+        let out = run(
+            &tool,
+            json!({"action": "patch", "old_text": "uses tea", "new_text": "uses coffee"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("Multiple entries matched"));
+        // Span repeated inside one entry is also refused.
+        assert!(
+            !run(&tool, json!({"action": "add", "content": "a-b a-b"}))
+                .await
+                .is_error
+        );
+        let out = run(
+            &tool,
+            json!({"action": "patch", "old_text": "a-b", "new_text": "c"}),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("more than once"));
+        // No match is an error too, and nothing changed on disk.
+        let out = run(&tool, json!({"action": "remove", "old_text": "absent"})).await;
+        assert!(out.is_error && out.content.contains("No entry matched"));
+        assert!(std::fs::read_to_string(&mem).unwrap().starts_with(&before));
+    }
+
+    #[tokio::test]
+    async fn memory_markdown_missing_path_is_tool_error() {
+        let tool = MemoryTool::default();
+        for target in ["memory", "user"] {
+            let out = run(
+                &tool,
+                json!({"action": "add", "target": target, "content": "x"}),
+            )
+            .await;
+            assert!(out.is_error);
+            assert!(out.content.contains("not configured"), "{}", out.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_legacy_actions_still_work_with_paths_configured() {
+        let (_tmp, tool, mem, _user) = markdown_memory_tool();
+        let ctx = ToolContext {
+            memory: Some(Arc::new(crate::memory::Memory::in_memory().unwrap())),
+            ..Default::default()
+        };
+        let out = tool
+            .execute(json!({"action": "write", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "ok");
+        let out = tool
+            .execute(json!({"action": "read", "key": "k"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "v");
+        let out = tool.execute(json!({"action": "list"}), &ctx).await.unwrap();
+        assert!(out.content.contains("k: v"));
+        let out = tool
+            .execute(json!({"action": "search", "query": "anything"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let out = tool
+            .execute(json!({"action": "delete", "key": "k"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.content, "ok");
+        assert!(!mem.exists(), "legacy actions must not touch MEMORY.md");
+        let schema = tool.schema();
+        for field in ["target", "content", "old_text", "new_text", "operations"] {
+            assert!(schema["properties"][field].is_object(), "missing {field}");
+        }
     }
 
     fn write_skill_tree(root: &Path, rel: &str, raw: &str) {

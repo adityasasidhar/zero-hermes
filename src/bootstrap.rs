@@ -224,7 +224,13 @@ fn build_registry_with_extra(
     reg.insert(Arc::new(SearchFilesTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(FetchTool::default()), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WebSearchTool::default()), &cfg.agent.enabled_tools);
-    reg.insert(Arc::new(MemoryTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        Arc::new(MemoryTool::new(
+            cfg.memory.markdown_path.clone(),
+            cfg.memory.user_path.clone(),
+        )),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert(Arc::new(CronTool), &cfg.agent.enabled_tools);
     reg.insert(
         Arc::new(WebExtractTool::default()),
