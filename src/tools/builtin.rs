@@ -7,6 +7,14 @@
 //! exist because vendored Hermes skills reference those names; they share
 //! the same implementations as the canonical tools so behaviour cannot drift.
 //!
+//! Upstream-Hermes aliases cover the names current NousResearch/hermes-agent
+//! skills use: `terminal` (`bash`), `patch` (`edit`), `clarify` (`ask`),
+//! `delegate_task` (`subagent`), `todo_list` (`todo`), `skills_list` /
+//! `skill_manage` (`skill`), `session_search` (`memory` action=search) and
+//! `cronjob_manage` (`cron`). They are thin wrappers that map upstream
+//! argument and action names (`old_string`, `choices`, `goal`, `create`, ...)
+//! onto the canonical tool's and then delegate to it.
+//!
 //! Deferred (not implemented): `background_task` (no job supervisor in this
 //! binary), `browser_navigate` (no headless browser; use `fetch` /
 //! `web_extract`), and the `hermes` CLI itself. Delegation is covered by the
@@ -2984,7 +2992,9 @@ impl Tool for SubAgentTool {
         let timeout = Duration::from_secs(args.timeout.unwrap_or(120).min(600));
         let futures = children.into_iter().map(|child_args| async move {
             let mut child = (*self.parent_registry).clone();
-            child.remove("subagent");
+            for name in SUBAGENT_TOOL_NAMES {
+                child.remove(name);
+            }
             let child = Arc::new(child);
             let system = format!("You are a sub-agent with role: {}. Complete the task, use tools when needed, and return concise evidence-backed results. You have no prior conversation history.", child_args.name);
             let mut history = Vec::new();
@@ -2994,6 +3004,475 @@ impl Tool for SubAgentTool {
         });
         let results = futures::future::join_all(futures).await;
         Ok(ToolOutput::ok(cap_model_output(results.join("\n\n"))))
+    }
+}
+
+// Upstream Hermes Agent aliases
+//
+// Skills written for current upstream Hermes Agent (NousResearch/hermes-agent)
+// name its tools — `terminal`, `patch`, `clarify`, `delegate_task`, ... —
+// rather than the older names above. Each wrapper below delegates to the
+// canonical tool and only renames upstream argument names into ours, so the
+// behaviour (and every safety check) cannot drift from the canonical tool.
+
+/// Every name under which the sub-agent tool is registered. A child registry
+/// strips all of them, so a sub-agent cannot recurse through an alias.
+pub const SUBAGENT_TOOL_NAMES: &[&str] = &["subagent", "delegate_task"];
+
+/// Move `input[from]` to `input[to]` when `to` is absent. Non-objects pass
+/// through unchanged; an explicit canonical key always wins.
+fn rename_arg(input: &mut Value, from: &str, to: &str) {
+    if let Some(obj) = input.as_object_mut() {
+        if !obj.contains_key(to) {
+            if let Some(v) = obj.remove(from) {
+                obj.insert(to.to_string(), v);
+            }
+        }
+    }
+}
+
+/// Rewrite `input["action"]` through `map` (unlisted actions pass through).
+fn map_action(input: &mut Value, map: &[(&str, &str)]) {
+    let Some(action) = input.get("action").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some((_, to)) = map.iter().find(|(from, _)| *from == action) {
+        input["action"] = Value::String((*to).to_string());
+    }
+}
+
+/// Map upstream `patch` args (`old_string` / `new_string`) onto `edit`'s
+/// `old_str` / `new_str`. `path` and `replace_all` are shared.
+pub fn map_patch_args(mut input: Value) -> Value {
+    rename_arg(&mut input, "old_string", "old_str");
+    rename_arg(&mut input, "new_string", "new_str");
+    input
+}
+
+/// Map upstream `clarify` args (`choices`) onto `ask`'s `options`.
+pub fn map_clarify_args(mut input: Value) -> Value {
+    rename_arg(&mut input, "choices", "options");
+    input
+}
+
+/// Map upstream `delegate_task` args onto `subagent`'s.
+///
+/// Upstream sends `goal` (+ optional `context`) for one task, or `tasks`
+/// as `[{goal, context}]`; ours takes `name` + `task`, or `tasks` as
+/// `[{name, task}]`. `context` is appended to the task text; a missing role
+/// name defaults to `delegate` (`delegate-N` in a batch). Already-native
+/// `name`/`task` pairs pass through.
+pub fn map_delegate_args(mut input: Value) -> Value {
+    fn task_text(entry: &Value) -> Option<String> {
+        let base = entry
+            .get("task")
+            .or_else(|| entry.get("goal"))
+            .and_then(Value::as_str)?;
+        Some(match entry.get("context").and_then(Value::as_str) {
+            Some(c) if !c.trim().is_empty() => format!("{base}\n\nContext:\n{c}"),
+            _ => base.to_string(),
+        })
+    }
+    let single = task_text(&input);
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    if let Some(Value::Array(tasks)) = obj.get("tasks") {
+        let mapped: Vec<Value> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let name = t
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("delegate-{}", i + 1));
+                json!({"name": name, "task": task_text(t).unwrap_or_default()})
+            })
+            .collect();
+        obj.insert("tasks".into(), Value::Array(mapped));
+    } else if let Some(task) = single {
+        obj.insert("task".into(), Value::String(task));
+        if !obj.contains_key("name") {
+            obj.insert("name".into(), Value::String("delegate".into()));
+        }
+    }
+    obj.remove("goal");
+    obj.remove("context");
+    input
+}
+
+/// Map upstream `skill_manage` args onto `skill`'s.
+///
+/// Actions: `create` / `edit` -> `write`, `delete` -> `archive` (reversible:
+/// the skill moves to `<root>/.archive/`); `patch`, `archive`, `list`,
+/// `read`, `sync` pass through, and anything else reaches `skill` unchanged
+/// so it reports the unknown action itself. `old_string` / `new_string` map
+/// to `old_str` / `new_str`.
+pub fn map_skill_manage_args(mut input: Value) -> Value {
+    map_action(
+        &mut input,
+        &[
+            ("create", "write"),
+            ("edit", "write"),
+            ("delete", "archive"),
+        ],
+    );
+    rename_arg(&mut input, "old_string", "old_str");
+    rename_arg(&mut input, "new_string", "new_str");
+    input
+}
+
+/// Map upstream `cronjob_manage` args onto `cron`'s.
+///
+/// Actions: `create` -> `add`, `delete` -> `remove`; others pass through.
+/// Upstream's `job_id` stands in for `name` when `name` is absent.
+pub fn map_cronjob_args(mut input: Value) -> Value {
+    map_action(&mut input, &[("create", "add"), ("delete", "remove")]);
+    rename_arg(&mut input, "job_id", "name");
+    input
+}
+
+/// Map upstream `session_search` args onto `memory` action=search. Only
+/// `query` is forwarded, so `memory`'s other actions are unreachable here.
+pub fn map_session_search_args(input: &Value) -> Value {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({"action": "search", "query": query})
+}
+
+/// Upstream-Hermes alias for [`BashTool`] under the `terminal` name.
+///
+/// Accepts `command` + `timeout` like `bash`, plus upstream's `workdir`
+/// (resolved against the session cwd). `background: true` is refused: there
+/// is no job supervisor, and a foreground run would block until timeout.
+/// Registered behind the command guard exactly like `bash`.
+pub struct TerminalTool;
+
+#[async_trait]
+impl Tool for TerminalTool {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+    fn description(&self) -> &str {
+        "Run a shell command and return combined stdout+stderr. (Alias of `bash` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run"},
+                "timeout": {"type": "integer", "description": "Timeout seconds (default 180, max 600)"},
+                "workdir": {"type": "string", "description": "Working directory (absolute or cwd-relative)"}
+            },
+            "required": ["command"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            command: String,
+            timeout: Option<u64>,
+            workdir: Option<String>,
+            background: Option<bool>,
+        }
+        let args: Args = serde_json::from_value(input)?;
+        if args.background == Some(true) {
+            return Ok(ToolOutput::err(
+                "terminal: background execution is not supported; run the command in the foreground (with a timeout)",
+            ));
+        }
+        match args.workdir.as_deref().filter(|w| !w.trim().is_empty()) {
+            Some(dir) => {
+                let mut sub = ctx.clone();
+                sub.cwd = Some(resolve_path(dir, ctx.cwd.as_deref()));
+                run_shell(&args.command, args.timeout, &sub).await
+            }
+            None => run_shell(&args.command, args.timeout, ctx).await,
+        }
+    }
+}
+
+/// Upstream-Hermes alias for [`EditTool`] under the `patch` name.
+///
+/// Upstream's `old_string` / `new_string` map to `old_str` / `new_str`
+/// ([`map_patch_args`]). Only upstream's default `mode: "replace"` is
+/// supported; V4A multi-file diffs (`mode: "patch"`) are refused.
+pub struct PatchTool;
+
+#[async_trait]
+impl Tool for PatchTool {
+    fn name(&self) -> &str {
+        "patch"
+    }
+    fn description(&self) -> &str {
+        "Replace an exact string in a file. Fails when old_string is missing or matches more than once (unless replace_all is true). (Alias of `edit` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or cwd-relative path"},
+                "old_string": {"type": "string", "description": "Exact string to replace (must occur once)"},
+                "new_string": {"type": "string", "description": "Replacement string"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        if let Some(mode) = input.get("mode").and_then(Value::as_str) {
+            if mode != "replace" {
+                return Ok(ToolOutput::err(format!(
+                    "patch: mode `{mode}` is not supported; use mode=replace with path, old_string and new_string"
+                )));
+            }
+        }
+        EditTool.execute(map_patch_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`AskTool`] under the `clarify` name
+/// (`choices` maps to `options`, see [`map_clarify_args`]).
+pub struct ClarifyTool;
+
+#[async_trait]
+impl Tool for ClarifyTool {
+    fn name(&self) -> &str {
+        "clarify"
+    }
+    fn description(&self) -> &str {
+        "Pose a question with choices. UI-mediated: present the choices in chat text and proceed with a reasonable default. (Alias of `ask` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to put to the user"},
+                "choices": {"type": "array", "items": {"type": "string"}, "description": "Candidate answers"}
+            },
+            "required": ["question"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        AskTool.execute(map_clarify_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`TodoTool`] under the `todo_list` name.
+pub struct TodoListTool;
+
+#[async_trait]
+impl Tool for TodoListTool {
+    fn name(&self) -> &str {
+        "todo_list"
+    }
+    fn description(&self) -> &str {
+        "Track tasks: list, add, done, clear. Stored in the memory `todos` note. (Alias of `todo` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        TodoTool.schema()
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        TodoTool.execute(input, ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SkillTool`] action=list under the
+/// `skills_list` name. Upstream's optional `category` filter is ignored.
+pub struct SkillsListTool {
+    inner: SkillTool,
+}
+
+impl SkillsListTool {
+    /// Create a skills-list tool rooted at `root`.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            inner: SkillTool::new(root),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillsListTool {
+    fn name(&self) -> &str {
+        "skills_list"
+    }
+    fn description(&self) -> &str {
+        "List available SKILL.md procedures. (Alias of `skill` action=list for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(json!({"action": "list"}), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SkillTool`] under the `skill_manage` name
+/// (action and argument mapping in [`map_skill_manage_args`]).
+pub struct SkillManageTool {
+    inner: SkillTool,
+}
+
+impl SkillManageTool {
+    /// Wrap a configured [`SkillTool`] (same root and hub URL as `skill`).
+    pub fn new(inner: SkillTool) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillManageTool {
+    fn name(&self) -> &str {
+        "skill_manage"
+    }
+    fn description(&self) -> &str {
+        "Create, edit, patch, or delete (archive) reusable SKILL.md procedures. (Alias of `skill` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object", "properties": {
+                "action": {"type": "string", "enum": ["create", "edit", "patch", "delete", "list", "read", "archive", "sync"], "description": "create/edit write the whole SKILL.md; delete archives it to .archive/"},
+                "name": {"type": "string", "description": "skill name (letters, digits, _, -)"},
+                "content": {"type": "string", "description": "full SKILL.md content for create/edit (must include --- frontmatter with name: and description:)"},
+                "old_string": {"type": "string", "description": "exact string to replace for patch (must occur once)"},
+                "new_string": {"type": "string", "description": "replacement string for patch"}
+            }, "required": ["action"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(map_skill_manage_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`MemoryTool`] action=search under the
+/// `session_search` name: cross-session recall over past conversation.
+pub struct SessionSearchTool;
+
+#[async_trait]
+impl Tool for SessionSearchTool {
+    fn name(&self) -> &str {
+        "session_search"
+    }
+    fn description(&self) -> &str {
+        "Search past conversation across sessions. (Alias of `memory` action=search for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Full-text search query"}
+            },
+            "required": ["query"]
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        let has_query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(|q| !q.trim().is_empty());
+        if !has_query {
+            return Ok(ToolOutput::err(
+                "session_search requires a non-empty `query`",
+            ));
+        }
+        MemoryTool
+            .execute(map_session_search_args(&input), ctx)
+            .await
+    }
+}
+
+/// Upstream-Hermes alias for [`CronTool`] under the `cronjob_manage` name
+/// (action and argument mapping in [`map_cronjob_args`]).
+pub struct CronjobManageTool;
+
+#[async_trait]
+impl Tool for CronjobManageTool {
+    fn name(&self) -> &str {
+        "cronjob_manage"
+    }
+    fn description(&self) -> &str {
+        "List, create, or delete custom cron jobs (persisted in memory; loaded at gateway boot). (Alias of `cron` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "create", "delete", "add", "remove"]},
+                "name": {"type": "string", "description": "Job name (create/delete); `job_id` is accepted too"},
+                "schedule": {"type": "string", "description": "5-field cron expression (create only)"},
+                "prompt": {"type": "string", "description": "Agent prompt (create only)"}
+            },
+            "required": ["action"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        CronTool.execute(map_cronjob_args(input), ctx).await
+    }
+}
+
+/// Upstream-Hermes alias for [`SubAgentTool`] under the `delegate_task`
+/// name (argument mapping in [`map_delegate_args`]).
+///
+/// It wraps its own `SubAgentTool` over the same parent snapshot, and the
+/// child registry strips every name in [`SUBAGENT_TOOL_NAMES`], so a
+/// delegated child can no more recurse than a `subagent` child can.
+pub struct DelegateTaskTool {
+    inner: SubAgentTool,
+}
+
+impl DelegateTaskTool {
+    /// Build a delegate tool over the parent's provider and tool snapshot.
+    pub fn new(
+        provider: Arc<dyn crate::agent::LlmProvider>,
+        parent_registry: Arc<crate::tools::ToolRegistry>,
+        limits: crate::agent::RunLimits,
+    ) -> Self {
+        Self {
+            inner: SubAgentTool::new(provider, parent_registry, limits),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateTaskTool {
+    fn name(&self) -> &str {
+        "delegate_task"
+    }
+    fn description(&self) -> &str {
+        "Delegate a goal to a fresh isolated sub-agent and return its final answer. Cannot nest. (Alias of `subagent` for Hermes skills.)"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "One self-contained goal for the sub-agent."},
+                "context": {"type": "string", "description": "Background the sub-agent needs (it sees no prior history)."},
+                "tasks": {"type": "array", "items": {"type": "object", "properties": {"goal": {"type": "string"}, "context": {"type": "string"}}, "required": ["goal"]}, "description": "Up to four independent goals, run concurrently."},
+                "timeout": {"type": "integer", "description": "Per-child timeout seconds (default 120, max 600)."}
+            }
+        })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        self.inner.execute(map_delegate_args(input), ctx).await
     }
 }
 
@@ -3734,6 +4213,267 @@ mod tests {
             assert!(!tool.description().is_empty());
             assert_eq!(tool.schema()["type"], "object");
         }
+    }
+
+    #[test]
+    fn upstream_aliases_have_distinct_names() {
+        let provider: Arc<dyn crate::agent::LlmProvider> =
+            Arc::new(crate::agent::mock::MockProvider::text_only(""));
+        let delegate = DelegateTaskTool::new(
+            provider,
+            Arc::new(crate::tools::ToolRegistry::new()),
+            crate::agent::RunLimits::default(),
+        );
+        for (tool, name, canonical) in [
+            (&TerminalTool as &dyn Tool, "terminal", "bash"),
+            (&PatchTool as &dyn Tool, "patch", "edit"),
+            (&ClarifyTool as &dyn Tool, "clarify", "ask"),
+            (&TodoListTool as &dyn Tool, "todo_list", "todo"),
+            (
+                &SkillsListTool::new(PathBuf::from("/x")) as &dyn Tool,
+                "skills_list",
+                "skill",
+            ),
+            (
+                &SkillManageTool::new(SkillTool::new(PathBuf::from("/x"))) as &dyn Tool,
+                "skill_manage",
+                "skill",
+            ),
+            (&SessionSearchTool as &dyn Tool, "session_search", "memory"),
+            (&CronjobManageTool as &dyn Tool, "cronjob_manage", "cron"),
+            (&delegate as &dyn Tool, "delegate_task", "subagent"),
+        ] {
+            assert_eq!(tool.name(), name);
+            assert!(
+                tool.description()
+                    .contains(&format!("(Alias of `{canonical}`")),
+                "{name}: {}",
+                tool.description()
+            );
+            assert_eq!(tool.schema()["type"], "object");
+        }
+    }
+
+    #[test]
+    fn patch_args_map_upstream_names() {
+        let mapped = map_patch_args(json!({
+            "path": "a.txt", "old_string": "x", "new_string": "y", "replace_all": true
+        }));
+        assert_eq!(
+            mapped,
+            json!({"path": "a.txt", "old_str": "x", "new_str": "y", "replace_all": true})
+        );
+        // Native names pass through and win over upstream ones.
+        let native = map_patch_args(json!({"path": "a", "old_str": "n", "old_string": "u"}));
+        assert_eq!(native["old_str"], "n");
+    }
+
+    #[tokio::test]
+    async fn patch_edits_with_upstream_args_and_refuses_v4a_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolContext {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("f.txt"), "hello world").unwrap();
+        let out = PatchTool
+            .execute(
+                json!({"path": "f.txt", "old_string": "world", "new_string": "hermes"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "hello hermes"
+        );
+        let out = PatchTool
+            .execute(json!({"mode": "patch", "patch": "*** Begin Patch"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn clarify_maps_choices_to_options() {
+        assert_eq!(
+            map_clarify_args(json!({"question": "q", "choices": ["a", "b"]})),
+            json!({"question": "q", "options": ["a", "b"]})
+        );
+        let out = ClarifyTool
+            .execute(
+                json!({"question": "Which?", "choices": ["red", "blue"]}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("Which?"));
+        assert!(out.content.contains("1. red"));
+        assert!(out.content.contains("2. blue"));
+    }
+
+    #[test]
+    fn delegate_args_map_goal_context_and_tasks() {
+        assert_eq!(
+            map_delegate_args(json!({"goal": "find x", "context": "in repo y"})),
+            json!({"name": "delegate", "task": "find x\n\nContext:\nin repo y"})
+        );
+        assert_eq!(
+            map_delegate_args(json!({"goal": "g", "timeout": 30})),
+            json!({"name": "delegate", "task": "g", "timeout": 30})
+        );
+        assert_eq!(
+            map_delegate_args(json!({"tasks": [{"goal": "a"}, {"goal": "b", "context": "c"}]})),
+            json!({"tasks": [
+                {"name": "delegate-1", "task": "a"},
+                {"name": "delegate-2", "task": "b\n\nContext:\nc"}
+            ]})
+        );
+        // Native subagent args pass through unchanged.
+        let native = json!({"name": "researcher", "task": "t"});
+        assert_eq!(map_delegate_args(native.clone()), native);
+    }
+
+    #[test]
+    fn skill_manage_args_map_actions_and_names() {
+        for (upstream, ours) in [
+            ("create", "write"),
+            ("edit", "write"),
+            ("delete", "archive"),
+            ("patch", "patch"),
+            ("list", "list"),
+            ("write_file", "write_file"),
+        ] {
+            let mapped = map_skill_manage_args(json!({"action": upstream, "name": "s"}));
+            assert_eq!(mapped["action"], ours, "{upstream}");
+        }
+        let mapped = map_skill_manage_args(
+            json!({"action": "patch", "name": "s", "old_string": "a", "new_string": "b"}),
+        );
+        assert_eq!(
+            mapped,
+            json!({"action": "patch", "name": "s", "old_str": "a", "new_str": "b"})
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_manage_create_patch_delete_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = SkillManageTool::new(SkillTool::new(tmp.path().to_path_buf()));
+        let ctx = ToolContext::default();
+        let content = "---\nname: demo\ndescription: a demo\n---\nstep one\n";
+        let out = tool
+            .execute(
+                json!({"action": "create", "name": "demo", "content": content}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let out = tool
+            .execute(
+                json!({"action": "patch", "name": "demo", "old_string": "step one", "new_string": "step two"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let listed = SkillsListTool::new(tmp.path().to_path_buf())
+            .execute(json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(listed.content.contains("demo"), "{}", listed.content);
+        let out = tool
+            .execute(json!({"action": "delete", "name": "demo"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("archived"));
+        assert!(!tmp.path().join("demo").exists());
+    }
+
+    #[test]
+    fn cronjob_args_map_actions_and_job_id() {
+        assert_eq!(
+            map_cronjob_args(
+                json!({"action": "create", "name": "n", "schedule": "* * * * *", "prompt": "p"})
+            ),
+            json!({"action": "add", "name": "n", "schedule": "* * * * *", "prompt": "p"})
+        );
+        assert_eq!(
+            map_cronjob_args(json!({"action": "delete", "job_id": "n"})),
+            json!({"action": "remove", "name": "n"})
+        );
+        assert_eq!(
+            map_cronjob_args(json!({"action": "list"})),
+            json!({"action": "list"})
+        );
+    }
+
+    #[test]
+    fn session_search_args_forward_only_query() {
+        assert_eq!(
+            map_session_search_args(&json!({"query": "rust", "limit": 3, "role_filter": "user"})),
+            json!({"action": "search", "query": "rust"})
+        );
+    }
+
+    #[tokio::test]
+    async fn session_search_requires_query() {
+        let out = SessionSearchTool
+            .execute(json!({"query": "  "}), &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn terminal_honours_workdir_and_refuses_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = TerminalTool
+            .execute(
+                json!({"command": "pwd", "workdir": tmp.path().to_str().unwrap()}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            out.content.contains(canon.to_str().unwrap())
+                || out.content.contains(tmp.path().to_str().unwrap()),
+            "{}",
+            out.content
+        );
+        let out = TerminalTool
+            .execute(
+                json!({"command": "sleep 100", "background": true}),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("background"));
+    }
+
+    #[tokio::test]
+    async fn todo_list_delegates_to_todo() {
+        let ctx = ToolContext {
+            memory: Some(Arc::new(crate::memory::Memory::in_memory().unwrap())),
+            ..Default::default()
+        };
+        let out = TodoListTool
+            .execute(json!({"action": "add", "text": "ship aliases"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let out = TodoTool
+            .execute(json!({"action": "list"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.content.contains("ship aliases"));
     }
 
     #[test]

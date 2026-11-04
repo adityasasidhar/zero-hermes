@@ -14,9 +14,11 @@ use crate::agent::{LlmProvider, RunLimits};
 use crate::config::Config;
 use crate::skills::SkillRegistry;
 use crate::tools::builtin::{
-    AskTool, BashTool, CronTool, EditTool, ExecuteCodeTool, ExecuteCommandTool, FetchTool,
-    MemoryTool, MessageTool, ReadFileTool, ReadTool, SearchFilesTool, SkillTool, SkillViewTool,
-    SubAgentTool, TodoTool, WebExtractTool, WebSearchTool, WriteFileTool, WriteTool,
+    AskTool, BashTool, ClarifyTool, CronTool, CronjobManageTool, DelegateTaskTool, EditTool,
+    ExecuteCodeTool, ExecuteCommandTool, FetchTool, MemoryTool, MessageTool, PatchTool,
+    ReadFileTool, ReadTool, SearchFilesTool, SessionSearchTool, SkillManageTool, SkillTool,
+    SkillViewTool, SkillsListTool, SubAgentTool, TerminalTool, TodoListTool, TodoTool,
+    WebExtractTool, WebSearchTool, WriteFileTool, WriteTool,
 };
 use crate::tools::ToolRegistry;
 
@@ -162,6 +164,13 @@ pub fn append_recall_context(base: &str, recalled: &str) -> String {
 /// `write_file`, `search_files`, `skill_view`, `web_search`, `web_extract`)
 /// are registered the same way so vendored Hermes skills find the names
 /// they reference.
+///
+/// Upstream-Hermes aliases (`terminal`, `patch`, `clarify`, `todo_list`,
+/// `skills_list`, `skill_manage`, `session_search`, `cronjob_manage`,
+/// `delegate_task`) also honour the allow-list. `terminal` sits behind the
+/// command guard like `bash`; `delegate_task` is built over the same
+/// snapshot as `subagent`, and children strip both names, so neither can
+/// recurse.
 pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<ToolRegistry> {
     build_registry_with_extra(cfg, provider, Vec::new())
 }
@@ -249,23 +258,40 @@ fn build_registry_with_extra(
     );
     reg.insert(Arc::new(ReadFileTool), &cfg.agent.enabled_tools);
     reg.insert(Arc::new(WriteFileTool), &cfg.agent.enabled_tools);
+    let skill_tool = || {
+        SkillTool::new(skills_root.clone()).with_hub_url(crate::skills::resolve_hub_url(
+            cfg.skills_hub_url.as_deref(),
+        ))
+    };
+    reg.insert(Arc::new(skill_tool()), &cfg.agent.enabled_tools);
     reg.insert(
-        Arc::new(
-            SkillTool::new(skills_root.clone()).with_hub_url(crate::skills::resolve_hub_url(
-                cfg.skills_hub_url.as_deref(),
-            )),
-        ),
+        Arc::new(SkillViewTool::new(skills_root.clone())),
+        &cfg.agent.enabled_tools,
+    );
+    // Upstream Hermes Agent names (current NousResearch/hermes-agent skills).
+    reg.insert(
+        guard_shell(&cfg.agent, Arc::new(TerminalTool)),
+        &cfg.agent.enabled_tools,
+    );
+    reg.insert(Arc::new(PatchTool), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(ClarifyTool), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(TodoListTool), &cfg.agent.enabled_tools);
+    reg.insert(
+        Arc::new(SkillsListTool::new(skills_root.clone())),
         &cfg.agent.enabled_tools,
     );
     reg.insert(
-        Arc::new(SkillViewTool::new(skills_root)),
+        Arc::new(SkillManageTool::new(skill_tool())),
         &cfg.agent.enabled_tools,
     );
+    reg.insert(Arc::new(SessionSearchTool), &cfg.agent.enabled_tools);
+    reg.insert(Arc::new(CronjobManageTool), &cfg.agent.enabled_tools);
 
     // Snapshot the parent's tools into a sibling registry, then build
     // SubAgentTool against that sibling. This avoids the Arc<DerefMut>
     // borrow problem and means sub-agents see the parent's tools without
-    // being able to recurse (we strip `subagent` itself in the tool).
+    // being able to recurse (the tool strips `subagent` and `delegate_task`,
+    // see `builtin::SUBAGENT_TOOL_NAMES`, and neither is in the snapshot).
     //
     // MCP tools (discovered by `build_tool_registry_async`) go in before the
     // sibling snapshot so sub-agents inherit them.
@@ -280,6 +306,14 @@ fn build_registry_with_extra(
     }
     let sibling = Arc::new(reg.clone());
     let mut reg = reg;
+    reg.insert(
+        Arc::new(DelegateTaskTool::new(
+            provider.clone(),
+            sibling.clone(),
+            RunLimits::from(&cfg.agent),
+        )),
+        &cfg.agent.enabled_tools,
+    );
     reg.insert_always(Arc::new(SubAgentTool::new(
         provider,
         sibling,
@@ -640,20 +674,29 @@ mod tests {
             vec![
                 "ask",
                 "bash",
+                "clarify",
                 "cron",
+                "cronjob_manage",
+                "delegate_task",
                 "edit",
                 "execute_code",
                 "execute_command",
                 "fetch",
                 "memory",
                 "message",
+                "patch",
                 "read",
                 "read_file",
                 "search_files",
+                "session_search",
                 "skill",
+                "skill_manage",
                 "skill_view",
+                "skills_list",
                 "subagent",
+                "terminal",
                 "todo",
+                "todo_list",
                 "web_extract",
                 "web_search",
                 "write",
@@ -682,6 +725,96 @@ mod tests {
         child.remove("subagent");
         assert!(child.get("subagent").is_none());
         assert!(child.get("bash").is_some(), "child keeps the other tools");
+    }
+
+    #[test]
+    fn upstream_aliases_honour_the_allowlist() {
+        let mut cfg = Config::default();
+        cfg.agent.enabled_tools = vec!["terminal".into(), "delegate_task".into()];
+        let reg = build_tool_registry(&cfg, provider());
+        assert_eq!(reg.names(), vec!["delegate_task", "subagent", "terminal"]);
+    }
+
+    #[tokio::test]
+    async fn terminal_is_behind_the_command_guard() {
+        let reg = build_tool_registry(&Config::default(), provider());
+        let ctx = crate::agent::tool::ToolContext::default();
+        for name in ["terminal", "bash", "execute_command"] {
+            let tool = reg.get(name).unwrap();
+            let out = tool
+                .execute(serde_json::json!({"command": "rm -rf /"}), &ctx)
+                .await
+                .unwrap();
+            assert!(out.is_error, "{name} must refuse rm -rf /");
+            assert!(
+                out.content.contains("refused by the command guard"),
+                "{name}: {}",
+                out.content
+            );
+        }
+        // A harmless command still runs through `terminal`.
+        let out = reg
+            .get("terminal")
+            .unwrap()
+            .execute(serde_json::json!({"command": "echo upstream-ok"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("upstream-ok"));
+    }
+
+    /// Records the tool names each `complete` call is offered, then answers.
+    #[derive(Default)]
+    struct ToolSpy {
+        offered: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ToolSpy {
+        async fn complete(
+            &self,
+            _system: Option<&str>,
+            _messages: &[crate::agent::Message],
+            tools: &[serde_json::Value],
+        ) -> crate::error::Result<crate::agent::Completion> {
+            let names = tools
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect();
+            self.offered.lock().unwrap().push(names);
+            Ok(crate::agent::Completion {
+                text: Some("child done".into()),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_task_child_cannot_recurse_through_any_alias() {
+        let spy = Arc::new(ToolSpy::default());
+        let reg = build_tool_registry(&Config::default(), spy.clone());
+        let out = reg
+            .get("delegate_task")
+            .unwrap()
+            .execute(
+                serde_json::json!({"goal": "check", "context": "nothing"}),
+                &crate::agent::tool::ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("child done"));
+        let offered = spy.offered.lock().unwrap();
+        assert_eq!(offered.len(), 1, "exactly one child turn ran");
+        let child = &offered[0];
+        for name in crate::tools::builtin::SUBAGENT_TOOL_NAMES {
+            assert!(
+                !child.iter().any(|n| n == name),
+                "child was offered {name}: {child:?}"
+            );
+        }
+        assert!(child.iter().any(|n| n == "terminal"));
+        assert!(child.iter().any(|n| n == "bash"));
     }
 
     #[test]
