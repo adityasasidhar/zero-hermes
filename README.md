@@ -236,6 +236,20 @@ an index of available skills and can use its `skill` tool to read one or save
 a new reusable procedure. This makes learned behavior inspectable and easy to
 edit or remove—there is no hidden training state.
 
+### Skill curator
+
+`zero-hermes curate` runs one agent turn that reviews the skill library, merges
+overlapping skills, repairs stale or vague ones and retires redundant skills
+with `skill` `archive`, which moves them to `<skills>/.archive/` rather than
+deleting them. Run it by hand or schedule it:
+
+```toml
+[[cron.jobs]]
+name = "curate-skills"
+schedule = "0 4 * * 0"
+prompt = "Run the skill curator: review every skill, merge near-duplicates, archive (never delete) redundant ones, and report what changed."
+```
+
 ## Subagents and scheduled work
 
 The `subagent` tool runs a focused child agent with its own fresh history and

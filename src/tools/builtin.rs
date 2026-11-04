@@ -1721,6 +1721,44 @@ fn validate_skill_content(content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move a skill's directory into `<root>/.archive/` (reversible retirement).
+///
+/// The skill must live in its own directory strictly inside `root`; a
+/// `SKILL.md` sitting directly in the root is refused so archiving can never
+/// sweep up the whole library.
+async fn archive_skill(root: &Path, name: &str) -> Result<ToolOutput> {
+    let Some(path) = resolve_skill_path(root, name) else {
+        return Ok(ToolOutput::err(format!("unknown skill: {name}")));
+    };
+    let (Ok(root_c), Some(dir)) = (root.canonicalize(), path.parent()) else {
+        return Ok(ToolOutput::err("cannot resolve skills root"));
+    };
+    let Ok(dir_c) = dir.canonicalize() else {
+        return Ok(ToolOutput::err("cannot resolve skill directory"));
+    };
+    if dir_c == root_c || !dir_c.starts_with(&root_c) {
+        return Ok(ToolOutput::err(format!(
+            "refusing to archive {name}: its directory is not a dedicated folder inside the skills root"
+        )));
+    }
+    let archive = root_c.join(crate::skills::ARCHIVE_DIR);
+    tokio::fs::create_dir_all(&archive)
+        .await
+        .map_err(|e| anyhow::anyhow!("create archive dir failed: {e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = archive.join(format!("{name}-{stamp}"));
+    tokio::fs::rename(&dir_c, &dest)
+        .await
+        .map_err(|e| anyhow::anyhow!("archive move failed: {e}"))?;
+    Ok(ToolOutput::ok(format!(
+        "archived skill {name} to {}",
+        dest.strip_prefix(&root_c).unwrap_or(&dest).display()
+    )))
+}
+
 /// Read a skill's `SKILL.md` body by registry name.
 async fn read_skill_by_name(root: &Path, name: &str) -> Result<ToolOutput> {
     let Some(path) = resolve_skill_path(root, name) else {
@@ -1935,12 +1973,12 @@ impl Tool for SkillTool {
         "skill"
     }
     fn description(&self) -> &str {
-        "List, read, create, patch, or sync reusable SKILL.md procedures."
+        "List, read, create, patch, archive, or sync reusable SKILL.md procedures."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object", "properties": {
-                "action": {"type": "string", "enum": ["list", "read", "write", "patch", "sync"]},
+                "action": {"type": "string", "enum": ["list", "read", "write", "patch", "archive", "sync"]},
                 "name": {"type": "string", "description": "skill name (letters, digits, _, -)"},
                 "content": {"type": "string", "description": "full SKILL.md content for write (must include --- frontmatter with name: and description:)"},
                 "old_str": {"type": "string", "description": "exact string to replace for patch (must occur once)"},
@@ -2022,6 +2060,10 @@ impl Tool for SkillTool {
                     }
                     Err(e) => Ok(ToolOutput::err(e)),
                 }
+            }
+            "archive" => {
+                let name = safe_skill_name(args.name.as_deref())?;
+                archive_skill(&self.root, &name).await
             }
             "sync" => {
                 let url = self

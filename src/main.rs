@@ -135,6 +135,9 @@ enum Command {
         #[arg(long)]
         no_banner: bool,
     },
+    /// Run one skill-curator turn: review the skill library, merge overlaps,
+    /// fix stale entries and archive redundant skills (reversible).
+    Curate,
     /// Manage cron jobs.
     Cron {
         #[command(subcommand)]
@@ -202,6 +205,12 @@ async fn main() -> Result<()> {
             CronAction::List => cron_list(&cfg),
             CronAction::Check { expr } => cron_check(&expr),
         },
+        Command::Curate => {
+            let skills = load_skills(&cfg);
+            let root = zero_hermes::bootstrap::skills_dir(&cfg);
+            let prompt = zero_hermes::skills::curator_prompt(&skills, &root);
+            run_once(cfg, &prompt, cli.mock, cli.stream).await
+        }
         Command::Tools => tools_list(&cfg),
         Command::InitConfig { force } => init_config(force),
         Command::ShowConfig => {

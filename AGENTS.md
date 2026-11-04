@@ -75,6 +75,7 @@ Subcommands (see the `Command` enum in `src/main.rs`):
 | `gateway`        | Telegram long-poll + agent loop + cron scheduler                                                                             |
 | `run "msg"`      | one agent turn against the configured provider, then exit                                                                    |
 | `chat`           | multi-turn interactive chat on stdin, streaming (`repl` is a visible alias; `/help`, `/status`, `/tools`, `/clear`, `/exit`) |
+| `curate`         | one skill-curator agent turn (`skills::curator_prompt`): merge overlaps, fix stale skills, `skill archive` redundant ones |
 | `cron list`      | print configured jobs and next firing time                                                                                   |
 | `cron check E`   | parse a 5-field cron expr and print next firing                                                                              |
 | `tools`          | list registered tool names (honours the loaded config)                                                                       |
@@ -244,7 +245,9 @@ src/
   memory.rs            rusqlite (bundled): durable session transcripts, notes,
                        and an FTS5 `message_search` index for cross-session
                        recall; `Memory::in_memory()` for tests
-  skills.rs            SKILL.md frontmatter parser + SkillRegistry
+  skills.rs            SKILL.md frontmatter parser + SkillRegistry (dot-dirs such
+                       as `.archive` are skipped) + curator_prompt; the `skill`
+                       tool's `archive` action moves a skill to <root>/.archive/
   cron.rs              cron crate (6-field) with normalize_cron() for 5-field input;
                        Scheduler emits CronEvent on a tokio mpsc. Fires *every*
                        job due at an instant, and honours [cron].timezone
