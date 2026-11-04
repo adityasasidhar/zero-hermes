@@ -208,8 +208,13 @@ src/
                        load_dotenv, expand_env_vars
   mcp.rs               MCP stdio client (JSON-RPC 2.0 initialize / tools/list /
                        tools/call). McpTool wraps a remote tool as
-                       mcp_<server>_<tool>; discovery is async and NOT yet wired
-                       into the sync registry — see the TODO in bootstrap.rs
+                       mcp_<server>_<tool>. Discovery is async, so
+                       bootstrap::build_tool_registry_async (used by run /
+                       chat / web / gateway) registers the tools before the
+                       sub-agent snapshot; the sync build_tool_registry (used
+                       by `tools` and tests) never spawns servers. A server
+                       that fails discovery is skipped with a warning.
+                       Stateless: one process spawn per call.
   agent/
     mod.rs             the loop: agent::run + agent::run_stream + dispatch_tool
                        + RunLimits (max_iterations + context_window)

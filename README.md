@@ -55,6 +55,9 @@ Telegram / terminal / browser
 - Keep long conversations bounded with pair-safe trimming and token-budget
   summaries.
 
+MCP stdio servers configured under `[mcp.servers.<name>]` are discovered at
+startup and exposed as `mcp_<server>_<tool>` tools (also to subagents).
+
 The built-in tools are `bash`, `read`, `write`, `fetch`, `memory`, `skill`,
 and `subagent`. An empty `enabled_tools` list enables them all.
 
@@ -309,7 +312,7 @@ Useful smoke checks:
 ## Scope
 
 zero-hermes deliberately does not attempt to be the full Hermes Agent product:
-there is no desktop application, MCP client, multi-platform messaging layer,
+there is no desktop application, multi-platform messaging layer,
 voice stack, remote execution backend, approval UI, or semantic memory model.
 Those are worthwhile systems; this project optimizes for a compact agent you
 can understand, operate, and afford to leave on a Raspberry Pi.

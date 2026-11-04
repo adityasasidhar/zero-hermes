@@ -9,7 +9,9 @@ use clap::{Parser, Subcommand};
 
 use zero_hermes::agent::mock::MockProvider;
 use zero_hermes::agent::{build_provider, LlmProvider, Message, RunLimits};
-use zero_hermes::bootstrap::{build_system_prompt_with_memory, build_tool_registry, load_skills};
+use zero_hermes::bootstrap::{
+    build_system_prompt_with_memory, build_tool_registry, build_tool_registry_async, load_skills,
+};
 use zero_hermes::channels::{telegram, Channel, InboundMessage};
 use zero_hermes::config::Config;
 use zero_hermes::error::Result;
@@ -228,7 +230,7 @@ async fn run_once(cfg: Config, message: &str, mock: bool, stream: bool) -> Resul
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
-    let registry = build_tool_registry(&cfg, provider.clone());
+    let registry = build_tool_registry_async(&cfg, provider.clone()).await;
     let system = build_system_prompt_with_memory(&cfg, &skills, Some(&memory));
     let ctx = zero_hermes::agent::make_context_with_memory(None, memory);
 
@@ -296,7 +298,7 @@ async fn run_chat(cfg: Config, mock: bool, no_banner: bool) -> Result<()> {
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
-    let registry = build_tool_registry(&cfg, provider.clone());
+    let registry = build_tool_registry_async(&cfg, provider.clone()).await;
     let system = build_system_prompt_with_memory(&cfg, &skills, Some(&memory));
     let session_id = "cli-default";
     let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory.clone());
@@ -487,7 +489,7 @@ async fn run_web(cfg: Config, mock: bool, bind: Option<String>) -> Result<()> {
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
-    let registry = build_tool_registry(&cfg, provider.clone());
+    let registry = build_tool_registry_async(&cfg, provider.clone()).await;
     let system = build_system_prompt_with_memory(&cfg, &skills, Some(&memory));
 
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
@@ -560,7 +562,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     } else {
         Arc::from(build_provider(&cfg.provider)?)
     };
-    let registry = build_tool_registry(&cfg, provider.clone());
+    let registry = build_tool_registry_async(&cfg, provider.clone()).await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(16);
     let system = build_system_prompt_with_memory(&cfg, &skills, Some(&memory));

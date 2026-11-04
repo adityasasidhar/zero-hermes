@@ -216,9 +216,8 @@ impl Tool for McpTool {
     }
 }
 
-/// Turn a `tools/list` result into local tools (not wired into bootstrap
-/// yet — Wave D owns the registry shape; wire via `insert_always` once the
-/// async discovery story is decided).
+/// Turn a `tools/list` result into local tools (wired into bootstrap via
+/// `bootstrap::build_tool_registry_async`).
 pub fn build_mcp_tools_from_list(
     server: &str,
     cfg: &McpServerConfig,
@@ -244,7 +243,7 @@ pub fn mcp_tool_names(cfg: &McpConfig) -> Vec<String> {
 ///
 /// One stdio spawn per server; a server that fails discovery is skipped
 /// with a warning so one broken entry cannot take the registry down.
-/// Async discovery is why bootstrap does not call this yet (see TODO).
+/// Called at startup by `bootstrap::build_tool_registry_async`.
 pub async fn build_mcp_tools(cfg: &McpConfig) -> Vec<McpTool> {
     let mut names: Vec<&String> = cfg.servers.keys().collect();
     names.sort();

@@ -200,9 +200,9 @@ pub struct McpConfig {
 impl McpConfig {
     /// Whether any MCP servers are configured.
     ///
-    /// Discovery is async (`mcp::build_mcp_tools`), so the sync tool
-    /// registry cannot wire them yet — see `bootstrap::build_tool_registry`.
-    /// This reports intent without advertising unwired tools.
+    /// Discovery is async (`mcp::build_mcp_tools`) and happens in
+    /// `bootstrap::build_tool_registry_async`; the sync registry builder
+    /// only reports intent and registers no `mcp_*` tools.
     pub fn is_configured(&self) -> bool {
         !self.servers.is_empty()
     }

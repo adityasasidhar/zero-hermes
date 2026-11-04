@@ -163,6 +163,39 @@ pub fn append_recall_context(base: &str, recalled: &str) -> String {
 /// are registered the same way so vendored Hermes skills find the names
 /// they reference.
 pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<ToolRegistry> {
+    build_registry_with_extra(cfg, provider, Vec::new())
+}
+
+/// Like [`build_tool_registry`], but first discovers tools on every configured
+/// MCP stdio server and registers them as `mcp_<server>_<tool>`.
+///
+/// Discovery spawns one process per server and is async, so only async entry
+/// points (chat, run, web, gateway) call this; the sync builder stays for
+/// `tools`-style diagnostics and tests. A server that fails discovery is
+/// skipped with a warning. MCP tools are registered unconditionally (an
+/// explicit `[mcp.servers.*]` entry is the opt-in) and, being inserted before
+/// the sub-agent snapshot, are available to sub-agents too.
+pub async fn build_tool_registry_async(
+    cfg: &Config,
+    provider: Arc<dyn LlmProvider>,
+) -> Arc<ToolRegistry> {
+    let extra: Vec<Arc<dyn crate::agent::tool::Tool>> = if cfg.mcp.is_configured() {
+        crate::mcp::build_mcp_tools(&cfg.mcp)
+            .await
+            .into_iter()
+            .map(|t| Arc::new(t) as Arc<dyn crate::agent::tool::Tool>)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    build_registry_with_extra(cfg, provider, extra)
+}
+
+fn build_registry_with_extra(
+    cfg: &Config,
+    provider: Arc<dyn LlmProvider>,
+    extra: Vec<Arc<dyn crate::agent::tool::Tool>>,
+) -> Arc<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     let skills_root = skills_dir(cfg);
     reg.insert(Arc::new(BashTool), &cfg.agent.enabled_tools);
@@ -203,20 +236,15 @@ pub fn build_tool_registry(cfg: &Config, provider: Arc<dyn LlmProvider>) -> Arc<
     // borrow problem and means sub-agents see the parent's tools without
     // being able to recurse (we strip `subagent` itself in the tool).
     //
-    // MCP: `mcp::build_mcp_tools` discovery is async (spawns stdio servers)
-    // and this constructor is sync, so no `mcp_*` tools are registered here
-    // and none are advertised in `tools list` until async wiring lands.
-    // `McpConfig::is_configured()` + `mcp::mcp_tool_names(&cfg.mcp)` report
-    // configured server names for prompt diagnostics only. See `src/mcp.rs`.
-    // TODO(wave-e): wire MCP tools here via `mcp::list_remote_tools` +
-    // `mcp::build_mcp_tools_from_list` + `insert_always`. Left out
-    // deliberately: discovery is async (spawns stdio servers) and the
-    // registry shape is Wave D territory — merging a sync constructor
-    // now would conflict. See `src/mcp.rs`.
-    if cfg.mcp.is_configured() {
-        tracing::warn!(
+    // MCP tools (discovered by `build_tool_registry_async`) go in before the
+    // sibling snapshot so sub-agents inherit them.
+    for t in extra {
+        reg.insert_always(t);
+    }
+    if cfg.mcp.is_configured() && !reg.names().iter().any(|n| n.starts_with("mcp_")) {
+        tracing::debug!(
             servers = ?crate::mcp::mcp_tool_names(&cfg.mcp),
-            "mcp servers configured but not wired into the sync tool registry; no mcp_* tools advertised"
+            "mcp servers configured but no mcp_* tools registered (sync builder or discovery failed)"
         );
     }
     let sibling = Arc::new(reg.clone());
