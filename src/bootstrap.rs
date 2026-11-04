@@ -591,6 +591,29 @@ pub fn doctor_report(cfg: &Config, mock: bool) -> Vec<(DoctorLevel, String)> {
             },
         );
     }
+    if cfg.matrix.is_enabled() {
+        out.push(if !cfg.matrix.has_allow_list() {
+            (
+                Fail,
+                "matrix: no allowed_rooms/allowed_users/allow_all (gateway will refuse to start)"
+                    .into(),
+            )
+        } else if cfg.matrix.allow_all {
+            (
+                Warn,
+                "matrix: allow_all = true — anyone who can message the bot gets a shell".into(),
+            )
+        } else {
+            (
+                Ok,
+                format!(
+                    "matrix: {} allowed room(s), {} allowed user(s)",
+                    cfg.matrix.allowed_rooms.len(),
+                    cfg.matrix.allowed_users.len()
+                ),
+            )
+        });
+    }
     out
 }
 

@@ -257,6 +257,10 @@ src/
   channels/
     mod.rs             Channel trait, InboundMessage, parse_command, strip_bot_mention
     telegram.rs        getUpdates long-poll + sendMessage
+    matrix.rs          /sync long-poll + PUT send; parse_sync applies the
+                       allow-list; auto-joins trusted invites; first sync's
+                       backlog is never dispatched. run_gateway runs both
+                       channels and routes replies by msg.channel
   web.rs               axum router: /, /events (SSE), /send, /health and one
                        static route per entry in ASSETS; serves web/index.html
                        (vanilla JS, EventSource).

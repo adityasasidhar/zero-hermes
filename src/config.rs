@@ -42,6 +42,9 @@ pub struct Config {
     /// auto-pulled (see `skills::fetch_hub_manifest`).
     #[serde(default)]
     pub skills_hub_url: Option<String>,
+    /// Matrix gateway (second chat platform, plain HTTPS long-poll).
+    #[serde(default)]
+    pub matrix: MatrixSettings,
     /// MCP (Model Context Protocol) stdio servers.
     ///
     /// Minimal JSON-RPC 2.0 over stdio client lives in `crate::mcp`;
@@ -166,6 +169,58 @@ impl Default for ProviderConfig {
             read_timeout_secs: default_read_timeout(),
             fallbacks: Vec::new(),
         }
+    }
+}
+
+/// `[matrix]` settings. Empty `access_token` disables the channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixSettings {
+    /// Homeserver base URL, e.g. `https://matrix.example.org`.
+    #[serde(default)]
+    pub homeserver: String,
+    /// Bot account access token (`${MATRIX_TOKEN}` expands from the env).
+    #[serde(default)]
+    pub access_token: String,
+    /// Room ids (`!id:server`) the bot serves.
+    #[serde(default)]
+    pub allowed_rooms: Vec<String>,
+    /// User ids (`@name:server`) the bot serves in any room.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Serve everyone. The agent has a shell, so this is an explicit opt-in.
+    #[serde(default)]
+    pub allow_all: bool,
+    /// Long-poll timeout in seconds.
+    #[serde(default = "default_matrix_poll")]
+    pub poll_timeout: u32,
+}
+
+fn default_matrix_poll() -> u32 {
+    30
+}
+
+impl Default for MatrixSettings {
+    fn default() -> Self {
+        Self {
+            homeserver: String::new(),
+            access_token: String::new(),
+            allowed_rooms: Vec::new(),
+            allowed_users: Vec::new(),
+            allow_all: false,
+            poll_timeout: default_matrix_poll(),
+        }
+    }
+}
+
+impl MatrixSettings {
+    /// Whether the Matrix channel is configured to run.
+    pub fn is_enabled(&self) -> bool {
+        !self.access_token.trim().is_empty() && !self.homeserver.trim().is_empty()
+    }
+
+    /// Whether anyone at all is allowed in (guards the shell-access risk).
+    pub fn has_allow_list(&self) -> bool {
+        self.allow_all || !self.allowed_rooms.is_empty() || !self.allowed_users.is_empty()
     }
 }
 
@@ -318,6 +373,11 @@ pub struct AgentConfig {
     /// disables token-aware compaction.
     #[serde(default = "default_context_tokens")]
     pub context_tokens: usize,
+    /// When history exceeds `context_tokens`, have the model write the
+    /// summary of older turns (one extra provider call) instead of relying
+    /// only on the extractive summary. Off by default: it costs tokens.
+    #[serde(default)]
+    pub llm_compaction: bool,
     /// Allow-list of tool names; empty = all registered tools.
     #[serde(default)]
     pub enabled_tools: Vec<String>,
@@ -353,6 +413,7 @@ impl Default for AgentConfig {
             max_iterations: default_max_iterations(),
             context_window: default_context_window(),
             context_tokens: default_context_tokens(),
+            llm_compaction: false,
             enabled_tools: Vec::new(),
             command_guard: true,
             blocked_commands: Vec::new(),
@@ -474,6 +535,8 @@ impl Config {
             }
         }
         self.telegram.token = expand_env_vars(&self.telegram.token);
+        self.matrix.homeserver = expand_env_vars(&self.matrix.homeserver);
+        self.matrix.access_token = expand_env_vars(&self.matrix.access_token);
         if let Some(url) = &self.skills_hub_url {
             self.skills_hub_url = Some(expand_env_vars(url));
         }

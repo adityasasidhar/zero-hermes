@@ -179,6 +179,9 @@ context_tokens = 24000
 enabled_tools = []
 command_guard = true
 blocked_commands = []
+# Have the model write the summary when history exceeds context_tokens
+# (one extra provider call). Off by default.
+llm_compaction = false
 
 [telegram]
 token = "${TELEGRAM_BOT_TOKEN}"
@@ -249,6 +252,25 @@ name = "curate-skills"
 schedule = "0 4 * * 0"
 prompt = "Run the skill curator: review every skill, merge near-duplicates, archive (never delete) redundant ones, and report what changed."
 ```
+
+### Matrix gateway
+
+Besides Telegram, `zero-hermes gateway` can serve a Matrix account over plain
+HTTPS long-poll (no WebSocket stack, no new dependency). Like Telegram it must
+be told who to trust, because the agent has a shell:
+
+```toml
+[matrix]
+homeserver = "https://matrix.example.org"
+access_token = "${MATRIX_TOKEN}"
+allowed_rooms = ["!abc:example.org"]   # and/or allowed_users = ["@me:example.org"]
+```
+
+The bot auto-joins invites from an allowed user, ignores its own messages and
+the history it sees at startup, and `/new`, `/clear` and `/help` work as on
+Telegram. With no allow-list (and no `allow_all = true`) the gateway refuses to
+start. Cron results are delivered to the single allowed Telegram chat or, failing
+that, the single allowed Matrix room.
 
 ## Subagents and scheduled work
 

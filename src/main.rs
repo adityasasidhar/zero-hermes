@@ -12,6 +12,7 @@ use zero_hermes::agent::{build_provider, LlmProvider, Message, RunLimits};
 use zero_hermes::bootstrap::{
     build_system_prompt_with_memory, build_tool_registry, build_tool_registry_async, load_skills,
 };
+use zero_hermes::channels::matrix::{MatrixChannel, MatrixConfig};
 use zero_hermes::channels::{telegram, Channel, InboundMessage};
 use zero_hermes::config::Config;
 use zero_hermes::error::Result;
@@ -635,8 +636,16 @@ async fn run_web(cfg: Config, mock: bool, bind: Option<String>) -> Result<()> {
 }
 
 async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
-    if cfg.telegram.token.is_empty() && !mock {
-        anyhow::bail!("telegram.token is required to run the gateway (or pass --mock)");
+    if cfg.telegram.token.is_empty() && !cfg.matrix.is_enabled() && !mock {
+        anyhow::bail!(
+            "configure telegram.token or [matrix] (homeserver + access_token) to run the gateway (or pass --mock)"
+        );
+    }
+    if cfg.matrix.is_enabled() && !cfg.matrix.has_allow_list() {
+        anyhow::bail!(
+            "refusing to start: `[matrix]` has no allowed_rooms, allowed_users or allow_all, \
+             so anyone who can message this bot could run shell commands on this host."
+        );
     }
     // The agent can run arbitrary shell commands. An empty `allowed_chats`
     // means every stranger who finds the bot gets that capability, so it
@@ -714,7 +723,30 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     let channel_arc = channel.clone();
     let mut channel_task = tokio::spawn(async move { channel_arc.run(tx_clone).await });
     let reply_channel = channel.clone();
-    tracing::info!(channel = %channel_name, "gateway running (ctrl-c to stop)");
+    // Optional second platform. Replies are routed by `msg.channel`.
+    let matrix_channel: Option<Arc<dyn Channel>> = if cfg.matrix.is_enabled() {
+        Some(Arc::new(MatrixChannel::new(MatrixConfig {
+            homeserver: cfg.matrix.homeserver.clone(),
+            access_token: cfg.matrix.access_token.clone(),
+            allowed_rooms: cfg.matrix.allowed_rooms.clone(),
+            allowed_users: cfg.matrix.allowed_users.clone(),
+            allow_all: cfg.matrix.allow_all,
+            poll_timeout: cfg.matrix.poll_timeout,
+        })))
+    } else {
+        None
+    };
+    let mut matrix_task = matrix_channel.clone().map(|ch| {
+        let tx = tx.clone();
+        tokio::spawn(async move { ch.run(tx).await })
+    });
+    let reply_for = |name: &str| -> Arc<dyn Channel> {
+        match (name, &matrix_channel) {
+            ("matrix", Some(ch)) => ch.clone(),
+            _ => reply_channel.clone(),
+        }
+    };
+    tracing::info!(channel = %channel_name, matrix = matrix_channel.is_some(), "gateway running (ctrl-c to stop)");
 
     // Per-chat conversation histories. Each inbound turn is spawned as its
     // own task so one slow LLM call never blocks other chats. Same-session
@@ -727,7 +759,19 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let session_locks: zero_hermes::web::SessionLocks =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let notify_chats: Vec<i64> = cfg.telegram.allowed_chats.clone();
+    // Cron results go to the one unambiguous recipient: a single allowed
+    // Telegram chat, else a single allowed Matrix room.
+    let cron_target: Option<(Arc<dyn Channel>, String)> =
+        if cfg.telegram.allowed_chats.len() == 1 && !cfg.telegram.token.is_empty() {
+            Some((
+                reply_channel.clone(),
+                cfg.telegram.allowed_chats[0].to_string(),
+            ))
+        } else if let (Some(ch), [room]) = (&matrix_channel, cfg.matrix.allowed_rooms.as_slice()) {
+            Some((ch.clone(), room.clone()))
+        } else {
+            None
+        };
     let agent_limits = RunLimits::from(&cfg.agent);
 
     loop {
@@ -746,7 +790,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                         let histories = histories.clone();
                         let session_locks = session_locks.clone();
                         let memory = memory.clone();
-                        let reply = reply_channel.clone();
+                        let reply = reply_for(&msg.channel);
                         let chat_id = msg.chat_id.clone();
                         let session_id = session_id.clone();
                         tokio::spawn(async move {
@@ -768,7 +812,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                         continue;
                     }
                     if lc == "help" {
-                        let reply = reply_channel.clone();
+                        let reply = reply_for(&msg.channel);
                         let chat_id = msg.chat_id.clone();
                         tokio::spawn(async move {
                             if let Err(e) = reply.send(&chat_id, gateway_help_text()).await {
@@ -789,7 +833,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                 let registry = registry.clone();
                 let system = system.clone();
                 let memory_clone = memory.clone();
-                let reply = reply_channel.clone();
+                let reply = reply_for(&msg.channel);
                 let histories_clone = histories.clone();
                 let session_locks_clone = session_locks.clone();
                 let chat_id = msg.chat_id.clone();
@@ -915,8 +959,7 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                 let registry = registry.clone();
                 let system = system.clone();
                 let memory_clone = memory.clone();
-                let reply = reply_channel.clone();
-                let notify = notify_chats.clone();
+                let target = cron_target.clone();
                 let job_name = evt.job.clone();
                 tokio::spawn(async move {
                     let mut ctx = zero_hermes::agent::make_context_with_memory(None, memory_clone.clone());
@@ -943,12 +986,11 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                                 tracing::warn!(error = %e, "saving cron history failed");
                             }
                             // Best-effort delivery: with exactly one allowed
-                            // chat there is an unambiguous recipient.
+                            // chat/room there is an unambiguous recipient.
                             // Otherwise the result stays in memory under
                             // `cron-<job>` plus the info log above.
-                            if notify.len() == 1 {
-                                let chat_id = notify[0].to_string();
-                                if let Err(e) = reply.send(&chat_id, &text).await {
+                            if let Some((channel, chat_id)) = target {
+                                if let Err(e) = channel.send(&chat_id, &text).await {
                                     tracing::warn!(error = %e, "cron notify send failed");
                                 }
                             }
@@ -974,6 +1016,24 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
                 }
                 break;
             }
+            joined = async {
+                match matrix_task.as_mut() {
+                    Some(t) => t.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match joined {
+                    Ok(Ok(())) => tracing::info!(channel = "matrix", "channel loop ended"),
+                    Ok(Err(e)) => {
+                        tracing::error!(channel = "matrix", error = %e, "channel loop failed");
+                        channel_task.abort();
+                        shutdown(cron_handle).await;
+                        return Err(e);
+                    }
+                    Err(e) => tracing::error!(channel = "matrix", error = %e, "channel task panicked"),
+                }
+                matrix_task = None;
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
                 break;
@@ -983,6 +1043,9 @@ async fn run_gateway(cfg: Config, mock: bool) -> Result<()> {
     }
 
     channel_task.abort();
+    if let Some(t) = matrix_task {
+        t.abort();
+    }
     shutdown(cron_handle).await;
     Ok(())
 }

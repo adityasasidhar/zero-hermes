@@ -845,3 +845,26 @@ fn chat_model_command_switches_the_model() {
     assert!(text.contains("model -> my-test-model"), "{text}");
     assert!(text.contains("model: my-test-model"), "{text}");
 }
+
+/// Matrix is a shell-access surface too: with no room/user allow-list the
+/// gateway must refuse to start, exactly like an open Telegram bot.
+#[test]
+fn gateway_refuses_an_open_matrix_bot() {
+    let sb = Sandbox::new();
+    let cfg = sb.write(
+        "matrix.toml",
+        "[matrix]\nhomeserver = \"https://hs.example\"\naccess_token = \"tok\"\n",
+    );
+    let out = sb.run(&["--config", cfg.to_str().unwrap(), "gateway"]);
+    assert_ne!(code(&out), 0);
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        text.contains("[matrix]") && text.contains("allow_all"),
+        "{text}"
+    );
+
+    // `doctor` flags the same misconfiguration.
+    let doc = sb.run(&["--config", cfg.to_str().unwrap(), "doctor", "--mock"]);
+    assert_ne!(code(&doc), 0);
+    assert!(stdout(&doc).contains("[FAIL] matrix:"), "{}", stdout(&doc));
+}
