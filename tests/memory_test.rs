@@ -61,3 +61,34 @@ fn sessions_crud() {
     let s1 = list.iter().find(|s| s.id == "s1").unwrap();
     assert_eq!(s1.chat_id, "99");
 }
+
+/// Several handles on one file (gateway + web UI + a terminal chat) write at
+/// the same time without "database is locked", and the file is in WAL mode.
+#[test]
+fn concurrent_handles_on_one_file_do_not_hit_database_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite");
+    let handles: Vec<_> = (0..4)
+        .map(|t| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let m = Memory::open(Some(&path)).expect("open");
+                for i in 0..50 {
+                    m.write_note(&format!("t{t}-k{i}"), "v")
+                        .unwrap_or_else(|e| panic!("write failed under contention: {e}"));
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("writer thread");
+    }
+    let m = Memory::open(Some(&path)).unwrap();
+    assert_eq!(m.list_notes().unwrap().len(), 4 * 50);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+}

@@ -47,7 +47,21 @@ impl Memory {
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                rusqlite::Connection::open(p)?
+                let conn = rusqlite::Connection::open(p)?;
+                // The gateway, the web UI and a terminal chat may all open
+                // the same file. WAL lets readers and a writer coexist,
+                // `busy_timeout` makes a contended write wait instead of
+                // failing with "database is locked", and `synchronous=NORMAL`
+                // (safe under WAL) cuts fsyncs, which is what wears an SD
+                // card. Best effort: a filesystem that refuses WAL (some
+                // network mounts) still works in the default journal mode.
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                if let Err(e) =
+                    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+                {
+                    tracing::warn!(error = %e, "could not enable SQLite WAL; using default journal");
+                }
+                conn
             }
             None => rusqlite::Connection::open_in_memory()?,
         };
